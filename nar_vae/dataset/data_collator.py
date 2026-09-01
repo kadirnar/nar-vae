@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -51,12 +52,16 @@ class FlowMatchingDataCollator:
         pad_token: int = PAD_TOKEN,
         latent_pad_value: float = 0.0,
         speaker_patch_size: int = 4,
+        conditioning_feature_dtype: str | None = None,
     ):
         if speaker_patch_size <= 0:
             raise ValueError("speaker_patch_size must be greater than zero")
+        if conditioning_feature_dtype not in {None, "float16", "float32"}:
+            raise ValueError("conditioning_feature_dtype must be None, 'float16', or 'float32'.")
         self.pad_token = pad_token
         self.latent_pad_value = latent_pad_value
         self.speaker_patch_size = speaker_patch_size
+        self.conditioning_feature_dtype = conditioning_feature_dtype
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         """
@@ -141,6 +146,67 @@ class FlowMatchingDataCollator:
             "language_ids": torch.tensor(target_language_ids, dtype=torch.long),
         }
 
+        samples_with_features = ["conditioning_features" in sample for sample in samples]
+        if any(samples_with_features) and not all(samples_with_features):
+            raise ValueError(
+                "conditioning_features must be present in every sample or omitted from the batch"
+            )
+        if all(samples_with_features):
+            feature_rows = []
+            feature_width = None
+            declared_dtypes: set[str] = set()
+            for index, (sample, token_ids) in enumerate(zip(samples, conditioning_ids)):
+                features = torch.as_tensor(sample["conditioning_features"])
+                if features.ndim != 2 or features.shape[0] != token_ids.shape[0]:
+                    raise ValueError(
+                        f"Row {index} conditioning_features must have shape "
+                        "[conditioning_tokens, hidden_size]."
+                    )
+                if features.shape[1] <= 0 or not torch.is_floating_point(features):
+                    raise ValueError("conditioning_features must have a positive floating width.")
+                if not bool(torch.isfinite(features).all()):
+                    raise ValueError("conditioning_features must contain only finite values.")
+                if feature_width is None:
+                    feature_width = int(features.shape[1])
+                elif int(features.shape[1]) != feature_width:
+                    raise ValueError(
+                        "conditioning_features hidden width must match across a batch."
+                    )
+                representation = sample.get("representation_contract")
+                if isinstance(representation, Mapping):
+                    frontend = representation.get("text_frontend")
+                    if isinstance(frontend, Mapping):
+                        declared_dtype = frontend.get("feature_dtype")
+                        if declared_dtype not in {"float16", "float32"}:
+                            raise ValueError(
+                                "Frozen representation declares an unsupported feature dtype."
+                            )
+                        declared_dtypes.add(str(declared_dtype))
+                feature_rows.append(features)
+            if len(declared_dtypes) > 1:
+                raise ValueError("Frozen feature dtype must match across a batch.")
+            declared_dtype = next(iter(declared_dtypes), None)
+            if (
+                self.conditioning_feature_dtype is not None
+                and declared_dtype is not None
+                and self.conditioning_feature_dtype != declared_dtype
+            ):
+                raise ValueError(
+                    "Configured conditioning feature dtype does not match the dataset contract."
+                )
+            resolved_dtype = self.conditioning_feature_dtype or declared_dtype
+            if resolved_dtype is not None:
+                torch_dtype = {
+                    "float16": torch.float16,
+                    "float32": torch.float32,
+                }[resolved_dtype]
+                feature_rows = [features.to(dtype=torch_dtype) for features in feature_rows]
+            result["conditioning_features"] = pad_sequence(
+                feature_rows,
+                batch_first=True,
+                padding_value=0.0,
+            )
+
         # Speaker conditioning must be present consistently across the batch.
         samples_with_speaker = ["speaker_latents" in sample for sample in samples]
         if any(samples_with_speaker) and not all(samples_with_speaker):
@@ -212,6 +278,7 @@ class FlowMatchingDataCollator:
 def create_data_collator(
     pad_token: int = PAD_TOKEN,
     speaker_patch_size: int = 4,
+    conditioning_feature_dtype: str | None = None,
 ) -> FlowMatchingDataCollator:
     """
     Factory function to create data collator.
@@ -226,6 +293,7 @@ def create_data_collator(
     return FlowMatchingDataCollator(
         pad_token=pad_token,
         speaker_patch_size=speaker_patch_size,
+        conditioning_feature_dtype=conditioning_feature_dtype,
     )
 
 
@@ -241,16 +309,19 @@ class SimpleTTSCollator:
         self,
         pad_token: int = PAD_TOKEN,
         speaker_patch_size: int = 4,
+        conditioning_feature_dtype: str | None = None,
     ):
         if speaker_patch_size <= 0:
             raise ValueError("speaker_patch_size must be greater than zero")
         self.pad_token = pad_token
         self.speaker_patch_size = speaker_patch_size
+        self.conditioning_feature_dtype = conditioning_feature_dtype
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         """Collate TTS features."""
         collator = FlowMatchingDataCollator(
             pad_token=self.pad_token,
             speaker_patch_size=self.speaker_patch_size,
+            conditioning_feature_dtype=self.conditioning_feature_dtype,
         )
         return collator(features)

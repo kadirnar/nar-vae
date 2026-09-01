@@ -111,10 +111,13 @@ def _load_cache_dit() -> ModuleType:
 
 
 def _cache_dit_version(module: ModuleType) -> str | None:
+    module_version = getattr(module, "__version__", None)
+    if module_version is not None:
+        return str(module_version)
     try:
         return distribution_version("cache-dit")
     except PackageNotFoundError:
-        return getattr(module, "__version__", None)
+        return None
 
 
 def _turbo_step_mask(num_steps: int) -> list[int]:

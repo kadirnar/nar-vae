@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from nar_vae.dataset.representation import (
+    FROZEN_REPRESENTATION_CONTRACT_VERSION,
     REPRESENTATION_CONTRACT_COLUMN,
     REPRESENTATION_CONTRACT_VERSION,
     TEXT_FRONTEND_NAME,
@@ -26,6 +27,7 @@ from nar_vae.languages import (
     normalize_languages,
     resolve_language_pair_support,
 )
+from nar_vae.text_frontend import FrozenTextFrontendSpec
 
 
 @dataclass(frozen=True)
@@ -129,9 +131,10 @@ def resolve_language_training_options(
         raise ValueError(
             "initialize_language_conditioning requires use_language_conditioning: true"
         )
-    if not use_language_conditioning and supported_languages != ("en",):
+    if not use_language_conditioning and len(supported_languages) != 1:
         raise ValueError(
-            "supported_languages beyond English require use_language_conditioning: true"
+            "A model without learned language conditioning must declare exactly one "
+            "supported language."
         )
     if initialize_language_conditioning and not pretrained_checkpoint:
         raise ValueError(
@@ -321,11 +324,11 @@ def _validated_representation_contract(
     *,
     row_index: int,
     latent_size: int,
-) -> dict[str, int | str | None]:
+) -> dict[str, object]:
     """Validate one versioned dataset representation without guessing defaults."""
     if not isinstance(value, Mapping):
         raise ValueError(f"Row {row_index} {REPRESENTATION_CONTRACT_COLUMN} must be a mapping.")
-    expected_fields = {
+    legacy_fields = {
         "contract_version",
         "text_frontend_name",
         "text_frontend_version",
@@ -338,19 +341,37 @@ def _validated_representation_contract(
         "hop_length",
         "latent_width",
     }
+    contract_version = value.get("contract_version")
+    expected_fields = set(legacy_fields)
+    if contract_version == FROZEN_REPRESENTATION_CONTRACT_VERSION:
+        expected_fields.add("text_frontend")
     if set(value) != expected_fields:
         raise ValueError(
             f"Row {row_index} has an incomplete or unknown representation contract: "
             f"missing={sorted(expected_fields - set(value))}, "
             f"unexpected={sorted(set(value) - expected_fields)}."
         )
-    if value["contract_version"] != REPRESENTATION_CONTRACT_VERSION:
+    if contract_version not in {
+        REPRESENTATION_CONTRACT_VERSION,
+        FROZEN_REPRESENTATION_CONTRACT_VERSION,
+    }:
         raise ValueError(f"Row {row_index} has an unsupported representation contract version.")
-    if (
-        value["text_frontend_name"] != TEXT_FRONTEND_NAME
-        or value["text_frontend_version"] != TEXT_FRONTEND_VERSION
-    ):
-        raise ValueError(f"Row {row_index} was prepared with an incompatible text frontend.")
+    if contract_version == REPRESENTATION_CONTRACT_VERSION:
+        if (
+            value["text_frontend_name"] != TEXT_FRONTEND_NAME
+            or value["text_frontend_version"] != TEXT_FRONTEND_VERSION
+        ):
+            raise ValueError(f"Row {row_index} was prepared with an incompatible text frontend.")
+    else:
+        payload = value["text_frontend"]
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"Row {row_index} has no frozen text frontend contract.")
+        try:
+            spec = FrozenTextFrontendSpec(**dict(payload))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Row {row_index} has an invalid frozen frontend: {exc}") from exc
+        if value["text_frontend_name"] != spec.contract_name:
+            raise ValueError(f"Row {row_index} frozen frontend fingerprint does not match.")
     for name in ("sample_rate", "hop_length", "latent_width"):
         item = value[name]
         if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
@@ -415,6 +436,8 @@ def validate_tts_dataset(
     expected_codec_sha256: str | None = None,
     expected_sample_rate: int | None = None,
     expected_hop_length: int | None = None,
+    text_vocab_size: int | None = None,
+    expected_representation: Mapping[str, object] | None = None,
 ) -> None:
     """Fail before training when prepared latent rows have an unsafe schema."""
     if len(dataset) == 0:
@@ -473,7 +496,7 @@ def validate_tts_dataset(
             f"TTS dataset has no {REPRESENTATION_CONTRACT_COLUMN}. Re-prepare it with the "
             "current NAR-VAE dataset API or explicitly allow legacy data after an external audit."
         )
-    first_representation: dict[str, int | str | None] | None = None
+    first_representation: dict[str, object] | None = None
 
     for index in range(len(dataset)):
         row = dataset[index]
@@ -514,9 +537,51 @@ def validate_tts_dataset(
                     f"Row {index} has {LATENT_NUM_FRAMES_COLUMN}={declared_frames}, "
                     f"but latents contain {actual_frames} frames."
                 )
-        conditioning_token_count = len(row["conditioning_ids"])
+        conditioning_ids = torch.as_tensor(row["conditioning_ids"])
+        integer_dtypes = {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }
+        if conditioning_ids.ndim != 1 or conditioning_ids.dtype not in integer_dtypes:
+            raise ValueError(f"Row {index} conditioning_ids must be a rank-one integer sequence.")
+        if bool((conditioning_ids < 0).any()):
+            raise ValueError(f"Row {index} conditioning_ids must be nonnegative.")
+        if text_vocab_size is not None and bool((conditioning_ids >= text_vocab_size).any()):
+            raise ValueError(
+                f"Row {index} conditioning_ids exceed text_vocab_size={text_vocab_size}."
+            )
+        conditioning_token_count = int(conditioning_ids.numel())
         if conditioning_token_count == 0:
             raise ValueError(f"Row {index} has empty conditioning_ids.")
+        expects_frozen_features = bool(
+            first_representation is not None
+            and first_representation.get("contract_version")
+            == FROZEN_REPRESENTATION_CONTRACT_VERSION
+        )
+        if expects_frozen_features:
+            if "conditioning_features" not in row:
+                raise ValueError(f"Row {index} has no cached frozen conditioning_features.")
+            conditioning_features = torch.as_tensor(row["conditioning_features"])
+            frontend = first_representation.get("text_frontend")
+            assert isinstance(frontend, Mapping)
+            expected_width = int(frontend["hidden_size"])
+            if (
+                conditioning_features.ndim != 2
+                or tuple(conditioning_features.shape) != (conditioning_token_count, expected_width)
+                or not torch.is_floating_point(conditioning_features)
+                or not bool(torch.isfinite(conditioning_features).all())
+            ):
+                raise ValueError(
+                    f"Row {index} conditioning_features must be finite "
+                    f"[{conditioning_token_count}, {expected_width}]."
+                )
+        elif "conditioning_features" in row:
+            raise ValueError(
+                f"Row {index} has conditioning_features under a legacy scratch frontend contract."
+            )
         if use_mas_duration and int(target.shape[1]) < conditioning_token_count:
             raise ValueError(
                 f"Row {index} has {target.shape[1]} latent frames for "
@@ -539,11 +604,12 @@ def validate_tts_dataset(
                     f"Row {index} uses unsupported language {row_language!r}; "
                     f"expected one of {sorted(supported)}."
                 )
-            seen_languages.add(row_language)
-        elif row_language != DEFAULT_LANGUAGE:
+        elif row_language not in supported:
             raise ValueError(
-                f"Row {index} uses language {row_language!r}, but language conditioning is disabled."
+                f"Row {index} uses language {row_language!r}, but this monolingual checkpoint "
+                f"declares {sorted(supported)}."
             )
+        seen_languages.add(row_language)
 
         if use_speaker_conditioning:
             reference = row.get("speaker_latents")
@@ -588,6 +654,44 @@ def validate_tts_dataset(
                 seen_language_pairs.add(row_pair)
 
     if first_representation is not None:
+        normalized_expected_representation = (
+            dict(expected_representation) if expected_representation is not None else None
+        )
+        if (
+            normalized_expected_representation is not None
+            and normalized_expected_representation.get("contract_version")
+            == REPRESENTATION_CONTRACT_VERSION
+            and normalized_expected_representation.get("text_frontend") is None
+        ):
+            # Model-manifest schema v3 carries an explicit null. Prepared-data schema v2 predates
+            # that field and must remain exact rather than accepting an unknown extra key.
+            normalized_expected_representation.pop("text_frontend")
+        if (
+            normalized_expected_representation is not None
+            and dict(first_representation) != normalized_expected_representation
+        ):
+            raise ValueError(
+                "Dataset codec/frontend representation does not exactly match the training "
+                "configuration."
+            )
+        if first_representation.get("contract_version") == FROZEN_REPRESENTATION_CONTRACT_VERSION:
+            dataset_features = getattr(dataset, "features", None)
+            if (
+                isinstance(dataset_features, Mapping)
+                and "conditioning_features" in dataset_features
+            ):
+                arrow_feature = dataset_features["conditioning_features"]
+                while hasattr(arrow_feature, "feature"):
+                    arrow_feature = arrow_feature.feature
+                physical_dtype = getattr(arrow_feature, "dtype", None)
+                frontend = first_representation.get("text_frontend")
+                assert isinstance(frontend, Mapping)
+                declared_dtype = frontend["feature_dtype"]
+                if physical_dtype is not None and physical_dtype != declared_dtype:
+                    raise ValueError(
+                        "Dataset conditioning feature dtype does not match its frozen frontend "
+                        f"contract: {physical_dtype!r} != {declared_dtype!r}."
+                    )
         expected_values = {
             "codec_source": expected_codec_source,
             "codec_backend": (
@@ -606,7 +710,7 @@ def validate_tts_dataset(
                     f"match the training configuration ({expected!r})."
                 )
 
-    if require_language_coverage and use_language_conditioning and seen_languages != supported:
+    if require_language_coverage and seen_languages != supported:
         raise ValueError(
             "Dataset target-language coverage does not match supported_languages: "
             f"observed={sorted(seen_languages)}, declared={sorted(supported)}."

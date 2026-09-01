@@ -433,7 +433,10 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             reference_language,
             has_reference=reference_audio is not None or speaker_latent is not None,
         )
-        conditioning_ids = self._prepare_conditioning(text, language_pair.target)
+        conditioning_ids, conditioning_mask, conditioning_features = self._prepare_conditioning(
+            text,
+            language_pair.target,
+        )
         language_ids = self._language_ids(language_pair)
         resolved_speaker = self._resolve_speaker_latent(
             reference_audio=reference_audio,
@@ -452,7 +455,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         encoded_conditioning, predicted_frames, expected_token_durations = (
             self._encode_trajectory_conditioning(
                 conditioning_ids,
-                conditioning_mask=None,
+                conditioning_mask=conditioning_mask,
                 language_ids=language_ids,
                 speaker_latent=resolved_speaker,
                 cfg_scale=effective_cfg_scale,
@@ -462,6 +465,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
                 needs_learned_duration=(
                     duration is None and getattr(self, "uses_learned_duration", False)
                 ),
+                conditioning_features=conditioning_features,
             )
         )
         estimated_duration, num_frames = self._resolve_duration_shape(
@@ -471,13 +475,16 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             language_ids,
             resolved_speaker,
             predicted_frames,
+            conditioning_features,
         )
         token_durations = self._resolve_token_durations(
             conditioning_ids,
             num_frames=num_frames,
+            conditioning_mask=conditioning_mask,
             language_ids=language_ids,
             speaker_latent=resolved_speaker,
             expected_token_durations=expected_token_durations,
+            conditioning_features=conditioning_features,
         )
         latent_shape = (1, self.latent_size, num_frames)
 
@@ -589,7 +596,8 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
                     temporal_rescale_k=selected.temporal_rescale_k,
                     temporal_rescale_sigma=selected.temporal_rescale_sigma,
                     target_latent_std=selected.target_latent_std,
-                    conditioning_mask=None,
+                    conditioning_mask=conditioning_mask,
+                    conditioning_features=conditioning_features,
                     speaker_latent=resolved_speaker,
                     language_ids=language_ids,
                     token_durations=token_durations,

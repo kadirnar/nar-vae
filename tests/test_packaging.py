@@ -50,7 +50,7 @@ class PackagingMetadataTest(unittest.TestCase):
             "build",
             "cache-dit>=1.5,<2",
             "datasets==3.4.1",
-            "kernels>=0.16,<0.17",
+            "kernels>=0.10,<0.12",
             "PyYAML",
             "ruff",
             "torchcodec",
@@ -103,9 +103,12 @@ class PackagingMetadataTest(unittest.TestCase):
         self.assertFalse((ROOT / "AGENTS.md").exists())
         self.assertFalse((ROOT / "agent.md").exists())
         for path in ROOT.rglob("*"):
-            if not path.is_file() or {".git", ".ruff_cache", "__pycache__"}.intersection(
-                path.parts
-            ):
+            if not path.is_file() or {
+                ".git",
+                ".ruff_cache",
+                ".venv",
+                "__pycache__",
+            }.intersection(path.parts):
                 continue
             if path.suffix.lower() not in {".md", ".py", ".toml", ".txt", ".yaml", ".yml"}:
                 continue

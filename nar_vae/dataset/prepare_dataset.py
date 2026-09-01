@@ -27,6 +27,7 @@ from nar_vae.dataset.speaker_references import (
     select_reference_indices,
 )
 from nar_vae.languages import DEFAULT_LANGUAGE, normalize_language
+from nar_vae.text_frontend import FrozenTextFrontend, FrozenTextFrontendSpec
 from nar_vae.tokenization import encode_tts_text
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
@@ -69,6 +70,7 @@ class DatasetPreparer:
         dacvae_revision: str | None = None,
         dacvae_filename: str | None = None,
         dacvae_sha256: str | None = None,
+        text_frontend_spec: FrozenTextFrontendSpec | None = None,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.max_duration = max_duration
@@ -101,14 +103,26 @@ class DatasetPreparer:
                 f"{target_sample_rate} != {codec_sample_rate}."
             )
         self.target_sample_rate = codec_sample_rate
+        self.frozen_text_frontend = (
+            FrozenTextFrontend(text_frontend_spec, device=self.device)
+            if text_frontend_spec is not None
+            else None
+        )
         self.representation_contract = build_representation_contract(
             self.dacvae,
             codec_source=codec_source,
+            text_frontend=text_frontend_spec,
         )
 
-        # Load tokenizer
-        print("Loading tokenizer: tiktoken cl100k_base")
-        self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        if self.frozen_text_frontend is None:
+            print("Loading tokenizer: tiktoken cl100k_base")
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        else:
+            print(
+                "Loading frozen text features: "
+                f"{text_frontend_spec.model_id}@{text_frontend_spec.revision}"
+            )
+            self.tokenizer = None
 
         print(f"Ready on {self.device}")
 
@@ -215,10 +229,30 @@ class DatasetPreparer:
         Returns:
             List of token IDs
         """
+        if self.tokenizer is None:
+            raise RuntimeError("tokenize_text is available only for the legacy scratch frontend.")
         return encode_tts_text(
             text.strip(),
             self.tokenizer,
             language=language or self.language,
+        )
+
+    def encode_text_conditioning(
+        self,
+        text: str,
+        language: str | None = None,
+    ) -> tuple[list[int], np.ndarray | None]:
+        """Return aligned IDs and optional cached frozen contextual states."""
+        if getattr(self, "frozen_text_frontend", None) is None:
+            return self.tokenize_text(text, language), None
+        batch = self.frozen_text_frontend.encode(
+            [text.strip()],
+            inputs_are_phonemes=self.frozen_text_frontend.spec.input_mode == "phonemes",
+        )
+        token_count = int(batch.attention_mask[0].sum().item())
+        return (
+            batch.input_ids[0, :token_count].tolist(),
+            batch.features[0, :token_count].numpy(),
         )
 
     @torch.no_grad()
@@ -292,7 +326,10 @@ class DatasetPreparer:
             return None
 
         # Tokenize text
-        conditioning_ids = self.tokenize_text(text, target_language)
+        conditioning_ids, conditioning_features = self.encode_text_conditioning(
+            text,
+            target_language,
+        )
 
         result = {
             "latents": latents,
@@ -300,6 +337,8 @@ class DatasetPreparer:
             "conditioning_ids": conditioning_ids,
             "language": target_language,
         }
+        if conditioning_features is not None:
+            result["conditioning_features"] = conditioning_features
         if speaker_references is not None:
             speaker_latents = self.encode_speaker_audio(speaker_references)
             if speaker_latents is None:
@@ -330,6 +369,7 @@ def prepare_from_hf_dataset(
     dacvae_revision: str | None = None,
     dacvae_filename: str | None = None,
     dacvae_sha256: str | None = None,
+    text_frontend_spec: FrozenTextFrontendSpec | None = None,
 ):
     """
     Prepare dataset from HuggingFace.
@@ -365,6 +405,7 @@ def prepare_from_hf_dataset(
         dacvae_revision=dacvae_revision,
         dacvae_filename=dacvae_filename,
         dacvae_sha256=dacvae_sha256,
+        text_frontend_spec=text_frontend_spec,
     )
 
     speaker_index = (
@@ -441,6 +482,7 @@ def prepare_from_local_folder(
     dacvae_revision: str | None = None,
     dacvae_filename: str | None = None,
     dacvae_sha256: str | None = None,
+    text_frontend_spec: FrozenTextFrontendSpec | None = None,
 ):
     """
     Prepare dataset from local folder.
@@ -495,6 +537,7 @@ def prepare_from_local_folder(
         dacvae_revision=dacvae_revision,
         dacvae_filename=dacvae_filename,
         dacvae_sha256=dacvae_sha256,
+        text_frontend_spec=text_frontend_spec,
     )
 
     processed_samples = []
@@ -539,6 +582,7 @@ def prepare_from_csv(
     dacvae_revision: str | None = None,
     dacvae_filename: str | None = None,
     dacvae_sha256: str | None = None,
+    text_frontend_spec: FrozenTextFrontendSpec | None = None,
 ):
     """
     Prepare dataset from CSV file.
@@ -577,6 +621,7 @@ def prepare_from_csv(
         dacvae_revision=dacvae_revision,
         dacvae_filename=dacvae_filename,
         dacvae_sha256=dacvae_sha256,
+        text_frontend_spec=text_frontend_spec,
     )
 
     processed_samples = []
@@ -613,6 +658,32 @@ def save_dataset(
     if any(optional_speaker) and not all(optional_speaker):
         raise ValueError("speaker_latents must be present in every prepared sample or none.")
     fields = ["latents", "conditioning_ids"]
+    optional_conditioning_features = ["conditioning_features" in sample for sample in samples]
+    if any(optional_conditioning_features) and not all(optional_conditioning_features):
+        raise ValueError("conditioning_features must be present in every prepared sample or none.")
+    if all(optional_conditioning_features):
+        declared_feature_dtypes: set[str] = set()
+        for index, sample in enumerate(samples):
+            representation = sample.get(REPRESENTATION_CONTRACT_COLUMN)
+            frontend = (
+                representation.get("text_frontend") if isinstance(representation, dict) else None
+            )
+            declared_dtype = frontend.get("feature_dtype") if isinstance(frontend, dict) else None
+            if declared_dtype not in {"float16", "float32"}:
+                raise ValueError(
+                    f"Sample {index} has cached features without a supported frozen frontend "
+                    "dtype contract."
+                )
+            actual_dtype = str(np.asarray(sample["conditioning_features"]).dtype)
+            if actual_dtype != declared_dtype:
+                raise ValueError(
+                    f"Sample {index} conditioning_features use {actual_dtype}, but the frozen "
+                    f"frontend contract declares {declared_dtype}."
+                )
+            declared_feature_dtypes.add(declared_dtype)
+        if len(declared_feature_dtypes) != 1:
+            raise ValueError("All cached frozen features must use one declared dtype.")
+        fields.append("conditioning_features")
     optional_frame_lengths = [LATENT_NUM_FRAMES_COLUMN in sample for sample in samples]
     if any(optional_frame_lengths) and not all(optional_frame_lengths):
         raise ValueError(
@@ -649,6 +720,17 @@ def save_dataset(
     dataset_dict = {field: [sample[field] for sample in samples] for field in fields}
 
     ds = Dataset.from_dict(dataset_dict)
+    if all(optional_conditioning_features):
+        arrow_feature = ds.features["conditioning_features"]
+        while hasattr(arrow_feature, "feature"):
+            arrow_feature = arrow_feature.feature
+        arrow_dtype = getattr(arrow_feature, "dtype", None)
+        declared_dtype = next(iter(declared_feature_dtypes))
+        if arrow_dtype != declared_dtype:
+            raise ValueError(
+                "Prepared Arrow feature dtype does not match the frozen frontend contract: "
+                f"{arrow_dtype!r} != {declared_dtype!r}."
+            )
     ds.save_to_disk(output_dir)
     write_prepared_dataset_manifest(ds, output_dir)
 

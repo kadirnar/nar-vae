@@ -52,6 +52,7 @@ class ODESolver:
         temporal_rescale_k: float = 1.0,
         temporal_rescale_sigma: float = 3.0,
         conditioning_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
         speaker_latent: torch.Tensor | None = None,
         speaker_mask: torch.Tensor | None = None,
         show_progress: bool = False,
@@ -168,6 +169,18 @@ class ODESolver:
             if tuple(conditioning_mask.shape) != tuple(conditioning_ids.shape):
                 raise ValueError("conditioning_mask must have the conditioning_ids shape.")
             conditioning_mask = conditioning_mask.to(device=device, dtype=torch.bool)
+        if conditioning_features is not None:
+            if (
+                conditioning_features.ndim != 3
+                or tuple(conditioning_features.shape[:2]) != tuple(conditioning_ids.shape)
+                or not torch.is_floating_point(conditioning_features)
+                or not bool(torch.isfinite(conditioning_features).all())
+            ):
+                raise ValueError(
+                    "conditioning_features must be finite floating states with shape "
+                    "[batch, conditioning_tokens, hidden_size]."
+                )
+            conditioning_features = conditioning_features.to(device)
         if token_durations is not None:
             if tuple(token_durations.shape) != tuple(conditioning_ids.shape):
                 raise ValueError("token_durations must have the conditioning_ids shape.")
@@ -279,6 +292,8 @@ class ODESolver:
                 prepare_cfg_kwargs["language_ids"] = language_ids
             if token_durations is not None:
                 prepare_cfg_kwargs["token_durations"] = token_durations
+            if conditioning_features is not None:
+                prepare_cfg_kwargs["conditioning_features"] = conditioning_features
             candidate = prepare_cfg(
                 conditioning_ids,
                 conditioning_mask,
@@ -300,6 +315,8 @@ class ODESolver:
                 prepare_kwargs["language_ids"] = language_ids
             if token_durations is not None:
                 prepare_kwargs["token_durations"] = token_durations
+            if conditioning_features is not None:
+                prepare_kwargs["conditioning_features"] = conditioning_features
             prepared_conditioning = prepare_conditioning(
                 conditioning_ids,
                 conditioning_mask,
@@ -381,6 +398,8 @@ class ODESolver:
                     cfg_kwargs["language_ids"] = language_ids
                 if token_durations is not None:
                     cfg_kwargs["token_durations"] = token_durations
+                if conditioning_features is not None:
+                    cfg_kwargs["conditioning_features"] = conditioning_features
                 return model.forward_with_cfg(
                     x_in,
                     conditioning_ids,
@@ -400,6 +419,8 @@ class ODESolver:
                 # implement only the original four-argument protocol.
                 if language_ids is not None:
                     model_kwargs = {"language_ids": language_ids}
+                    if conditioning_features is not None:
+                        model_kwargs["conditioning_features"] = conditioning_features
                     if token_durations is not None:
                         model_kwargs["token_durations"] = token_durations
                     return model(
@@ -410,17 +431,30 @@ class ODESolver:
                         **model_kwargs,
                     )
                 if token_durations is not None:
+                    model_kwargs = {"token_durations": token_durations}
+                    if conditioning_features is not None:
+                        model_kwargs["conditioning_features"] = conditioning_features
                     return model(
                         latents=x_in,
                         conditioning_ids=conditioning_ids,
                         timesteps=t_in,
                         attention_mask=conditioning_mask,
-                        token_durations=token_durations,
+                        **model_kwargs,
+                    )
+                if conditioning_features is not None:
+                    return model(
+                        latents=x_in,
+                        conditioning_ids=conditioning_ids,
+                        timesteps=t_in,
+                        attention_mask=conditioning_mask,
+                        conditioning_features=conditioning_features,
                     )
                 return model(x_in, conditioning_ids, t_in, conditioning_mask)
             if speaker_mask is None:
                 if language_ids is not None:
                     model_kwargs = {"language_ids": language_ids}
+                    if conditioning_features is not None:
+                        model_kwargs["conditioning_features"] = conditioning_features
                     if token_durations is not None:
                         model_kwargs["token_durations"] = token_durations
                     return model(
@@ -433,6 +467,9 @@ class ODESolver:
                         **model_kwargs,
                     )
                 if token_durations is not None:
+                    model_kwargs = {"token_durations": token_durations}
+                    if conditioning_features is not None:
+                        model_kwargs["conditioning_features"] = conditioning_features
                     return model(
                         latents=x_in,
                         conditioning_ids=conditioning_ids,
@@ -440,7 +477,17 @@ class ODESolver:
                         attention_mask=conditioning_mask,
                         speaker_latent=speaker_latent,
                         use_cfg_dropout=False,
-                        token_durations=token_durations,
+                        **model_kwargs,
+                    )
+                if conditioning_features is not None:
+                    return model(
+                        latents=x_in,
+                        conditioning_ids=conditioning_ids,
+                        timesteps=t_in,
+                        attention_mask=conditioning_mask,
+                        speaker_latent=speaker_latent,
+                        use_cfg_dropout=False,
+                        conditioning_features=conditioning_features,
                     )
                 return model(
                     x_in,
@@ -463,6 +510,8 @@ class ODESolver:
                 model_kwargs["language_ids"] = language_ids
             if token_durations is not None:
                 model_kwargs["token_durations"] = token_durations
+            if conditioning_features is not None:
+                model_kwargs["conditioning_features"] = conditioning_features
             return model(**model_kwargs)
 
         # Invariant text/speaker encoders and their projected KV caches are part

@@ -7,7 +7,7 @@ import json
 import os
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,7 @@ from nar_vae.dacvae.loader import (
     normalize_dacvae_source,
 )
 from nar_vae.dataset.representation import (
+    FROZEN_REPRESENTATION_CONTRACT_VERSION,
     REPRESENTATION_CONTRACT_VERSION,
     TEXT_FRONTEND_NAME,
     TEXT_FRONTEND_VERSION,
@@ -28,15 +29,16 @@ from nar_vae.languages import (
     resolve_language_pair_support,
 )
 from nar_vae.model_presets import ARCHITECTURE_FIELDS, resolve_model_architecture
+from nar_vae.text_frontend import FrozenTextFrontendSpec
 
 MODEL_MANIFEST_FILENAME = "nar_vae_manifest.json"
-MODEL_MANIFEST_SCHEMA_VERSION = 2
+MODEL_MANIFEST_SCHEMA_VERSION = 3
 MODEL_MANIFEST_LIBRARY = "nar-vae"
 MODEL_MANIFEST_STAGES = ("pretrain", "sft", "grpo")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _HUB_COMMIT = re.compile(r"[0-9a-fA-F]{40}")
 
-_ARCHITECTURE_FIELDS = (
+_ARCHITECTURE_FIELDS_V2 = (
     "latent_size",
     *ARCHITECTURE_FIELDS,
     "text_vocab_size",
@@ -44,6 +46,13 @@ _ARCHITECTURE_FIELDS = (
     "use_speaker_conditioning",
     "use_mas_duration",
     "norm_eps",
+)
+_ARCHITECTURE_FIELDS = (
+    *_ARCHITECTURE_FIELDS_V2,
+    "latent_patch_size",
+    "text_encoder_type",
+    "frozen_text_input_size",
+    "text_adapter_bottleneck_ratio",
 )
 _CAPABILITY_FIELDS = (
     "speaker_conditioning",
@@ -58,7 +67,7 @@ _CAPABILITY_FIELDS = (
     "monotonic_alignment",
     "duration_alignment_hidden_size",
 )
-_REPRESENTATION_FIELDS = (
+_REPRESENTATION_FIELDS_V2 = (
     "contract_version",
     "text_frontend_name",
     "text_frontend_version",
@@ -71,6 +80,7 @@ _REPRESENTATION_FIELDS = (
     "hop_length",
     "latent_width",
 )
+_REPRESENTATION_FIELDS = (*_REPRESENTATION_FIELDS_V2, "text_frontend")
 _PARENT_FIELDS = (
     "manifest_sha256",
     "stage",
@@ -161,7 +171,7 @@ def _mapping_with_exact_fields(
     return result
 
 
-def architecture_from_config(config: Mapping[str, Any]) -> dict[str, int | float]:
+def architecture_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve the exact model-construction shape stored with exported weights."""
     preset = resolve_model_architecture(config)
     architecture: dict[str, int | float] = {
@@ -174,9 +184,27 @@ def architecture_from_config(config: Mapping[str, Any]) -> dict[str, int | float
         "use_speaker_conditioning": _strict_boolean(config, "use_speaker_conditioning"),
         "use_mas_duration": _strict_boolean(config, "use_mas_duration"),
         "norm_eps": _finite_number(config.get("norm_eps", 1e-6), name="norm_eps"),
+        "latent_patch_size": _positive_integer(
+            config.get("latent_patch_size", 1), name="latent_patch_size"
+        ),
+        "text_encoder_type": config.get("text_encoder_type", "scratch"),
+        "frozen_text_input_size": (
+            _positive_integer(
+                config.get("frozen_text_input_size"),
+                name="frozen_text_input_size",
+            )
+            if config.get("text_encoder_type", "scratch") == "frozen_features"
+            else 0
+        ),
+        "text_adapter_bottleneck_ratio": _positive_integer(
+            config.get("text_adapter_bottleneck_ratio", 4),
+            name="text_adapter_bottleneck_ratio",
+        ),
     }
     if architecture["norm_eps"] <= 0:
         raise ModelManifestError("norm_eps must be positive.")
+    if architecture["text_encoder_type"] not in {"scratch", "frozen_features"}:
+        raise ModelManifestError("text_encoder_type must be 'scratch' or 'frozen_features'.")
     return architecture
 
 
@@ -266,10 +294,26 @@ def representation_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "dacvae_sha256 must bind the exact local or Hub codec artifact with a lowercase "
             "64-character SHA-256."
         )
+    frozen_frontend = None
+    if config.get("text_encoder_type", "scratch") == "frozen_features":
+        try:
+            frozen_frontend = FrozenTextFrontendSpec.from_config(dict(config))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ModelManifestError(str(exc)) from exc
     return {
-        "contract_version": REPRESENTATION_CONTRACT_VERSION,
-        "text_frontend_name": TEXT_FRONTEND_NAME,
-        "text_frontend_version": TEXT_FRONTEND_VERSION,
+        "contract_version": (
+            FROZEN_REPRESENTATION_CONTRACT_VERSION
+            if frozen_frontend is not None
+            else REPRESENTATION_CONTRACT_VERSION
+        ),
+        "text_frontend_name": (
+            frozen_frontend.contract_name if frozen_frontend is not None else TEXT_FRONTEND_NAME
+        ),
+        "text_frontend_version": (
+            frozen_frontend.contract_version
+            if frozen_frontend is not None
+            else TEXT_FRONTEND_VERSION
+        ),
         "codec_source": source.identifier,
         "codec_backend": backend,
         "codec_revision": source.revision,
@@ -282,6 +326,7 @@ def representation_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "latent_width": _positive_integer(
             config.get("dacvae_latent_dim"), name="dacvae_latent_dim"
         ),
+        "text_frontend": asdict(frozen_frontend) if frozen_frontend is not None else None,
     }
 
 
@@ -292,7 +337,7 @@ class ModelManifest:
     path: Path
     stage: str
     weights: Mapping[str, str]
-    architecture: Mapping[str, int | float]
+    architecture: Mapping[str, Any]
     capabilities: Mapping[str, Any]
     representation: Mapping[str, Any]
     parent: Mapping[str, Any] | None
@@ -319,7 +364,8 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
     }
     if set(raw) != expected_root:
         raise ModelManifestError("NAR-VAE model manifest has incomplete or unknown root fields.")
-    if raw["schema_version"] != MODEL_MANIFEST_SCHEMA_VERSION:
+    schema_version = raw["schema_version"]
+    if schema_version not in {2, MODEL_MANIFEST_SCHEMA_VERSION}:
         raise ModelManifestError("Unsupported NAR-VAE model-manifest schema.")
     if raw["library"] != MODEL_MANIFEST_LIBRARY:
         raise ModelManifestError("The acoustic checkpoint was not exported by NAR-VAE.")
@@ -337,9 +383,17 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             raise ModelManifestError(f"Weight {resolved_name!r} has an invalid SHA-256.")
         weights[resolved_name] = checksum
 
+    architecture_fields = _ARCHITECTURE_FIELDS_V2 if schema_version == 2 else _ARCHITECTURE_FIELDS
     architecture = _mapping_with_exact_fields(
-        raw["architecture"], _ARCHITECTURE_FIELDS, name="architecture"
+        raw["architecture"], architecture_fields, name="architecture"
     )
+    if schema_version == 2:
+        architecture.update(
+            latent_patch_size=1,
+            text_encoder_type="scratch",
+            frozen_text_input_size=0,
+            text_adapter_bottleneck_ratio=4,
+        )
     for name in _ARCHITECTURE_FIELDS:
         if name in {"use_speaker_conditioning", "use_mas_duration"}:
             if not isinstance(architecture[name], bool):
@@ -348,8 +402,22 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             architecture[name] = _finite_number(architecture[name], name=name)
             if architecture[name] <= 0:
                 raise ModelManifestError("Manifest architecture norm_eps must be positive.")
+        elif name == "text_encoder_type":
+            if architecture[name] not in {"scratch", "frozen_features"}:
+                raise ModelManifestError(
+                    "Manifest text_encoder_type must be 'scratch' or 'frozen_features'."
+                )
+        elif name == "frozen_text_input_size":
+            value = architecture[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ModelManifestError(
+                    "Manifest frozen_text_input_size must be a non-negative integer."
+                )
         else:
             architecture[name] = _positive_integer(architecture[name], name=name)
+    frozen_width = architecture["frozen_text_input_size"]
+    if (architecture["text_encoder_type"] == "frozen_features") != (frozen_width > 0):
+        raise ModelManifestError("Manifest frozen text encoder type and input width disagree.")
 
     capabilities = _mapping_with_exact_fields(
         raw["capabilities"], _CAPABILITY_FIELDS, name="capabilities"
@@ -448,16 +516,44 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             "MAS topology and monotonic-alignment capability metadata disagree."
         )
 
-    representation = _mapping_with_exact_fields(
-        raw["representation"], _REPRESENTATION_FIELDS, name="representation"
+    representation_fields = (
+        _REPRESENTATION_FIELDS_V2 if schema_version == 2 else _REPRESENTATION_FIELDS
     )
-    if representation["contract_version"] != REPRESENTATION_CONTRACT_VERSION:
+    representation = _mapping_with_exact_fields(
+        raw["representation"], representation_fields, name="representation"
+    )
+    if schema_version == 2:
+        representation["text_frontend"] = None
+    if representation["contract_version"] not in {
+        REPRESENTATION_CONTRACT_VERSION,
+        FROZEN_REPRESENTATION_CONTRACT_VERSION,
+    }:
         raise ModelManifestError("Unsupported prepared-data representation contract version.")
     for name in ("text_frontend_name", "codec_source", "codec_backend"):
         if not isinstance(representation[name], str) or not representation[name].strip():
             raise ModelManifestError(f"Manifest representation {name} must be non-empty.")
     if representation["text_frontend_version"] < 1:
         raise ModelManifestError("Manifest text_frontend_version must be positive.")
+    frontend_payload = representation["text_frontend"]
+    if architecture["text_encoder_type"] == "frozen_features":
+        if representation["contract_version"] != FROZEN_REPRESENTATION_CONTRACT_VERSION:
+            raise ModelManifestError("Frozen text features require representation contract v3.")
+        if not isinstance(frontend_payload, Mapping):
+            raise ModelManifestError("Frozen text features require a complete frontend contract.")
+        try:
+            frontend_spec = FrozenTextFrontendSpec(**dict(frontend_payload))
+        except (TypeError, ValueError) as exc:
+            raise ModelManifestError(f"Invalid frozen text frontend contract: {exc}") from exc
+        if frontend_spec.contract_name != representation["text_frontend_name"]:
+            raise ModelManifestError("Frozen text frontend name/fingerprint mismatch.")
+        if frontend_spec.hidden_size != architecture["frozen_text_input_size"]:
+            raise ModelManifestError("Frozen text frontend and adapter input widths disagree.")
+        representation["text_frontend"] = asdict(frontend_spec)
+    elif (
+        frontend_payload is not None
+        or representation["contract_version"] != REPRESENTATION_CONTRACT_VERSION
+    ):
+        raise ModelManifestError("Scratch text checkpoints require the legacy text representation.")
     for name in ("sample_rate", "hop_length", "latent_width"):
         representation[name] = _positive_integer(representation[name], name=name)
     revision = representation["codec_revision"]
@@ -533,14 +629,6 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             parent["selected_weight_filename"] = selected_name
             parent["base_weight_filename"] = base_name
 
-    normalized_raw = {
-        **raw,
-        "weights": weights,
-        "architecture": architecture,
-        "capabilities": capabilities,
-        "representation": representation,
-        "parent": parent,
-    }
     return ModelManifest(
         path=path,
         stage=stage,
@@ -549,7 +637,9 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         capabilities=capabilities,
         representation=representation,
         parent=parent,
-        raw=normalized_raw,
+        # Preserve the exact on-disk object for parent hashes. Parsed v2 defaults live only in
+        # the normalized architecture/representation views above.
+        raw=raw,
     )
 
 
@@ -911,7 +1001,7 @@ def validate_inference_manifest(
     if dict(manifest.capabilities) != dict(capabilities):
         raise ModelManifestError("Checkpoint capabilities do not match the NAR-VAE model manifest.")
     representation = manifest.representation
-    if (
+    if manifest.architecture["text_encoder_type"] == "scratch" and (
         representation["text_frontend_name"] != TEXT_FRONTEND_NAME
         or representation["text_frontend_version"] != TEXT_FRONTEND_VERSION
     ):

@@ -118,6 +118,19 @@ def model_export_config_from_manifest(manifest: ModelManifest) -> dict[str, Any]
         "dacvae_sample_rate": representation["sample_rate"],
         "dacvae_hop_length": representation["hop_length"],
     }
+    frontend = representation.get("text_frontend")
+    if isinstance(frontend, Mapping):
+        config.update(
+            text_frontend_model=frontend["model_id"],
+            text_frontend_revision=frontend["revision"],
+            text_frontend_input_mode=frontend["input_mode"],
+            text_frontend_layer=frontend["hidden_layer"],
+            text_frontend_max_length=frontend["max_length"],
+            text_frontend_dtype=frontend["feature_dtype"],
+            text_frontend_license=frontend["license"],
+            text_frontend_tokenizer_model=frontend.get("tokenizer_id"),
+            text_frontend_tokenizer_revision=frontend.get("tokenizer_revision"),
+        )
     return config
 
 
@@ -151,6 +164,14 @@ def _new_model_from_manifest(
         latent_size=architecture["latent_size"],
         text_vocab_size=architecture["text_vocab_size"],
         speaker_patch_size=architecture["speaker_patch_size"],
+        latent_patch_size=architecture["latent_patch_size"],
+        text_encoder_type=architecture["text_encoder_type"],
+        frozen_text_input_size=(
+            architecture["frozen_text_input_size"]
+            if architecture["text_encoder_type"] == "frozen_features"
+            else None
+        ),
+        text_adapter_bottleneck_ratio=architecture["text_adapter_bottleneck_ratio"],
         norm_eps=architecture["norm_eps"],
         cfg_dropout=cfg_dropout,
         use_speaker_conditioning=capabilities["speaker_conditioning"],
@@ -266,10 +287,18 @@ def _validate_grpo_parent_before_deserialization(
 class NARVAEGRPOCollator:
     """Collate one row per prompt while retaining metadata for external rewards."""
 
-    def __init__(self, *, pad_token: int, speaker_patch_size: int, prompt_id_column: str) -> None:
+    def __init__(
+        self,
+        *,
+        pad_token: int,
+        speaker_patch_size: int,
+        prompt_id_column: str,
+        conditioning_feature_dtype: str | None = None,
+    ) -> None:
         self.base = FlowMatchingDataCollator(
             pad_token=pad_token,
             speaker_patch_size=speaker_patch_size,
+            conditioning_feature_dtype=conditioning_feature_dtype,
         )
         self.prompt_id_column = prompt_id_column
 
@@ -376,6 +405,9 @@ def _velocity_adapter(
         ),
         speaker_mask=_expand_prompt_tensor(conditioning.get("speaker_mask"), group_size=group_size),
         language_ids=_expand_prompt_tensor(conditioning.get("language_ids"), group_size=group_size),
+        conditioning_features=_expand_prompt_tensor(
+            conditioning.get("conditioning_features"), group_size=group_size
+        ),
         latent_mask=_expand_prompt_tensor(conditioning.get("latent_mask"), group_size=group_size),
         token_durations=_expand_prompt_tensor(
             conditioning.get("token_durations"), group_size=group_size
@@ -530,6 +562,11 @@ def build_nar_vae_grpo_runtime(
         pad_token=pad_token,
         speaker_patch_size=int(parent_manifest.architecture["speaker_patch_size"]),
         prompt_id_column=config.prompt_id_column,
+        conditioning_feature_dtype=(
+            parent_manifest.representation["text_frontend"]["feature_dtype"]
+            if isinstance(parent_manifest.representation.get("text_frontend"), Mapping)
+            else None
+        ),
     )
 
     def prepare_batch(
@@ -554,6 +591,7 @@ def build_nar_vae_grpo_runtime(
                     model_inputs.get("speaker_latents"),
                     model_inputs.get("speaker_mask"),
                     model_inputs.get("language_ids"),
+                    model_inputs.get("conditioning_features"),
                     total_frames=batch["latent_lengths"].to(selected_device),
                 ).detach()
                 # expand_text_by_durations requires one tensor-wide frame count. Allocate only
@@ -621,6 +659,7 @@ def build_nar_vae_grpo_runtime(
                 speaker_latent=inputs.get("speaker_latents"),
                 speaker_mask=inputs.get("speaker_mask"),
                 language_ids=inputs.get("language_ids"),
+                conditioning_features=inputs.get("conditioning_features"),
                 token_durations=inputs.get("token_durations"),
             )
 

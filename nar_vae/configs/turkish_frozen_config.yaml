@@ -1,0 +1,61 @@
+# Experimental Turkish conditioning/voice-cloning baseline; quality is not yet established.
+#
+# mmBERT is an external, revision-pinned feature provider. It is always frozen and is not part
+# of the acoustic optimizer/checkpoint. The small residual projector, temporal reference encoder,
+# duration predictor, and rectified-flow EchoDiT are trained. The bundled DACVAE is unchanged.
+
+extends: "echodit_config.yaml"
+
+model_preset: "small"
+model_initialization: "random"
+
+text_encoder_type: "frozen_features"
+text_frontend_model: "jhu-clsp/mmBERT-small"
+text_frontend_revision: "abc32620dd4f6ab06f5fbe905dc25f310618e09f"
+text_frontend_input_mode: "raw_text"
+text_frontend_layer: -1
+text_frontend_max_length: 512
+text_frontend_dtype: "float16"
+text_frontend_license: "MIT"
+frozen_text_input_size: 384
+text_adapter_bottleneck_ratio: 4
+text_vocab_size: 256000
+pad_token: 0
+# This flag controls the trainable acoustic adapter. The external mmBERT provider is frozen
+# unconditionally, so the adapter must remain trainable.
+freeze_text_encoder: false
+
+# P2 halves the DiT sequence length while keeping the 128*2 acoustic output within the
+# 384-wide small backbone. P4 would create a rank-deficient 512 -> 384 -> 512 bottleneck.
+latent_patch_size: 2
+
+use_speaker_conditioning: true
+speaker_patch_size: 4
+freeze_speaker_encoder: false
+
+# A constant learned language embedding adds no discriminative information in a one-language
+# run. Turkish remains strict dataset/checkpoint/request metadata and can later be migrated to a
+# genuinely multilingual checkpoint with learned language conditioning.
+use_language_conditioning: false
+supported_languages: ["tr"]
+supported_language_pairs: null
+
+# The inexpensive utterance-level duration head is trained from exact DACVAE frame counts.
+# Hard MAS is disabled in this first run: contextual-model boundary tokens need a separately
+# validated zero-duration policy, and the current CPU-backtracking path is not a cheap default.
+use_duration_predictor: true
+duration_predictor_use_speaker: true
+duration_loss_weight: 0.1
+use_mas_duration: false
+duration_alignment_hidden_size: 64
+mas_duration_loss_weight: 0.0
+mas_alignment_loss_weight: 0.0
+
+cfg_dropout: 0.1
+cfg_dropout_text: 0.1
+cfg_dropout_speaker: 0.1
+
+TTS_dataset_local: "./data/turkish_prepared"
+run_name: "nar-vae-turkish-frozen-small-p2"
+save_folder: "checkpoints/nar_vae_turkish_frozen_small_p2"
+wandb_run_name: "nar-vae-turkish-frozen-small-p2"

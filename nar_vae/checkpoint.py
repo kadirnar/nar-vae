@@ -64,6 +64,7 @@ MONOTONIC_ALIGNMENT_METADATA_KEYS = {
 }
 MONOTONIC_ALIGNMENT_PARAMETER_PREFIX = "duration_alignment."
 MONOTONIC_FRAME_PROJECTION_KEY = "dit.frame_text_proj.weight"
+GLOBAL_LANGUAGE_EMBEDDING_KEY = "dit.global_language_embedding.weight"
 _HUB_COMMIT_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
 
@@ -218,6 +219,22 @@ def _duration_state_keys(state_dict: Mapping[str, torch.Tensor]) -> set[str]:
     }
 
 
+def _speaker_topology_keys(state_dict: Mapping[str, torch.Tensor]) -> set[str]:
+    """Return every additive speaker key from a concrete destination topology."""
+    return SPEAKER_STATE_KEYS | {
+        key
+        for key in state_dict
+        if key.startswith("dit.speaker_encoder.")
+        or key.startswith("dit.speaker_norm.")
+        or ".attention.wk_speaker." in key
+        or ".attention.wv_speaker." in key
+    }
+
+
+def _language_topology_keys(state_dict: Mapping[str, torch.Tensor]) -> set[str]:
+    return LANGUAGE_STATE_KEYS | {key for key in state_dict if key == GLOBAL_LANGUAGE_EMBEDDING_KEY}
+
+
 def _monotonic_alignment_state_keys(state_dict: Mapping[str, torch.Tensor]) -> set[str]:
     keys = MONOTONIC_ALIGNMENT_METADATA_KEYS | {
         key for key in state_dict if key.startswith(MONOTONIC_ALIGNMENT_PARAMETER_PREFIX)
@@ -292,15 +309,20 @@ def inspect_duration_capability(
     text_projection = state_dict.get("duration_predictor.text_projection.weight")
     output_projection = state_dict.get("duration_predictor.output_projection.weight")
     text_embedding = state_dict.get("dit.text_encoder.text_embedding.weight")
+    frozen_projection = state_dict.get("dit.text_encoder.in_proj.weight")
     if not isinstance(text_projection, torch.Tensor) or text_projection.ndim != 2:
         raise LegacyDurationCheckpointError("Duration text projection must be rank 2.")
     if not isinstance(output_projection, torch.Tensor) or output_projection.ndim != 2:
         raise LegacyDurationCheckpointError("Duration output projection must be rank 2.")
-    if not isinstance(text_embedding, torch.Tensor) or text_embedding.ndim != 2:
+    if isinstance(text_embedding, torch.Tensor) and text_embedding.ndim == 2:
+        text_width = text_embedding.shape[1]
+    elif isinstance(frozen_projection, torch.Tensor) and frozen_projection.ndim == 2:
+        text_width = frozen_projection.shape[0]
+    else:
         raise LegacyDurationCheckpointError(
-            "Duration checkpoints must include the EchoDiT text embedding."
+            "Duration checkpoints must include a scratch embedding or frozen-feature projector."
         )
-    if tuple(text_projection.shape) != (hidden_size, text_embedding.shape[1]):
+    if tuple(text_projection.shape) != (hidden_size, text_width):
         raise LegacyDurationCheckpointError(
             "Duration text projection does not match its stored hidden/text dimensions."
         )
@@ -418,6 +440,7 @@ def inspect_monotonic_alignment_capability(
         )
 
     text_embedding = state_dict.get("dit.text_encoder.text_embedding.weight")
+    frozen_projection = state_dict.get("dit.text_encoder.in_proj.weight")
     input_projection = state_dict.get("dit.in_proj.weight")
     statistics_weight = state_dict["duration_alignment.text_statistics.weight"]
     statistics_bias = state_dict["duration_alignment.text_statistics.bias"]
@@ -427,29 +450,39 @@ def inspect_monotonic_alignment_capability(
         raise LegacyMonotonicAlignmentCheckpointError(
             "Monotonic-alignment and frame-regulator state must contain tensors."
         )
-    if not isinstance(text_embedding, torch.Tensor) or text_embedding.ndim != 2:
+    if isinstance(text_embedding, torch.Tensor) and text_embedding.ndim == 2:
+        text_width = text_embedding.shape[1]
+    elif isinstance(frozen_projection, torch.Tensor) and frozen_projection.ndim == 2:
+        text_width = frozen_projection.shape[0]
+    else:
         raise LegacyMonotonicAlignmentCheckpointError(
-            "MAS checkpoints must include the EchoDiT text embedding."
+            "MAS checkpoints require a scratch embedding or frozen-feature projector."
         )
     if not isinstance(input_projection, torch.Tensor) or input_projection.ndim != 2:
         raise LegacyMonotonicAlignmentCheckpointError(
             "MAS checkpoints must include the EchoDiT latent input projection."
         )
+    raw_latent_width = latent_projection.shape[1]
+    if raw_latent_width <= 0 or input_projection.shape[1] % raw_latent_width:
+        raise LegacyMonotonicAlignmentCheckpointError(
+            "EchoDiT packed input width is not a multiple of the raw MAS latent width."
+        )
+    latent_patch_size = input_projection.shape[1] // raw_latent_width
     if frame_projection.ndim != 2 or tuple(frame_projection.shape) != (
         input_projection.shape[0],
-        text_embedding.shape[1],
+        text_width * latent_patch_size,
     ):
         raise LegacyMonotonicAlignmentCheckpointError(
             "MAS frame-regulator projection does not match the model/text dimensions."
         )
-    if hidden_size > input_projection.shape[1]:
+    if hidden_size > raw_latent_width:
         raise LegacyMonotonicAlignmentCheckpointError(
             "Monotonic-alignment hidden size cannot exceed the latent width."
         )
     expected_shapes = (
-        (hidden_size * 2, text_embedding.shape[1]),
+        (hidden_size * 2, text_width),
         (hidden_size * 2,),
-        (hidden_size, input_projection.shape[1]),
+        (hidden_size, raw_latent_width),
     )
     if tuple(statistics_weight.shape) != expected_shapes[0]:
         raise LegacyMonotonicAlignmentCheckpointError(
@@ -579,11 +612,16 @@ def inspect_language_conditioning(
         )
 
     text_embedding = state_dict.get("dit.text_encoder.text_embedding.weight")
-    if not isinstance(text_embedding, torch.Tensor) or text_embedding.ndim != 2:
+    frozen_projection = state_dict.get("dit.text_encoder.in_proj.weight")
+    if isinstance(text_embedding, torch.Tensor) and text_embedding.ndim == 2:
+        text_width = text_embedding.shape[1]
+    elif isinstance(frozen_projection, torch.Tensor) and frozen_projection.ndim == 2:
+        text_width = frozen_projection.shape[0]
+    else:
         raise LegacyLanguageCheckpointError(
-            "Language-conditioned checkpoints must include a rank-2 text embedding."
+            "Language-conditioned checkpoints require a scratch embedding or frozen projector."
         )
-    if embedding.shape[1] != text_embedding.shape[1]:
+    if embedding.shape[1] != text_width:
         raise LegacyLanguageCheckpointError(
             "Language and text embedding widths do not match in this checkpoint."
         )
@@ -1139,9 +1177,13 @@ def load_pretrained_checkpoint(
         missing = set(result.missing_keys)
         expected_missing = set()
         if initialize_speaker_conditioning:
-            expected_missing.update(SPEAKER_STATE_KEYS)
+            expected_missing.update(
+                _speaker_topology_keys(model.state_dict()) - set(normalized_state)
+            )
         if initialize_language_conditioning:
-            expected_missing.update(LANGUAGE_STATE_KEYS)
+            expected_missing.update(
+                _language_topology_keys(model.state_dict()) - set(normalized_state)
+            )
         if initialize_cross_lingual_capability:
             expected_missing.update(CROSS_LINGUAL_STATE_KEYS)
         if initialize_duration_predictor:
@@ -1254,6 +1296,24 @@ class FlowCheckpoint:
         """Strictly load a base checkpoint, then overlay partial EMA weights if used."""
         model_keys = set(model.state_dict())
 
+        def load_base(state_dict: Mapping[str, torch.Tensor]) -> None:
+            compatible = compatible_state_dict(state_dict)
+            allow_legacy_global_language = (
+                GLOBAL_LANGUAGE_EMBEDDING_KEY in model_keys
+                and GLOBAL_LANGUAGE_EMBEDDING_KEY not in compatible
+                and LANGUAGE_EMBEDDING_KEY in compatible
+            )
+            incompatible = model.load_state_dict(compatible, strict=False)
+            allowed_missing = (
+                {GLOBAL_LANGUAGE_EMBEDDING_KEY} if allow_legacy_global_language else set()
+            )
+            if set(incompatible.missing_keys) != allowed_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "Checkpoint topology does not match the model. "
+                    f"Missing: {sorted(incompatible.missing_keys)}; "
+                    f"unexpected: {sorted(incompatible.unexpected_keys)}."
+                )
+
         def compatible_state_dict(
             state_dict: Mapping[str, torch.Tensor],
         ) -> Mapping[str, torch.Tensor]:
@@ -1268,7 +1328,7 @@ class FlowCheckpoint:
             return {key: value for key, value in state_dict.items() if key not in ignored}
 
         if self.base_state_dict is not None:
-            model.load_state_dict(compatible_state_dict(self.base_state_dict), strict=True)
+            load_base(self.base_state_dict)
             incompatible = model.load_state_dict(
                 compatible_state_dict(self.state_dict),
                 strict=False,
@@ -1278,7 +1338,7 @@ class FlowCheckpoint:
                     f"EMA checkpoint contains unexpected keys: {incompatible.unexpected_keys}"
                 )
             return
-        model.load_state_dict(compatible_state_dict(self.state_dict), strict=True)
+        load_base(self.state_dict)
 
 
 __all__ = [

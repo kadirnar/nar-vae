@@ -1,0 +1,68 @@
+# Low-cost multilingual, transcript-free voice-cloning research recipe.
+#
+# The DACVAE artifact and public latent representation are exactly the canonical ones in
+# echodit_config.yaml.  Only the acoustic model is trained. mmBERT runs frozen outside the
+# acoustic checkpoint; prepared rows cache its contextual states before the small projector.
+
+extends: "echodit_config.yaml"
+
+model_preset: "small"
+model_initialization: "random"  # Random acoustic model; the external text provider is pretrained.
+
+# Frozen raw-text provider. Every mutable dependency is pinned in the representation contract.
+text_encoder_type: "frozen_features"
+text_frontend_model: "jhu-clsp/mmBERT-small"
+text_frontend_revision: "abc32620dd4f6ab06f5fbe905dc25f310618e09f"
+text_frontend_input_mode: "raw_text"
+text_frontend_layer: -1
+text_frontend_max_length: 512
+text_frontend_dtype: "float16"
+text_frontend_license: "MIT"
+frozen_text_input_size: 384
+text_adapter_bottleneck_ratio: 4
+text_vocab_size: 256000
+pad_token: 0
+freeze_text_encoder: false  # Keep the small acoustic projector trainable; mmBERT is external/frozen.
+
+# Lossless target-latent packing happens only inside EchoDiT. Dataset latents, MAS durations,
+# ODE tensors, and DACVAE encode/decode remain native 128-channel, ~86-Hz values.
+latent_patch_size: 2
+
+use_speaker_conditioning: true
+speaker_patch_size: 4
+freeze_speaker_encoder: false
+
+use_language_conditioning: true
+supported_languages: ["en", "de", "es", "fr", "tr", "ja"]
+# Start with same-language cloning plus English-reference cross-lingual rows. Expand only when
+# the prepared dataset actually contains the corresponding same-speaker language pairs.
+supported_language_pairs:
+  - ["en", "en"]
+  - ["de", "de"]
+  - ["es", "es"]
+  - ["fr", "fr"]
+  - ["tr", "tr"]
+  - ["ja", "ja"]
+  - ["de", "en"]
+  - ["es", "en"]
+  - ["fr", "en"]
+  - ["tr", "en"]
+  - ["ja", "en"]
+
+use_duration_predictor: true
+duration_predictor_use_speaker: true
+use_mas_duration: false
+duration_alignment_hidden_size: 64
+duration_loss_weight: 0.1
+mas_duration_loss_weight: 0.0
+mas_alignment_loss_weight: 0.0
+
+# Independent dropout teaches text/reference null branches. Inference can choose joint or
+# alternating CFG to avoid the three-backbone-call cost of independent CFG.
+cfg_dropout: 0.1
+cfg_dropout_text: 0.1
+cfg_dropout_speaker: 0.1
+
+run_name: "nar-vae-multilingual-frozen-small-p2"
+save_folder: "checkpoints/nar_vae_multilingual_frozen_small_p2"
+wandb_run_name: "nar-vae-multilingual-frozen-small-p2"

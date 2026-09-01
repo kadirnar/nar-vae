@@ -328,6 +328,7 @@ class FlowMatchingLoss(nn.Module):
         speaker_mask: torch.Tensor | None = None,  # [B, T_speaker] or [B, L_speaker]
         language_ids: torch.Tensor | None = None,  # [B] target-language IDs
         token_durations: torch.Tensor | None = None,  # [B, L] fixed MAS allocation
+        conditioning_features: torch.Tensor | None = None,  # [B, L, H] frozen states
         accumulation_normalization: AccumulationLossNormalization | None = None,
     ) -> torch.Tensor:
         """
@@ -399,6 +400,7 @@ class FlowMatchingLoss(nn.Module):
             "speaker_latent": speaker_latent,
             "speaker_mask": speaker_mask,
             "language_ids": language_ids,
+            "conditioning_features": conditioning_features,
             "use_cfg_dropout": True,
         }
         if latent_mask is not None:

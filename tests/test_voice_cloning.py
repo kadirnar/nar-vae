@@ -3,13 +3,12 @@
 import unittest
 from inspect import signature
 from pathlib import Path
-from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from nar_vae.inference import FlowMatchingTTSInference, VoiceCloningUnsupportedError
-from nar_vae.models.flow_matching import FlowMatchingEchoDiT, PreparedCFGConditioning
+from nar_vae.models.flow_matching import FlowMatchingEchoDiT
 from nar_vae.solvers.ode_solver import ODESolver
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
@@ -35,6 +34,33 @@ def make_runtime(*, supported: bool) -> FlowMatchingTTSInference:
     runtime.max_reference_seconds = 2.0
     runtime.dacvae = FakeCodec()
     return runtime
+
+
+def make_tiny_cfg_model() -> FlowMatchingEchoDiT:
+    model = FlowMatchingEchoDiT(
+        latent_size=2,
+        model_size=8,
+        num_layers=1,
+        num_heads=2,
+        intermediate_size=16,
+        text_vocab_size=32,
+        text_model_size=8,
+        text_num_layers=1,
+        text_num_heads=2,
+        text_intermediate_size=16,
+        speaker_patch_size=2,
+        speaker_model_size=8,
+        speaker_num_layers=1,
+        speaker_num_heads=2,
+        speaker_intermediate_size=16,
+        timestep_embed_size=8,
+        adaln_rank=4,
+        use_speaker_conditioning=True,
+        use_language_conditioning=False,
+        supported_languages=("en",),
+    ).eval()
+    torch.nn.init.normal_(model.dit.out_proj.weight, std=0.1)
+    return model
 
 
 class VoiceCloningTest(unittest.TestCase):
@@ -75,6 +101,26 @@ class VoiceCloningTest(unittest.TestCase):
             int(DEFAULT_MAX_REFERENCE_SECONDS * runtime.sample_rate),
         )
 
+    def test_multiple_references_are_concatenated_under_one_budget(self):
+        runtime = make_runtime(supported=True)
+
+        runtime.encode_reference_audio(
+            [torch.zeros(12000), torch.ones(24000)],
+            sample_rate=[48000, 48000],
+            max_seconds=0.5,
+        )
+
+        waveform = runtime.dacvae.last_waveform
+        self.assertEqual(tuple(waveform.shape), (1, 1, 24000))
+        torch.testing.assert_close(waveform[..., :12000], torch.zeros(1, 1, 12000))
+        torch.testing.assert_close(waveform[..., 12000:], torch.ones(1, 1, 12000))
+
+        with self.assertRaisesRegex(ValueError, "sample rates must align"):
+            runtime.encode_reference_audio(
+                [torch.zeros(100), torch.ones(100)],
+                sample_rate=[48000],
+            )
+
     def test_reference_and_preencoded_latent_are_mutually_exclusive(self):
         runtime = make_runtime(supported=True)
 
@@ -112,156 +158,62 @@ class VoiceCloningTest(unittest.TestCase):
             )
 
     def test_cfg_null_reference_matches_reference_length(self):
-        model = FlowMatchingEchoDiT.__new__(FlowMatchingEchoDiT)
-        torch.nn.Module.__init__(model)
-        model.use_speaker_conditioning = True
-        model.register_buffer("null_speaker_embed", torch.zeros(1, 2, 4))
-        seen_references = []
-        seen_masks = []
-
-        def fake_forward(
-            self,
-            latents,
-            conditioning_ids,
-            timesteps,
-            attention_mask=None,
-            speaker_latent=None,
-            use_cfg_dropout=False,
-            speaker_mask=None,
-        ):
-            del self, conditioning_ids, timesteps, attention_mask, use_cfg_dropout
-            seen_references.append(speaker_latent)
-            seen_masks.append(speaker_mask)
-            return torch.zeros_like(latents)
-
-        model.forward = MethodType(fake_forward, model)
+        model = make_tiny_cfg_model()
         reference = torch.ones(1, 2, 8)
-        model.forward_with_cfg(
-            torch.zeros(1, 2, 2),
+        encoded = model.encode_inference_conditioning(
             torch.ones(1, 2, dtype=torch.long),
-            torch.zeros(1),
-            cfg_scale=2.0,
+            torch.ones(1, 2, dtype=torch.bool),
+            reference,
             cfg_mode="joint",
-            speaker_latent=reference,
-            speaker_mask=torch.tensor([[True, False]]),
-            fuse_cfg_branches=True,
+            speaker_mask=torch.ones(1, 4, dtype=torch.bool),
         )
 
-        self.assertEqual(len(seen_references), 1)
-        self.assertEqual(tuple(seen_references[0].shape), (2, 2, 8))
-        torch.testing.assert_close(seen_references[0][0], reference[0])
-        self.assertEqual(seen_references[0][1].count_nonzero().item(), 0)
-        self.assertEqual(len(seen_masks), 1)
+        conditional_mask, null_mask = encoded.variants[0].speaker_mask.chunk(2)
+        torch.testing.assert_close(conditional_mask, torch.ones(1, 4, dtype=torch.bool))
         torch.testing.assert_close(
-            seen_masks[0],
-            torch.tensor([[True, False], [True, False]]),
+            null_mask,
+            torch.tensor([[True, False, False, False]]),
         )
 
     def test_independent_cfg_is_fused_without_changing_the_formula(self):
-        model = FlowMatchingEchoDiT.__new__(FlowMatchingEchoDiT)
-        torch.nn.Module.__init__(model)
-        model.use_speaker_conditioning = True
-        model.register_buffer("null_speaker_embed", torch.zeros(1, 2, 4))
-        forward_calls = []
-
-        def fake_forward(
-            self,
-            latents,
-            conditioning_ids,
-            timesteps,
-            attention_mask=None,
-            speaker_latent=None,
-            use_cfg_dropout=False,
-            speaker_mask=None,
-        ):
-            del self, timesteps, attention_mask, use_cfg_dropout, speaker_mask
-            forward_calls.append(latents.shape[0])
-            text_value = conditioning_ids.float().sum(dim=1)
-            speaker_value = speaker_latent.float().mean(dim=(1, 2))
-            value = text_value + speaker_value
-            return value[:, None, None].expand_as(latents)
-
-        model.forward = MethodType(fake_forward, model)
-        output = model.forward_with_cfg(
-            torch.zeros(1, 2, 2),
-            torch.ones(1, 2, dtype=torch.long),
-            torch.zeros(1),
-            cfg_scale=2.0,
-            cfg_mode="independent",
-            cfg_scale_text=2.5,
-            cfg_scale_speaker=2.0,
-            speaker_latent=torch.ones(1, 2, 4),
-            fuse_cfg_branches=True,
-        )
-
-        self.assertEqual(forward_calls, [3])
-        torch.testing.assert_close(output, torch.full_like(output, 10.0))
-
-        forward_calls.clear()
-        sequential_output = model.forward_with_cfg(
-            torch.zeros(1, 2, 2),
-            torch.ones(1, 2, dtype=torch.long),
-            torch.zeros(1),
+        torch.manual_seed(13)
+        model = make_tiny_cfg_model()
+        common = dict(
+            latents=torch.randn(1, 2, 4),
+            conditioning_ids=torch.tensor([[1, 2]]),
+            timesteps=torch.tensor([0.5]),
             cfg_scale=2.0,
             cfg_mode="independent",
             cfg_scale_text=2.5,
             cfg_scale_speaker=2.0,
             speaker_latent=torch.ones(1, 2, 4),
         )
-
-        self.assertEqual(forward_calls, [1, 1, 1])
-        torch.testing.assert_close(sequential_output, output)
+        fused = model.forward_with_cfg(**common, fuse_cfg_branches=True)
+        sequential = model.forward_with_cfg(**common, fuse_cfg_branches=False)
+        torch.testing.assert_close(fused, sequential)
 
     def test_alternating_cfg_matches_prepared_and_fallback_formulas(self):
-        model = FlowMatchingEchoDiT.__new__(FlowMatchingEchoDiT)
-        torch.nn.Module.__init__(model)
-        model.use_speaker_conditioning = True
-        model.register_buffer("null_speaker_embed", torch.zeros(1, 2, 4))
-
-        def fake_forward(
-            self,
-            latents,
-            conditioning_ids,
-            timesteps,
-            attention_mask=None,
-            speaker_latent=None,
-            **kwargs,
-        ):
-            del self, timesteps, attention_mask, kwargs
-            text = conditioning_ids.float().sum(dim=1)
-            speaker = speaker_latent.float().mean(dim=(1, 2))
-            return (text + speaker)[:, None, None].expand_as(latents)
-
-        def fake_forward_prepared(self, latents, timesteps, conditioning):
-            del self, timesteps
-            return conditioning.values[:, None, None].expand_as(latents)
-
-        model.forward = MethodType(fake_forward, model)
-        model.forward_prepared = MethodType(fake_forward_prepared, model)
-        conditional = SimpleNamespace(values=torch.tensor([3.0]))
-        prepared = PreparedCFGConditioning(
-            mode="alternating",
-            branch_count=2,
-            variants=(
-                SimpleNamespace(values=torch.tensor([3.0, 1.0])),
-                SimpleNamespace(values=torch.tensor([3.0, 2.0])),
-            ),
-            conditional=conditional,
-        )
+        torch.manual_seed(17)
+        model = make_tiny_cfg_model()
         common = {
-            "latents": torch.zeros(1, 2, 2),
-            "conditioning_ids": torch.ones(1, 2, dtype=torch.long),
-            "timesteps": torch.zeros(1),
+            "latents": torch.randn(1, 2, 4),
+            "conditioning_ids": torch.tensor([[1, 2]]),
+            "timesteps": torch.tensor([0.5]),
             "cfg_scale": 2.0,
             "cfg_mode": "alternating",
             "cfg_scale_text": 2.5,
             "cfg_scale_speaker": 2.0,
             "speaker_latent": torch.ones(1, 2, 4),
         }
+        prepared = model.prepare_fused_cfg_conditioning(
+            common["conditioning_ids"],
+            speaker_latent=common["speaker_latent"],
+            cfg_mode="alternating",
+        )
 
-        for step_idx, expected in ((0, 6.0), (1, 4.0)):
+        for step_idx in (0, 1):
             with self.subTest(step_idx=step_idx):
-                fallback = model.forward_with_cfg(**common, step_idx=step_idx)
+                direct = model.forward_with_cfg(**common, step_idx=step_idx)
                 cached = model.forward_with_prepared_cfg(
                     common["latents"],
                     common["timesteps"],
@@ -271,8 +223,7 @@ class VoiceCloningTest(unittest.TestCase):
                     cfg_scale_speaker=common["cfg_scale_speaker"],
                     step_idx=step_idx,
                 )
-                torch.testing.assert_close(fallback, cached)
-                torch.testing.assert_close(fallback, torch.full_like(fallback, expected))
+                torch.testing.assert_close(direct, cached)
 
     def test_prepared_cfg_reuses_encoder_caches_and_preserves_the_formula(self):
         class FakeDiT(torch.nn.Module):

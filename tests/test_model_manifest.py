@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 from nar_vae.checkpoint import (
     CheckpointProvenance,
     DurationCheckpointInfo,
+    FlowCheckpoint,
     LanguageCheckpointInfo,
     MonotonicAlignmentCheckpointInfo,
     ReferenceLanguageCheckpointInfo,
@@ -86,7 +87,7 @@ class ModelManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(ModelManifestError, "manifest SHA-256"):
                 validate_manifest_weight(loaded, weights)
 
-    def test_manifest_v2_records_exact_language_pairs_authoritatively(self):
+    def test_manifest_v3_records_exact_language_pairs_authoritatively(self):
         config = model_config("./codec/weights.pth")
         config.update(
             use_speaker_conditioning=True,
@@ -99,7 +100,7 @@ class ModelManifestTest(unittest.TestCase):
             root = Path(directory)
             _, manifest = self._write(root, config)
 
-            self.assertEqual(manifest.raw["schema_version"], 2)
+            self.assertEqual(manifest.raw["schema_version"], 3)
             self.assertEqual(
                 manifest.capabilities["supported_language_pairs"],
                 [["es", "en"], ["en", "ja"]],
@@ -114,6 +115,54 @@ class ModelManifestTest(unittest.TestCase):
             (root / MODEL_MANIFEST_FILENAME).write_text(json.dumps(raw), encoding="utf-8")
             with self.assertRaisesRegex(ModelManifestError, "Unsupported.*schema"):
                 load_model_manifest(root / MODEL_MANIFEST_FILENAME)
+
+    def test_schema_two_is_normalized_to_legacy_scratch_and_patch_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root)
+            raw = json.loads(json.dumps(manifest.raw))
+            raw["schema_version"] = 2
+            for field in (
+                "latent_patch_size",
+                "text_encoder_type",
+                "frozen_text_input_size",
+                "text_adapter_bottleneck_ratio",
+            ):
+                raw["architecture"].pop(field)
+            raw["representation"].pop("text_frontend")
+            (root / MODEL_MANIFEST_FILENAME).write_text(json.dumps(raw), encoding="utf-8")
+
+            loaded = load_model_manifest(root / MODEL_MANIFEST_FILENAME)
+            self.assertEqual(loaded.architecture["latent_patch_size"], 1)
+            self.assertEqual(loaded.architecture["text_encoder_type"], "scratch")
+            self.assertIsNone(loaded.representation["text_frontend"])
+            self.assertEqual(loaded.raw["schema_version"], 2)
+
+    def test_frozen_frontend_and_patch_are_bound_by_schema_three(self):
+        config = model_config("./codec/weights.pth")
+        config.update(
+            text_encoder_type="frozen_features",
+            frozen_text_input_size=384,
+            text_adapter_bottleneck_ratio=4,
+            latent_patch_size=4,
+            text_frontend_model="jhu-clsp/mmBERT-small",
+            text_frontend_revision="abc32620dd4f6ab06f5fbe905dc25f310618e09f",
+            text_frontend_input_mode="raw_text",
+            text_frontend_layer=-1,
+            text_frontend_max_length=512,
+            text_frontend_dtype="float16",
+            text_frontend_license="MIT",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root, config)
+            self.assertEqual(manifest.architecture["latent_patch_size"], 4)
+            self.assertEqual(manifest.architecture["text_encoder_type"], "frozen_features")
+            self.assertEqual(manifest.representation["contract_version"], 3)
+            self.assertEqual(
+                manifest.representation["text_frontend"]["model_id"],
+                "jhu-clsp/mmBERT-small",
+            )
 
     def test_manifest_parser_rejects_multilingual_speaker_topology_without_exact_pairs(self):
         config = model_config("./codec/weights.pth")
@@ -388,6 +437,25 @@ class ModelManifestTest(unittest.TestCase):
                 device="cpu",
             )
         load_codec.assert_not_called()
+
+    def test_inference_rejects_partial_ema_without_base_provenance(self):
+        checkpoint = FlowCheckpoint(
+            path=Path("ema_model.bin"),
+            state_dict={"ema": object()},
+            base_state_dict={"base": object()},
+            is_ema=True,
+            provenance=None,
+        )
+
+        with (
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=checkpoint),
+            self.assertRaisesRegex(ModelManifestError, "must expose provenance"),
+        ):
+            FlowMatchingTTSInference(
+                "ema_model.bin",
+                dacvae_model="codec.pth",
+                device="cpu",
+            )
 
     def test_inference_rejects_missing_manifest_before_deserializing_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:

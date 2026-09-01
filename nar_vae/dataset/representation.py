@@ -10,6 +10,7 @@ from nar_vae.dacvae.loader import HubDACVAESource, describe_dacvae_source
 
 REPRESENTATION_CONTRACT_COLUMN = "representation_contract"
 REPRESENTATION_CONTRACT_VERSION = 2
+FROZEN_REPRESENTATION_CONTRACT_VERSION = 3
 TEXT_FRONTEND_NAME = "nar_vae.encode_tts_text/cl100k_base"
 TEXT_FRONTEND_VERSION = 1
 
@@ -33,10 +34,14 @@ class RepresentationContract:
     sample_rate: int
     hop_length: int
     latent_width: int
+    text_frontend: dict[str, Any] | None = None
 
-    def to_dict(self) -> dict[str, int | str | None]:
+    def to_dict(self) -> dict[str, Any]:
         """Return an independent, Arrow-friendly row value."""
-        return asdict(self)
+        value = asdict(self)
+        if self.text_frontend is None:
+            value.pop("text_frontend")
+        return value
 
 
 def _positive_integer(value: Any, *, name: str) -> int:
@@ -65,6 +70,7 @@ def build_representation_contract(
     codec: Any,
     *,
     codec_source: str | os.PathLike[str] | HubDACVAESource,
+    text_frontend: Any | None = None,
 ) -> RepresentationContract:
     """Build a contract from the codec instance actually used for preparation."""
     source = describe_dacvae_source(codec_source)
@@ -94,10 +100,24 @@ def build_representation_contract(
             "The loaded codec does not expose a lowercase artifact SHA-256."
         )
 
+    frontend_payload = None
+    if text_frontend is not None:
+        try:
+            frontend_payload = asdict(text_frontend)
+            frontend_name = text_frontend.contract_name
+            frontend_version = int(text_frontend.contract_version)
+        except (TypeError, AttributeError, ValueError) as exc:
+            raise RepresentationContractError("Invalid frozen text frontend contract.") from exc
+        contract_version = FROZEN_REPRESENTATION_CONTRACT_VERSION
+    else:
+        frontend_name = TEXT_FRONTEND_NAME
+        frontend_version = TEXT_FRONTEND_VERSION
+        contract_version = REPRESENTATION_CONTRACT_VERSION
+
     return RepresentationContract(
-        contract_version=REPRESENTATION_CONTRACT_VERSION,
-        text_frontend_name=TEXT_FRONTEND_NAME,
-        text_frontend_version=TEXT_FRONTEND_VERSION,
+        contract_version=contract_version,
+        text_frontend_name=frontend_name,
+        text_frontend_version=frontend_version,
         codec_source=source.identifier,
         codec_backend=backend.strip(),
         codec_revision=source.revision,
@@ -106,6 +126,7 @@ def build_representation_contract(
         sample_rate=_positive_integer(getattr(codec, "sample_rate", None), name="sample_rate"),
         hop_length=_positive_integer(getattr(codec, "hop_length", None), name="hop_length"),
         latent_width=_codec_latent_width(codec),
+        text_frontend=frontend_payload,
     )
 
 
@@ -154,6 +175,7 @@ def attach_representation_contract(
 __all__ = [
     "REPRESENTATION_CONTRACT_COLUMN",
     "REPRESENTATION_CONTRACT_VERSION",
+    "FROZEN_REPRESENTATION_CONTRACT_VERSION",
     "TEXT_FRONTEND_NAME",
     "TEXT_FRONTEND_VERSION",
     "RepresentationContract",

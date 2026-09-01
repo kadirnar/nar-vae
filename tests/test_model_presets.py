@@ -19,12 +19,12 @@ from nar_vae.models.flow_matching import create_flow_matching_echodit
 ROOT = Path(__file__).resolve().parents[1]
 
 EXPECTED_PARAMETER_COUNTS = {
-    "nano": (16_267_393, 16_805_313),
-    "tiny": (40_514_049, 42_708_097),
-    "small": (77_210_945, 83_118_849),
-    "medium": (169_604_353, 186_234_369),
-    "large": (353_931_137, 387_900_161),
-    "xlarge": (647_064_065, 690_472_705),
+    "nano": (16_267_393, 16_806_529),
+    "tiny": (40_514_049, 42_710_529),
+    "small": (77_210_945, 83_122_497),
+    "medium": (169_604_353, 186_239_233),
+    "large": (353_931_137, 387_905_025),
+    "xlarge": (647_064_065, 690_477_569),
 }
 
 

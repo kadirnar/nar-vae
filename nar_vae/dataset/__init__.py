@@ -31,6 +31,14 @@ _LAZY_EXPORTS = {
         "nar_vae.dataset.prepare_dataset",
         "prepare_from_hf_dataset",
     ),
+    "prepare_from_local_folder": (
+        "nar_vae.dataset.prepare_dataset",
+        "prepare_from_local_folder",
+    ),
+    "prepare_from_csv": (
+        "nar_vae.dataset.prepare_dataset",
+        "prepare_from_csv",
+    ),
     "prepare_finetune_dataset": (
         "nar_vae.dataset.finetune_prepare",
         "prepare_finetune_dataset",
@@ -97,6 +105,8 @@ __all__ = [
     "DatasetPreparer",
     "prepare_dataset",
     "prepare_from_hf_dataset",
+    "prepare_from_local_folder",
+    "prepare_from_csv",
     "prepare_finetune_dataset",
     "validate_zero_shot_splits",
     "FrameBudgetBatchSampler",

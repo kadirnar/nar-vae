@@ -1,5 +1,6 @@
 import math
 import time
+from collections.abc import Sequence
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from nar_vae.languages import (
 )
 from nar_vae.model_manifest import (
     MODEL_MANIFEST_FILENAME,
+    ModelManifestError,
     load_model_manifest,
     validate_inference_manifest,
     validate_loaded_codec,
@@ -38,10 +40,12 @@ from nar_vae.model_manifest import (
 from nar_vae.model_presets import get_model_preset
 from nar_vae.models.flow_matching import create_flow_matching_echodit
 from nar_vae.solvers.ode_solver import ODESolver
+from nar_vae.text_frontend import FrozenTextFrontend, FrozenTextFrontendSpec
 from nar_vae.tokenization import PAD_TOKEN, TOTAL_VOCAB_SIZE, encode_tts_text
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 AudioReference = str | Path | torch.Tensor
+AudioReferenceInput = AudioReference | Sequence[AudioReference]
 
 
 class VoiceCloningUnsupportedError(RuntimeError):
@@ -115,6 +119,10 @@ class FlowMatchingTTSInference:
         adaln_rank: int = 128,
         norm_eps: float = 1e-6,
         use_duration_predictor: bool | None = None,
+        latent_patch_size: int | None = None,
+        text_encoder_type: str | None = None,
+        frozen_text_input_size: int | None = None,
+        text_adapter_bottleneck_ratio: int | None = None,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.latent_size = latent_size
@@ -152,8 +160,46 @@ class FlowMatchingTTSInference:
             preload_validator=validate_before_deserialization,
         )
         self.checkpoint_provenance = checkpoint.provenance
+        if (
+            checkpoint.provenance is None
+            and getattr(checkpoint, "is_ema", False) is True
+            and getattr(checkpoint, "base_state_dict", None) is not None
+        ):
+            raise ModelManifestError(
+                "A custom loader returning a partial EMA checkpoint must expose provenance "
+                "with the manifest-bound EMA and base checkpoint paths."
+            )
+        if preloaded_manifest is None:
+            # The built-in loader invokes the authenticated callback before deserialization.
+            # Custom checkpoint adapters may not, so recover their manifest as early as possible
+            # (before any architecture inference) when they expose a real local artifact.
+            checkpoint_provenance = checkpoint.provenance
+            fallback_manifest_path = (
+                checkpoint_provenance.manifest_path
+                if checkpoint_provenance is not None
+                and checkpoint_provenance.manifest_path is not None
+                else checkpoint.path.parent / MODEL_MANIFEST_FILENAME
+            )
+            try:
+                fallback_manifest_path = Path(fallback_manifest_path)
+            except TypeError:
+                fallback_manifest_path = None
+            if fallback_manifest_path is not None and fallback_manifest_path.is_file():
+                if checkpoint_provenance is not None:
+                    validate_before_deserialization(checkpoint_provenance)
+                else:
+                    preloaded_manifest = load_model_manifest(fallback_manifest_path)
+                    validate_manifest_weight(
+                        preloaded_manifest,
+                        checkpoint.path,
+                        selected_filename=checkpoint.path.name,
+                    )
         if text_vocab_size is None:
-            text_vocab_size = checkpoint.infer_text_vocab_size(TOTAL_VOCAB_SIZE)
+            text_vocab_size = (
+                int(preloaded_manifest.architecture["text_vocab_size"])
+                if preloaded_manifest is not None
+                else checkpoint.infer_text_vocab_size(TOTAL_VOCAB_SIZE)
+            )
         checkpoint_supports_voice_cloning = checkpoint.infer_speaker_conditioning(False)
         requested_speaker_patch_size = speaker_patch_size
         if checkpoint_supports_voice_cloning:
@@ -181,6 +227,12 @@ class FlowMatchingTTSInference:
         self.supports_voice_cloning = bool(use_speaker_conditioning)
 
         checkpoint_language = checkpoint.language_capability()
+        manifest_capabilities = getattr(preloaded_manifest, "capabilities", None)
+        manifest_languages = (
+            tuple(manifest_capabilities["supported_languages"])
+            if manifest_capabilities is not None
+            else None
+        )
         if use_language_conditioning is None:
             use_language_conditioning = checkpoint_language.enabled
         elif use_language_conditioning and not checkpoint_language.enabled:
@@ -194,6 +246,11 @@ class FlowMatchingTTSInference:
             )
         checkpoint_languages = checkpoint_language.supported_languages
         if checkpoint_language.enabled:
+            if manifest_languages is not None and manifest_languages != checkpoint_languages:
+                raise MultilingualUnsupportedError(
+                    "Checkpoint language state does not match the model manifest: "
+                    f"{checkpoint_languages!r} != {manifest_languages!r}."
+                )
             if supported_languages is not None:
                 requested_languages = normalize_languages(supported_languages)
                 if requested_languages != checkpoint_languages:
@@ -203,14 +260,29 @@ class FlowMatchingTTSInference:
                     )
             resolved_languages = checkpoint_languages
         else:
-            if supported_languages is not None:
-                requested_languages = normalize_languages(supported_languages)
-                if requested_languages != (DEFAULT_LANGUAGE,):
+            if manifest_languages is None:
+                if supported_languages is not None:
+                    requested_languages = normalize_languages(supported_languages)
+                    if requested_languages != (DEFAULT_LANGUAGE,):
+                        raise MultilingualUnsupportedError(
+                            "A legacy checkpoint supports only English; "
+                            f"received supported_languages={requested_languages!r}."
+                        )
+                resolved_languages = (DEFAULT_LANGUAGE,)
+            else:
+                if len(manifest_languages) != 1:
                     raise MultilingualUnsupportedError(
-                        "A legacy checkpoint supports only English; "
-                        f"received supported_languages={requested_languages!r}."
+                        "A checkpoint without learned language conditioning must declare exactly "
+                        "one language in its model manifest."
                     )
-            resolved_languages = (DEFAULT_LANGUAGE,)
+                if supported_languages is not None:
+                    requested_languages = normalize_languages(supported_languages)
+                    if requested_languages != manifest_languages:
+                        raise MultilingualUnsupportedError(
+                            "Requested monolingual language does not match the checkpoint "
+                            f"manifest: {requested_languages!r} != {manifest_languages!r}."
+                        )
+                resolved_languages = manifest_languages
         self.uses_language_conditioning = bool(use_language_conditioning)
         self.supported_languages = resolved_languages
         self.supports_multilingual = len(resolved_languages) > 1
@@ -229,17 +301,20 @@ class FlowMatchingTTSInference:
         checkpoint_alignment = checkpoint.monotonic_alignment_capability()
         self.uses_mas_duration = checkpoint_alignment.enabled
         reference_language_capability = checkpoint.reference_language_capability()
-        self.supported_reference_languages = reference_language_capability.supported_languages
+        checkpoint_reference_languages = reference_language_capability.supported_languages
         checkpoint_language_pairs = reference_language_capability.supported_pairs
-        self.supported_language_pairs = (
-            checkpoint_language_pairs
-            if checkpoint_language_pairs
-            else (
-                (LanguagePair(target=DEFAULT_LANGUAGE, reference=DEFAULT_LANGUAGE),)
-                if self.supports_voice_cloning and not self.uses_language_conditioning
-                else ()
+        if checkpoint_language_pairs:
+            self.supported_reference_languages = checkpoint_reference_languages
+            self.supported_language_pairs = checkpoint_language_pairs
+        elif self.supports_voice_cloning and not self.uses_language_conditioning:
+            monolingual = self.supported_languages[0]
+            self.supported_reference_languages = (monolingual,)
+            self.supported_language_pairs = (
+                LanguagePair(target=monolingual, reference=monolingual),
             )
-        )
+        else:
+            self.supported_reference_languages = ()
+            self.supported_language_pairs = ()
         self.supports_cross_lingual = bool(
             self.supports_voice_cloning
             and self.uses_language_conditioning
@@ -266,6 +341,36 @@ class FlowMatchingTTSInference:
         # strict fallback while the built-in loader authenticates before torch.load.
         self.model_manifest = preloaded_manifest or load_model_manifest(manifest_path)
         representation = self.model_manifest.representation
+        # Lightweight custom loaders used by downstream integrations may expose only
+        # the representation contract. Schema-v3 manifests always provide architecture.
+        manifest_architecture = getattr(self.model_manifest, "architecture", {})
+
+        def resolve_manifest_option(name: str, requested, default):
+            stored = manifest_architecture.get(name, default)
+            if requested is not None and requested != stored:
+                raise ValueError(
+                    f"Requested {name}={requested!r} does not match checkpoint value {stored!r}."
+                )
+            return stored
+
+        latent_patch_size = int(resolve_manifest_option("latent_patch_size", latent_patch_size, 1))
+        text_encoder_type = str(
+            resolve_manifest_option("text_encoder_type", text_encoder_type, "scratch")
+        )
+        frozen_text_input_size = int(
+            resolve_manifest_option(
+                "frozen_text_input_size",
+                frozen_text_input_size,
+                0,
+            )
+        )
+        text_adapter_bottleneck_ratio = int(
+            resolve_manifest_option(
+                "text_adapter_bottleneck_ratio",
+                text_adapter_bottleneck_ratio,
+                4,
+            )
+        )
         if isinstance(dacvae_model, str) and representation["codec_revision"] is not None:
             codec_source = normalize_dacvae_source(
                 dacvae_model,
@@ -296,12 +401,16 @@ class FlowMatchingTTSInference:
             "use_speaker_conditioning": bool(use_speaker_conditioning),
             "use_mas_duration": checkpoint_alignment.enabled,
             "norm_eps": float(norm_eps),
+            "latent_patch_size": latent_patch_size,
+            "text_encoder_type": text_encoder_type,
+            "frozen_text_input_size": frozen_text_input_size,
+            "text_adapter_bottleneck_ratio": text_adapter_bottleneck_ratio,
         }
         checkpoint_capabilities = {
             "speaker_conditioning": bool(use_speaker_conditioning),
             "language_conditioning": self.uses_language_conditioning,
             "supported_languages": list(self.supported_languages),
-            "supported_reference_languages": list(self.supported_reference_languages),
+            "supported_reference_languages": list(checkpoint_reference_languages),
             "supported_language_pairs": [
                 list(pair.as_tuple()) for pair in checkpoint_language_pairs
             ],
@@ -328,10 +437,22 @@ class FlowMatchingTTSInference:
             codec_backend=dacvae_backend,
         )
 
-        # Load standalone tokenizer (tiktoken - NOT from any LLM)
-        print("Loading standalone tokenizer: tiktoken cl100k_base")
-        print("(No LLM model involved - just text → token ID conversion)")
-        self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.text_frontend = None
+        if text_encoder_type == "frozen_features":
+            payload = representation.get("text_frontend")
+            if not isinstance(payload, dict):
+                raise ValueError("Frozen-feature checkpoint is missing its frontend contract.")
+            frontend_spec = FrozenTextFrontendSpec(**payload)
+            print(
+                f"Loading frozen text provider: {frontend_spec.model_id}@{frontend_spec.revision}"
+            )
+            self.text_frontend = FrozenTextFrontend(frontend_spec, device=self.device)
+            self.tokenizer = None
+            self.text_pad_token = int(self.text_frontend.tokenizer.pad_token_id or 0)
+        else:
+            print("Loading standalone tokenizer: tiktoken cl100k_base")
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            self.text_pad_token = PAD_TOKEN
 
         # Create EchoDiT model with built-in text encoder
         print("\nCreating EchoDiT model...")
@@ -344,6 +465,12 @@ class FlowMatchingTTSInference:
             num_heads=num_heads,
             intermediate_size=intermediate_size,  # Use explicit parameter
             text_vocab_size=text_vocab_size,
+            latent_patch_size=latent_patch_size,
+            text_encoder_type=text_encoder_type,
+            frozen_text_input_size=(
+                frozen_text_input_size if text_encoder_type == "frozen_features" else None
+            ),
+            text_adapter_bottleneck_ratio=text_adapter_bottleneck_ratio,
             text_model_size=text_model_size,
             text_num_layers=text_num_layers,
             text_num_heads=text_num_heads,
@@ -361,7 +488,9 @@ class FlowMatchingTTSInference:
             use_speaker_conditioning=use_speaker_conditioning,
             use_language_conditioning=self.uses_language_conditioning,
             supported_languages=self.supported_languages,
-            supported_reference_languages=self.supported_reference_languages or None,
+            # Same-language support for a monolingual speaker checkpoint is an implicit runtime
+            # gate, not learned cross-language model state.
+            supported_reference_languages=checkpoint_reference_languages or None,
             supported_language_pairs=checkpoint_language_pairs or None,
             use_duration_predictor=self.uses_learned_duration,
             duration_predictor_hidden_size=checkpoint_duration.hidden_size or 256,
@@ -401,8 +530,16 @@ class FlowMatchingTTSInference:
         print(f"\n✓ Inference pipeline ready on {self.device}")
         print(f"  Sample rate: {self.sample_rate} Hz")
         print(f"  Frame rate: {self.frame_rate:.1f} frames/sec")
-        print("  Model: EchoDiT (built-in text encoder, no external LLM)")
-        print("  Tokenizer: tiktoken cl100k_base (standalone)")
+        print(f"  Model: EchoDiT (target latent patch={latent_patch_size})")
+        print(
+            "  Text frontend: "
+            + (
+                f"frozen {self.text_frontend.spec.model_id} "
+                f"({self.text_frontend.num_parameters / 1e6:.2f}M external parameters)"
+                if self.text_frontend is not None
+                else "legacy scratch cl100k encoder"
+            )
+        )
         print(f"  Voice cloning: {'available' if self.supports_voice_cloning else 'unavailable'}")
         print(f"  Languages: {', '.join(self.supported_languages)}")
         print(
@@ -434,16 +571,31 @@ class FlowMatchingTTSInference:
         """Return one of the packaged, validated inference profiles."""
         return self.settings.profile(name)
 
-    def _prepare_conditioning(self, text: str, language: str | None = None) -> torch.Tensor:
+    def _prepare_conditioning(
+        self,
+        text: str,
+        language: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if not text or not text.strip():
             raise ValueError("text must contain at least one non-whitespace character.")
+        text_frontend = getattr(self, "text_frontend", None)
+        if text_frontend is not None:
+            batch = text_frontend.encode(
+                [text.strip()],
+                inputs_are_phonemes=text_frontend.spec.input_mode == "phonemes",
+            )
+            return (
+                batch.input_ids.to(self.device),
+                batch.attention_mask.to(self.device),
+                batch.features.to(self.device),
+            )
         token_ids = encode_tts_text(
             text.strip(),
             self.tokenizer,
             vocab_size=getattr(self, "text_vocab_size", None),
             language=language,
         )
-        return torch.tensor([token_ids], dtype=torch.long, device=self.device)
+        return torch.tensor([token_ids], dtype=torch.long, device=self.device), None, None
 
     def _resolve_language_pair(
         self,
@@ -453,12 +605,13 @@ class FlowMatchingTTSInference:
         has_reference: bool,
     ) -> LanguagePair:
         """Validate independent target-text and source-reference languages."""
+        supported = getattr(self, "supported_languages", (DEFAULT_LANGUAGE,))
+        target_language = supported[0] if language is None and len(supported) == 1 else language
         pair = LanguagePair.resolve(
-            language,
+            target_language,
             reference_language,
             has_reference=has_reference,
         )
-        supported = getattr(self, "supported_languages", (DEFAULT_LANGUAGE,))
         if pair.target not in supported:
             raise MultilingualUnsupportedError(
                 f"Checkpoint {self.checkpoint_path.name!r} does not support target language "
@@ -503,6 +656,7 @@ class FlowMatchingTTSInference:
         language_ids: torch.Tensor | None,
         speaker_latent: torch.Tensor | None,
         predicted_frames: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> tuple[float, int]:
         """Resolve seconds and DACVAE frames without granting capability to legacy weights."""
         if duration is not None or not getattr(self, "uses_learned_duration", False):
@@ -511,10 +665,14 @@ class FlowMatchingTTSInference:
 
         predicted = predicted_frames
         if predicted is None:
+            feature_kwargs = {}
+            if conditioning_features is not None:
+                feature_kwargs["conditioning_features"] = conditioning_features
             predicted = self.flow_model.predict_duration_frames(
                 conditioning_ids,
                 speaker_latent=speaker_latent,
                 language_ids=language_ids,
+                **feature_kwargs,
             )
         if predicted.numel() != 1:
             raise RuntimeError("Single-utterance duration prediction must return one frame count.")
@@ -545,16 +703,21 @@ class FlowMatchingTTSInference:
         language_ids: torch.Tensor | None = None,
         speaker_latent: torch.Tensor | None = None,
         expected_token_durations: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Predict an exact token-to-frame allocation for a MAS-trained checkpoint."""
         if not getattr(self, "uses_mas_duration", False):
             return None
         if expected_token_durations is None:
+            feature_kwargs = {}
+            if conditioning_features is not None:
+                feature_kwargs["conditioning_features"] = conditioning_features
             token_durations = self.flow_model.predict_token_duration_frames(
                 conditioning_ids,
                 attention_mask=conditioning_mask,
                 speaker_latent=speaker_latent,
                 language_ids=language_ids,
+                **feature_kwargs,
                 total_frames=num_frames,
             )
         else:
@@ -581,6 +744,7 @@ class FlowMatchingTTSInference:
         cfg_scale_text: float | None,
         cfg_scale_speaker: float | None,
         needs_learned_duration: bool,
+        conditioning_features: torch.Tensor | None = None,
     ) -> tuple[object | None, torch.Tensor | None, torch.Tensor | None]:
         """Encode request invariants once and optionally run the shared duration head."""
         encode = getattr(self.flow_model, "encode_inference_conditioning", None)
@@ -603,12 +767,16 @@ class FlowMatchingTTSInference:
             cfg_scale_text=cfg_scale_text,
             cfg_scale_speaker=cfg_scale_speaker,
         )
+        encode_kwargs = {}
+        if conditioning_features is not None:
+            encode_kwargs["conditioning_features"] = conditioning_features
         encoded = encode(
             conditioning_ids,
             conditioning_mask,
             speaker_latent,
             cfg_mode=cfg_mode if guidance_active else None,
             language_ids=language_ids,
+            **encode_kwargs,
         )
         if not needs_prediction:
             return encoded, None, None
@@ -658,12 +826,12 @@ class FlowMatchingTTSInference:
     @torch.no_grad()
     def encode_reference_audio(
         self,
-        reference_audio: AudioReference,
+        reference_audio: AudioReferenceInput,
         *,
-        sample_rate: int | None = None,
+        sample_rate: int | Sequence[int | None] | None = None,
         max_seconds: float | None = None,
     ) -> torch.Tensor:
-        """Encode one reference recording for a speaker-conditioned checkpoint."""
+        """Encode one or more recordings, concatenated under one bounded reference budget."""
         if not self.supports_voice_cloning:
             raise VoiceCloningUnsupportedError(
                 "Voice cloning is unavailable for this checkpoint. "
@@ -671,36 +839,19 @@ class FlowMatchingTTSInference:
                 "Use a versioned speaker-conditioned checkpoint."
             )
 
-        if isinstance(reference_audio, (str, Path)):
-            if sample_rate is not None:
-                raise ValueError("sample_rate must be omitted when reference_audio is a file.")
-            waveform, source_sample_rate = torchaudio.load(str(reference_audio))
-        elif isinstance(reference_audio, torch.Tensor):
-            if sample_rate is None:
-                raise ValueError("sample_rate is required for a reference audio tensor.")
-            waveform = reference_audio.detach().cpu()
-            source_sample_rate = sample_rate
+        if isinstance(reference_audio, (str, Path, torch.Tensor)):
+            references = [reference_audio]
+            sample_rates = [sample_rate]
+        elif isinstance(reference_audio, Sequence) and reference_audio:
+            references = list(reference_audio)
+            if isinstance(sample_rate, Sequence) and not isinstance(sample_rate, (str, bytes)):
+                sample_rates = list(sample_rate)
+                if len(sample_rates) != len(references):
+                    raise ValueError("reference sample rates must align with reference recordings.")
+            else:
+                sample_rates = [sample_rate] * len(references)
         else:
-            raise TypeError("reference_audio must be a path or torch.Tensor.")
-
-        if waveform.ndim == 1:
-            waveform = waveform.unsqueeze(0)
-        elif waveform.ndim != 2:
-            raise ValueError("reference audio must have shape [samples] or [channels, samples].")
-        if waveform.shape[-1] == 0:
-            raise ValueError("reference audio is empty.")
-        if source_sample_rate <= 0:
-            raise ValueError("reference sample_rate must be positive.")
-        waveform = waveform.float().mean(dim=0, keepdim=True)
-        if not torch.isfinite(waveform).all():
-            raise ValueError("reference audio contains non-finite samples.")
-
-        if source_sample_rate != self.sample_rate:
-            waveform = torchaudio.functional.resample(
-                waveform,
-                source_sample_rate,
-                self.sample_rate,
-            )
+            raise TypeError("reference_audio must be a path, tensor, or non-empty sequence.")
 
         reference_limit = self.max_reference_seconds if max_seconds is None else max_seconds
         if not math.isfinite(reference_limit) or reference_limit <= 0:
@@ -712,7 +863,48 @@ class FlowMatchingTTSInference:
                 "max reference duration is too short to encode one DACVAE frame; "
                 f"use at least {minimum_seconds:.3f} seconds."
             )
-        waveform = waveform[..., :max_reference_samples]
+        waveforms = []
+        remaining = max_reference_samples
+        for reference, declared_rate in zip(references, sample_rates):
+            if isinstance(reference, (str, Path)):
+                if declared_rate is not None:
+                    raise ValueError("sample_rate must be omitted for reference audio files.")
+                waveform, source_sample_rate = torchaudio.load(str(reference))
+            elif isinstance(reference, torch.Tensor):
+                if declared_rate is None or isinstance(declared_rate, Sequence):
+                    raise ValueError("Every tensor reference requires one integer sample rate.")
+                waveform = reference.detach().cpu()
+                source_sample_rate = int(declared_rate)
+            else:
+                raise TypeError("Every reference must be a path or torch.Tensor.")
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            elif waveform.ndim != 2:
+                raise ValueError(
+                    "reference audio must have shape [samples] or [channels, samples]."
+                )
+            if waveform.shape[-1] == 0:
+                raise ValueError("reference audio is empty.")
+            if source_sample_rate <= 0:
+                raise ValueError("reference sample_rate must be positive.")
+            waveform = waveform.float().mean(dim=0, keepdim=True)
+            if not bool(torch.isfinite(waveform).all()):
+                raise ValueError("reference audio contains non-finite samples.")
+            if source_sample_rate != self.sample_rate:
+                waveform = torchaudio.functional.resample(
+                    waveform,
+                    source_sample_rate,
+                    self.sample_rate,
+                )
+            waveform = waveform[..., :remaining]
+            if waveform.shape[-1]:
+                waveforms.append(waveform)
+                remaining -= waveform.shape[-1]
+            if remaining <= 0:
+                break
+        if not waveforms:
+            raise ValueError("No usable reference audio remains under the duration limit.")
+        waveform = torch.cat(waveforms, dim=-1)
         if waveform.shape[-1] < self.hop_length:
             waveform = F.pad(waveform, (0, self.hop_length - waveform.shape[-1]))
 
@@ -722,8 +914,8 @@ class FlowMatchingTTSInference:
     def _resolve_speaker_latent(
         self,
         *,
-        reference_audio: AudioReference | None,
-        reference_sample_rate: int | None,
+        reference_audio: AudioReferenceInput | None,
+        reference_sample_rate: int | Sequence[int | None] | None,
         speaker_latent: torch.Tensor | None,
     ) -> torch.Tensor | None:
         if reference_audio is not None and speaker_latent is not None:
@@ -786,8 +978,8 @@ class FlowMatchingTTSInference:
         # Other
         duration: float | None = None,
         show_progress: bool = True,
-        reference_audio: AudioReference | None = None,
-        reference_sample_rate: int | None = None,
+        reference_audio: AudioReferenceInput | None = None,
+        reference_sample_rate: int | Sequence[int | None] | None = None,
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,
@@ -812,8 +1004,8 @@ class FlowMatchingTTSInference:
             cache_mode: ``"cache_dit"`` enables DBCache for the EchoDiT blocks
             duration: Target duration in seconds (None = auto-estimate)
             show_progress: Whether to show progress bar
-            reference_audio: Reference WAV path or waveform for voice cloning
-            reference_sample_rate: Required when reference_audio is a tensor
+            reference_audio: One or more reference WAV paths/waveforms for voice cloning
+            reference_sample_rate: Required for tensor references; pass one rate per tensor
             speaker_latent: Pre-encoded speaker reference, mutually exclusive
                 with reference_audio
             language: Target text/speech language (defaults to English)
@@ -834,7 +1026,10 @@ class FlowMatchingTTSInference:
             reference_language,
             has_reference=reference_audio is not None or speaker_latent is not None,
         )
-        conditioning_ids = self._prepare_conditioning(text, language_pair.target)
+        conditioning_ids, conditioning_mask, conditioning_features = self._prepare_conditioning(
+            text,
+            language_pair.target,
+        )
         language_ids = self._language_ids(language_pair)
         speaker_latent = self._resolve_speaker_latent(
             reference_audio=reference_audio,
@@ -852,7 +1047,7 @@ class FlowMatchingTTSInference:
         encoded_conditioning, predicted_frames, expected_token_durations = (
             self._encode_trajectory_conditioning(
                 conditioning_ids,
-                conditioning_mask=None,
+                conditioning_mask=conditioning_mask,
                 language_ids=language_ids,
                 speaker_latent=speaker_latent,
                 cfg_scale=cfg_scale,
@@ -862,6 +1057,7 @@ class FlowMatchingTTSInference:
                 needs_learned_duration=(
                     duration is None and getattr(self, "uses_learned_duration", False)
                 ),
+                conditioning_features=conditioning_features,
             )
         )
 
@@ -872,13 +1068,16 @@ class FlowMatchingTTSInference:
             language_ids,
             speaker_latent,
             predicted_frames,
+            conditioning_features,
         )
         token_durations = self._resolve_token_durations(
             conditioning_ids,
             num_frames=num_frames,
+            conditioning_mask=conditioning_mask,
             language_ids=language_ids,
             speaker_latent=speaker_latent,
             expected_token_durations=expected_token_durations,
+            conditioning_features=conditioning_features,
         )
         latent_shape = (1, self.latent_size, num_frames)
 
@@ -935,7 +1134,8 @@ class FlowMatchingTTSInference:
                 # Latent rescaling
                 target_latent_std=target_latent_std,
                 # Other
-                conditioning_mask=None,
+                conditioning_mask=conditioning_mask,
+                conditioning_features=conditioning_features,
                 speaker_latent=speaker_latent,
                 language_ids=language_ids,
                 token_durations=token_durations,
@@ -970,8 +1170,8 @@ class FlowMatchingTTSInference:
         *,
         duration: float | None = None,
         show_progress: bool = True,
-        reference_audio: AudioReference | None = None,
-        reference_sample_rate: int | None = None,
+        reference_audio: AudioReferenceInput | None = None,
+        reference_sample_rate: int | Sequence[int | None] | None = None,
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,
@@ -1063,7 +1263,9 @@ class FlowMatchingTTSInference:
                 None,
                 has_reference=False,
             )
-            conditioning_ids = self._prepare_conditioning(text, language_pair.target)
+            conditioning_ids, conditioning_mask, conditioning_features = self._prepare_conditioning(
+                text, language_pair.target
+            )
             language_ids = self._language_ids(language_pair)
             resolved_duration, num_frames = self._resolve_duration_shape(
                 text,
@@ -1071,6 +1273,7 @@ class FlowMatchingTTSInference:
                 conditioning_ids,
                 language_ids,
                 None,
+                conditioning_features=conditioning_features,
             )
             if resolved_duration > selected_maximum:
                 raise ValueError(
@@ -1078,14 +1281,32 @@ class FlowMatchingTTSInference:
                     f"maximum of {selected_maximum:g}s. Increase max_duration within the "
                     "configured limit or split the text; batching never truncates audio."
                 )
-            prepared_requests.append((index, conditioning_ids, language_ids, num_frames))
+            prepared_requests.append(
+                (
+                    index,
+                    conditioning_ids,
+                    conditioning_mask,
+                    conditioning_features,
+                    language_ids,
+                    num_frames,
+                )
+            )
 
         requests_by_frames: dict[
             int,
-            list[tuple[int, torch.Tensor, torch.Tensor | None, int]],
+            list[
+                tuple[
+                    int,
+                    torch.Tensor,
+                    torch.Tensor | None,
+                    torch.Tensor | None,
+                    torch.Tensor | None,
+                    int,
+                ]
+            ],
         ] = {}
         for request in prepared_requests:
-            requests_by_frames.setdefault(request[3], []).append(request)
+            requests_by_frames.setdefault(request[5], []).append(request)
 
         audios: list[torch.Tensor] = [torch.empty(0) for _ in texts]
         effective_cfg = self._effective_cfg(
@@ -1101,9 +1322,10 @@ class FlowMatchingTTSInference:
             batch_size = len(requests)
             max_text_tokens = max(request[1].shape[1] for request in requests)
             has_text_padding = any(request[1].shape[1] != max_text_tokens for request in requests)
+            has_explicit_mask = any(request[2] is not None for request in requests)
             batched_conditioning = torch.full(
                 (batch_size, max_text_tokens),
-                PAD_TOKEN,
+                getattr(self, "text_pad_token", PAD_TOKEN),
                 dtype=torch.long,
                 device=self.device,
             )
@@ -1114,21 +1336,43 @@ class FlowMatchingTTSInference:
                     dtype=torch.bool,
                     device=self.device,
                 )
-                if has_text_padding
+                if has_text_padding or has_explicit_mask
                 else None
             )
-            for batch_index, (_, conditioning_ids, _, _) in enumerate(requests):
+            batched_features = None
+            feature_width = next(
+                (int(request[3].shape[-1]) for request in requests if request[3] is not None),
+                None,
+            )
+            if feature_width is not None:
+                if any(request[3] is None for request in requests):
+                    raise RuntimeError("A batch cannot mix frozen and scratch text features.")
+                batched_features = torch.zeros(
+                    batch_size,
+                    max_text_tokens,
+                    feature_width,
+                    dtype=requests[0][3].dtype,
+                    device=self.device,
+                )
+            for batch_index, (_, conditioning_ids, request_mask, features, _, _) in enumerate(
+                requests
+            ):
                 token_count = conditioning_ids.shape[1]
                 batched_conditioning[batch_index, :token_count] = conditioning_ids[0]
                 if conditioning_mask is not None:
-                    conditioning_mask[batch_index, :token_count] = True
+                    conditioning_mask[batch_index, :token_count] = (
+                        request_mask[0] if request_mask is not None else True
+                    )
+                if batched_features is not None:
+                    assert features is not None
+                    batched_features[batch_index, :token_count] = features[0]
 
             language_batch = None
-            if requests and requests[0][2] is not None:
-                if any(request[2] is None for request in requests):
+            if requests and requests[0][4] is not None:
+                if any(request[4] is None for request in requests):
                     raise RuntimeError("A batch cannot mix language-conditioned and legacy rows.")
                 language_batch = torch.cat(
-                    [request[2] for request in requests if request[2] is not None],
+                    [request[4] for request in requests if request[4] is not None],
                     dim=0,
                 )
 
@@ -1137,6 +1381,7 @@ class FlowMatchingTTSInference:
                 num_frames=num_frames,
                 conditioning_mask=conditioning_mask,
                 language_ids=language_batch,
+                conditioning_features=batched_features,
             )
 
             generated_latents = ODESolver.sample(
@@ -1156,6 +1401,7 @@ class FlowMatchingTTSInference:
                 temporal_rescale_sigma=2.5,
                 target_latent_std=None,
                 conditioning_mask=conditioning_mask,
+                conditioning_features=batched_features,
                 language_ids=language_batch,
                 token_durations=token_durations,
                 fuse_cfg_branches=False,
@@ -1169,7 +1415,7 @@ class FlowMatchingTTSInference:
                 )
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
-            for batch_index, (request_index, _, _, _) in enumerate(requests):
+            for batch_index, (request_index, _, _, _, _, _) in enumerate(requests):
                 audios[request_index] = decoded[batch_index].squeeze().cpu()
 
         return audios
@@ -1207,8 +1453,8 @@ class FlowMatchingTTSInference:
         temporal_rescale_sigma: float = 2.5,
         target_latent_std: float | None = None,
         cache_mode: str = "none",
-        reference_audio: AudioReference | None = None,
-        reference_sample_rate: int | None = None,
+        reference_audio: AudioReferenceInput | None = None,
+        reference_sample_rate: int | Sequence[int | None] | None = None,
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,

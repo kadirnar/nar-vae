@@ -1,8 +1,9 @@
 # NAR-VAE
 
 NAR-VAE is a non-autoregressive text-to-speech research library built around conditional flow
-matching, EchoDiT, and continuous DACVAE latents. It supports acoustic-model scratch pretraining,
-SFT, flow-native GRPO, single- and multi-GPU training, multilingual conditioning, and Cache-DiT
+matching, EchoDiT, and continuous DACVAE latents. It supports a frozen multilingual text-feature
+path, legacy acoustic-model scratch pretraining, transcript-free reference voice conditioning,
+flow-native GRPO, single- and multi-GPU training, multilingual conditioning, and Cache-DiT
 inference. The separately supplied DACVAE codec remains fixed in every implemented training stage.
 
 > NAR-VAE does not publish a trained acoustic checkpoint yet. Quality, WER, multilingual,
@@ -50,6 +51,7 @@ The prepared dataset contains:
 latents:                 float32[latent_width, frames]
 latent_num_frames:       int
 conditioning_ids:        list[int]
+conditioning_features:   float16[text_tokens, provider_width]      # frozen path
 language:                str
 representation_contract: tokenizer and exact codec identity
 speaker_latents:         float32[latent_width, reference_frames]  # optional
@@ -61,7 +63,40 @@ Preparation saves the dataset with `Dataset.save_to_disk` and writes
 `nar_vae_dataset_manifest.json`. Training verifies the dataset inventory, tokenizer contract, codec
 revision, and codec SHA-256 before loading or resuming.
 
-## Scratch-pretraining architecture
+For the frozen recipe, construct `FrozenTextFrontendSpec.from_config(resolved_config)` and pass it
+as `text_frontend_spec` to `prepare_from_hf_dataset`, `prepare_from_local_folder`, or
+`prepare_from_csv`. Preparation caches provider states before the trainable acoustic projector and
+copies the complete provider contract into every representation row.
+
+## Experimental low-trainable-parameter frozen-text architecture
+
+The 2026 research recipe does not train a text encoder from token IDs. A revision-pinned external
+multilingual model produces contextual token states in eval/inference mode; only a small residual
+projector, EchoDiT, utterance-duration head, and temporal reference encoder are trained. Lossless
+internal latent packing reduces the DiT sequence rate without changing dataset latents, ODE
+tensors, or DACVAE. A genuinely multilingual run additionally learns target-language conditioning
+at the token and global AdaLN paths.
+
+```text
+text -> frozen multilingual provider -> small residual projector --+
+reference audio -> fixed DACVAE -> temporal speaker encoder --------+-> EchoDiT -> velocity
+raw noisy DAC latents -> internal pack-2 -> DiT -> unpack -----------+
+```
+
+Start the first Turkish experiment from `nar_vae/configs/turkish_frozen_config.yaml`. It is strict
+single-language `tr` metadata without a redundant learned language-ID bias. It uses raw Turkish
+text with revision-pinned mmBERT-small, speaker references, `small/P2`, and the inexpensive total
+duration objective. `nar_vae/configs/multilingual_frozen_config.yaml` is the later multilingual
+topology with learned language conditioning and explicit cross-language pair coverage. See the
+[2025–2026 design review](docs/multilingual_voice_cloning_2026.md) for evidence, caveats, and the
+Turkish preparation example.
+
+Voice-cloning preparation requires at least two utterances for each speaker and must pass
+`speaker_id_column` to the Hugging Face dataset preparer. The target recording is never selected as
+its own reference. Local-folder and simple CSV preparation remain text-only; use the Hugging Face
+speaker-aware path (or prepare equivalent `speaker_latents`) for this first voice-cloning run.
+
+## Legacy scratch-pretraining architecture
 
 Every acoustic-model component starts from random weights. The DACVAE codec is a fixed
 representation dependency, not a pretrained TTS teacher.
@@ -83,7 +118,7 @@ target velocity = x1 - x0
 
 EchoDiT predicts the velocity. MAS produces hard monotonic token/frame alignments for the learned
 duration head and duration-expanded frame conditioning. No external language model or third-party
-TTS checkpoint initializes the acoustic model.
+TTS checkpoint initializes this compatibility path.
 
 ### Model presets
 
@@ -178,9 +213,8 @@ convergence, WER/CER, and listening quality before keeping them. FSDP is not imp
 ## Inference
 
 Inference requires a locally trained NAR-VAE export. Its manifest supplies the exact codec revision,
-filename, SHA-256, and trained capabilities. This cross-lingual cloning example requires a
-checkpoint whose manifest declares speaker conditioning, Turkish target speech, and English
-reference-audio coverage:
+filename, SHA-256, frozen text provider, and trained capabilities. The Turkish first-run checkpoint
+accepts Turkish reference recordings only:
 
 ```python
 from nar_vae import FlowMatchingTTSInference
@@ -193,14 +227,17 @@ tts = FlowMatchingTTSInference.from_preset(
 )
 
 audio = tts.synthesize_with_config(
-    "Bu cümle, İngilizce referans kaydındaki sesi kullanır.",
+    "Bu cümle, Türkçe referans kaydındaki sesi kullanır.",
     tts.generation_profile("quality"),
-    reference_audio="reference_en.wav",
+    reference_audio=["reference_tr_1.wav", "reference_tr_2.wav"],
     language="tr",
-    reference_language="en",
+    reference_language="tr",
 )
 tts.save_audio(audio, "clone_tr.wav")
 ```
+
+English-reference → Turkish synthesis is a separate multilingual experiment and is rejected unless
+the checkpoint manifest records actual `tr/en` training coverage.
 
 Inference verifies the model manifest, weight hashes, architecture, capabilities, tokenizer, and
 codec SHA-256. Profile names describe numerical settings, not demonstrated quality. Current
@@ -210,6 +247,7 @@ inference returns a complete waveform after ODE integration and codec decoding; 
 
 - [Simple training guide](docs/train.md)
 - [Architecture and training](docs/architecture.md)
+- [2025–2026 multilingual voice-cloning design](docs/multilingual_voice_cloning_2026.md)
 - [SFT, GRPO, and evaluation](docs/post_pretraining.md)
 - [Inference optimization](docs/inference_optimization.md)
 

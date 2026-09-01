@@ -2,12 +2,18 @@
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
 from nar_vae.benchmark import _run_once
-from nar_vae.checkpoint import LanguageCheckpointInfo, ReferenceLanguageCheckpointInfo
+from nar_vae.checkpoint import (
+    DurationCheckpointInfo,
+    LanguageCheckpointInfo,
+    MonotonicAlignmentCheckpointInfo,
+    ReferenceLanguageCheckpointInfo,
+)
 from nar_vae.dataset.data_collator import FlowMatchingDataCollator
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.languages import (
@@ -158,6 +164,86 @@ class LanguageRegistryTest(unittest.TestCase):
         pair = runtime._resolve_language_pair("en", None, has_reference=True)
 
         self.assertEqual(pair, LanguagePair("en", "en"))
+
+    def test_turkish_monolingual_checkpoint_defaults_target_and_reference_to_turkish(self):
+        runtime = FlowMatchingTTSInference.__new__(FlowMatchingTTSInference)
+        runtime.checkpoint_path = Path("turkish.bin")
+        runtime.supports_voice_cloning = True
+        runtime.uses_language_conditioning = False
+        runtime.supported_languages = ("tr",)
+        runtime.supported_reference_languages = ("tr",)
+        runtime.supported_language_pairs = (LanguagePair("tr", "tr"),)
+
+        pair = runtime._resolve_language_pair(None, None, has_reference=True)
+
+        self.assertEqual(pair, LanguagePair("tr", "tr"))
+        self.assertIsNone(runtime._language_ids(pair))
+        with self.assertRaises(CrossLingualUnsupportedError):
+            runtime._resolve_language_pair("tr", "en", has_reference=True)
+
+    def test_turkish_constructor_keeps_implicit_pair_out_of_model_topology(self):
+        checkpoint_path = Path("turkish.bin")
+        checkpoint = Mock(path=checkpoint_path, provenance=None)
+        checkpoint.infer_speaker_conditioning.return_value = True
+        checkpoint.infer_speaker_patch_size.return_value = 4
+        checkpoint.language_capability.return_value = LanguageCheckpointInfo(False)
+        checkpoint.reference_language_capability.return_value = ReferenceLanguageCheckpointInfo(
+            False
+        )
+        checkpoint.duration_capability.return_value = DurationCheckpointInfo(False)
+        checkpoint.monotonic_alignment_capability.return_value = MonotonicAlignmentCheckpointInfo(
+            False
+        )
+        manifest = SimpleNamespace(
+            architecture={
+                "text_vocab_size": 100312,
+                "latent_patch_size": 1,
+                "text_encoder_type": "scratch",
+                "frozen_text_input_size": 0,
+                "text_adapter_bottleneck_ratio": 4,
+            },
+            capabilities={"supported_languages": ["tr"]},
+            representation={
+                "codec_source": "codec.pth",
+                "codec_revision": None,
+                "codec_filename": None,
+                "codec_sha256": "a" * 64,
+            },
+        )
+        flow_model = torch.nn.Identity()
+        codec = SimpleNamespace(
+            sample_rate=44100,
+            hop_length=512,
+            decode=lambda latent: latent,
+        )
+
+        with (
+            # Simulate a custom checkpoint adapter that returns deserialized weights without
+            # invoking the built-in preload callback, while still exposing a real manifest path.
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=checkpoint),
+            patch.object(Path, "is_file", return_value=True),
+            patch("nar_vae.inference.load_model_manifest", return_value=manifest),
+            patch("nar_vae.inference.validate_manifest_weight"),
+            patch("nar_vae.inference.validate_inference_manifest"),
+            patch(
+                "nar_vae.inference.create_flow_matching_echodit",
+                return_value=flow_model,
+            ) as factory,
+            patch("nar_vae.inference.load_dacvae", return_value=codec),
+            patch("nar_vae.inference.validate_loaded_codec"),
+        ):
+            runtime = FlowMatchingTTSInference(
+                checkpoint_path,
+                dacvae_model="codec.pth",
+                device="cpu",
+            )
+
+        self.assertEqual(
+            runtime._resolve_language_pair(None, None, has_reference=True),
+            LanguagePair("tr", "tr"),
+        )
+        self.assertIsNone(factory.call_args.kwargs["supported_reference_languages"])
+        self.assertIsNone(factory.call_args.kwargs["supported_language_pairs"])
 
     def test_inference_rejects_untrained_pair_from_supported_language_projections(self):
         runtime = FlowMatchingTTSInference.__new__(FlowMatchingTTSInference)

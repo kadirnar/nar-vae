@@ -31,8 +31,9 @@ dependencies = [
     "descript-audiotools>=0.7.2",
     "tiktoken",
     "einops",
-    "huggingface-hub",
-    "kernels>=0.16,<0.17",
+    "huggingface-hub>=0.34,<1",
+    # kernels 0.16 currently requires huggingface-hub 1.x, while Transformers 4.x requires <1.
+    "kernels>=0.10,<0.12",
     "librosa",
     "numpy",
     # Prevent legacy numba releases, which cannot install on supported Python versions.

@@ -674,6 +674,100 @@ class TextEncoder(nn.Module):
         return x
 
 
+class FrozenFeatureTextEncoder(nn.Module):
+    """Small acoustic adapter for contextual states produced by a frozen text model.
+
+    The pretrained backbone deliberately lives outside the acoustic checkpoint.  Dataset
+    preparation or inference supplies its contextual token states and this module learns only
+    the inexpensive projection into EchoDiT's text width.  This keeps the external backbone out
+    of the optimizer while retaining a versioned, trainable TTS-specific interface.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        model_size: int,
+        bottleneck_ratio: int,
+        norm_eps: float,
+        num_languages: int = 0,
+    ):
+        super().__init__()
+        if input_size <= 0:
+            raise ValueError("frozen_text_input_size must be positive.")
+        if bottleneck_ratio <= 0:
+            raise ValueError("text_adapter_bottleneck_ratio must be positive.")
+        bottleneck_size = max(8, model_size // bottleneck_ratio)
+        self.input_size = input_size
+        self.input_norm = nn.LayerNorm(input_size, eps=norm_eps, elementwise_affine=False)
+        self.in_proj = nn.Linear(input_size, model_size, bias=False)
+        self.adapter_norm = RMSNorm(model_size, norm_eps)
+        self.adapter_down = nn.Linear(model_size, bottleneck_size, bias=False)
+        self.adapter_up = nn.Linear(bottleneck_size, model_size, bias=False)
+        # The residual adapter starts as a pure projection, then learns TTS-specific corrections.
+        nn.init.zeros_(self.adapter_up.weight)
+        self.null_state = nn.Parameter(torch.zeros(1, 1, model_size))
+        self.language_embedding = (
+            nn.Embedding(num_languages + 1, model_size, padding_idx=0)
+            if num_languages > 0
+            else None
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        language_ids: torch.Tensor | None = None,
+        input_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if input_features is None:
+            raise ValueError(
+                "A frozen-feature checkpoint requires conditioning_features with shape "
+                "[batch, tokens, frozen_text_input_size]."
+            )
+        expected_shape = (*input_ids.shape, self.input_size)
+        if tuple(input_features.shape) != expected_shape:
+            raise ValueError(
+                f"conditioning_features must have shape {expected_shape}; "
+                f"got {tuple(input_features.shape)}."
+            )
+        if not torch.is_floating_point(input_features) or not bool(
+            torch.isfinite(input_features).all()
+        ):
+            raise ValueError("conditioning_features must contain finite floating-point values.")
+
+        features = input_features.to(
+            device=self.in_proj.weight.device, dtype=self.in_proj.weight.dtype
+        )
+        x = self.in_proj(self.input_norm(features))
+        x = x + self.adapter_up(F.silu(self.adapter_down(self.adapter_norm(x))))
+
+        if self.language_embedding is not None:
+            if language_ids is None:
+                raise ValueError("language_ids are required by this multilingual text adapter.")
+            if language_ids.ndim != 1 or language_ids.shape[0] != input_ids.shape[0]:
+                raise ValueError("language_ids must have shape [batch].")
+            language_ids = language_ids.to(input_ids.device)
+            x = x + self.language_embedding(language_ids)[:, None, :]
+            null_rows = language_ids == 0
+        elif language_ids is not None:
+            raise ValueError("language_ids require a language-conditioned text adapter.")
+        else:
+            # Frozen CFG states are explicitly all-zero inputs, never an arbitrary PLM token ID.
+            null_rows = torch.count_nonzero(input_features, dim=(1, 2)) == 0
+
+        if bool(null_rows.any()):
+            x = torch.where(
+                null_rows[:, None, None],
+                self.null_state.to(dtype=x.dtype).expand(x.shape[0], x.shape[1], -1),
+                x,
+            )
+        if mask is not None:
+            if tuple(mask.shape) != tuple(input_ids.shape):
+                raise ValueError("Text mask must have the conditioning ID shape.")
+            x = x.masked_fill(~mask.to(device=x.device, dtype=torch.bool)[:, :, None], 0.0)
+        return x
+
+
 class SpeakerEncoder(nn.Module):
     """
     Speaker encoder with patching.
@@ -802,25 +896,47 @@ class EchoDiT(nn.Module):
         num_languages: int = 0,
         use_speaker_conditioning: bool = False,
         use_duration_alignment: bool = False,
+        latent_patch_size: int = 1,
+        text_encoder_type: str = "scratch",
+        frozen_text_input_size: int | None = None,
+        text_adapter_bottleneck_ratio: int = 4,
     ):
         super().__init__()
+        if isinstance(latent_patch_size, bool) or latent_patch_size <= 0:
+            raise ValueError("latent_patch_size must be a positive integer.")
+        if text_encoder_type not in {"scratch", "frozen_features"}:
+            raise ValueError("text_encoder_type must be 'scratch' or 'frozen_features'.")
         self.speaker_patch_size = speaker_patch_size
         self.speaker_model_size = speaker_model_size
         self.use_speaker_conditioning = use_speaker_conditioning
         self.use_duration_alignment = use_duration_alignment
         self.timestep_embed_size = timestep_embed_size
         self.latent_size = latent_size
+        self.latent_patch_size = int(latent_patch_size)
+        self.text_encoder_type = text_encoder_type
 
-        # Trainable text encoder; NAR-VAE acoustic pretraining initializes it from scratch.
-        self.text_encoder = TextEncoder(
-            vocab_size=text_vocab_size,
-            model_size=text_model_size,
-            num_layers=text_num_layers,
-            num_heads=text_num_heads,
-            intermediate_size=text_intermediate_size,
-            norm_eps=norm_eps,
-            num_languages=num_languages,
-        )
+        if text_encoder_type == "scratch":
+            self.text_encoder = TextEncoder(
+                vocab_size=text_vocab_size,
+                model_size=text_model_size,
+                num_layers=text_num_layers,
+                num_heads=text_num_heads,
+                intermediate_size=text_intermediate_size,
+                norm_eps=norm_eps,
+                num_languages=num_languages,
+            )
+        else:
+            if frozen_text_input_size is None:
+                raise ValueError(
+                    "frozen_text_input_size is required when text_encoder_type='frozen_features'."
+                )
+            self.text_encoder = FrozenFeatureTextEncoder(
+                input_size=frozen_text_input_size,
+                model_size=text_model_size,
+                bottleneck_ratio=text_adapter_bottleneck_ratio,
+                norm_eps=norm_eps,
+                num_languages=num_languages,
+            )
 
         # Speaker conditioning is a versioned topology choice. Text-only models
         # carry neither a learned constant speaker branch nor unused speaker state.
@@ -854,11 +970,26 @@ class EchoDiT(nn.Module):
         # Together with the zeroed LowRankAdaLN up projections, this makes every
         # residual block an identity map at scratch initialization.
         nn.init.zeros_(self.cond_module[-1].weight)
+        self.global_language_embedding = (
+            nn.Embedding(num_languages + 1, timestep_embed_size, padding_idx=0)
+            if num_languages > 0
+            else None
+        )
+        if self.global_language_embedding is not None:
+            nn.init.zeros_(self.global_language_embedding.weight)
 
         # Input projection
-        self.in_proj = nn.Linear(latent_size, model_size, bias=True)
+        packed_latent_size = latent_size * self.latent_patch_size
+        if packed_latent_size > model_size:
+            raise ValueError(
+                "Packed latent width cannot exceed model_size; otherwise the per-token "
+                "velocity output is rank deficient."
+            )
+        self.in_proj = nn.Linear(packed_latent_size, model_size, bias=True)
         self.frame_text_proj = (
-            nn.Linear(text_model_size, model_size, bias=False) if use_duration_alignment else None
+            nn.Linear(text_model_size * self.latent_patch_size, model_size, bias=False)
+            if use_duration_alignment
+            else None
         )
 
         # DiT blocks
@@ -880,7 +1011,7 @@ class EchoDiT(nn.Module):
 
         # Output projection
         self.out_norm = RMSNorm(model_size, norm_eps)
-        self.out_proj = nn.Linear(model_size, latent_size, bias=True)
+        self.out_proj = nn.Linear(model_size, packed_latent_size, bias=True)
 
         # Zero-initialize output for stability
         nn.init.zeros_(self.out_proj.weight)
@@ -918,6 +1049,7 @@ class EchoDiT(nn.Module):
         kv_cache_latent: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         latent_mask: torch.Tensor | None = None,
         frame_text_state: torch.Tensor | None = None,
+        language_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -937,26 +1069,64 @@ class EchoDiT(nn.Module):
         Returns:
             Predicted velocity [B, latent_size, T]
         """
-        # Transpose: [B, D, T] -> [B, T, D]
-        x = x.transpose(1, 2)
-
         if start_pos not in (None, 0) or kv_cache_latent is not None:
             raise ValueError(
                 "NAR-VAE is non-autoregressive; start_pos must be zero and "
                 "kv_cache_latent must be None."
             )
-        freqs_cis = _rotary_frequencies(self, x.shape[1], x.device)
+        if x.ndim != 3 or x.shape[1] != self.latent_size or x.shape[-1] <= 0:
+            raise ValueError(
+                f"Noisy latents must have shape [batch, {self.latent_size}, positive_frames]."
+            )
+        batch_size, _, raw_frames = x.shape
+        if latent_mask is not None:
+            if tuple(latent_mask.shape) != (batch_size, raw_frames):
+                raise ValueError(
+                    f"Latent mask must have shape {(batch_size, raw_frames)}; "
+                    f"got {tuple(latent_mask.shape)}."
+                )
+            raw_mask = latent_mask.to(device=x.device, dtype=torch.bool)
+            x = x.masked_fill(~raw_mask[:, None, :], 0.0)
+        else:
+            raw_mask = None
+
+        pad_frames = (-raw_frames) % self.latent_patch_size
+        if pad_frames:
+            x = F.pad(x, (0, pad_frames))
+            if raw_mask is not None:
+                raw_mask = F.pad(raw_mask, (0, pad_frames), value=False)
+        packed_frames = x.shape[-1] // self.latent_patch_size
+        x = (
+            x.reshape(batch_size, self.latent_size, packed_frames, self.latent_patch_size)
+            .permute(0, 2, 1, 3)
+            .reshape(batch_size, packed_frames, self.latent_size * self.latent_patch_size)
+        )
+        packed_mask = (
+            raw_mask.reshape(batch_size, packed_frames, self.latent_patch_size).any(dim=-1)
+            if raw_mask is not None
+            else None
+        )
+        freqs_cis = _rotary_frequencies(self, packed_frames, x.device)
 
         # Note: speaker_mask is already at patch level (created in flow_matching.py)
 
         # Timestep conditioning
-        cond_embed = self.cond_module(
-            get_timestep_embedding(
-                t,
-                self.timestep_embed_size,
-                self._timestep_frequencies,
-            )
+        timestep_state = get_timestep_embedding(
+            t,
+            self.timestep_embed_size,
+            self._timestep_frequencies,
         )
+        if self.global_language_embedding is not None:
+            if language_ids is None:
+                raise ValueError("language_ids are required by this multilingual EchoDiT.")
+            if language_ids.ndim != 1 or language_ids.shape[0] != batch_size:
+                raise ValueError("language_ids must have shape [batch].")
+            timestep_state = timestep_state + self.global_language_embedding(
+                language_ids.to(device=x.device, dtype=torch.long)
+            ).to(dtype=timestep_state.dtype)
+        elif language_ids is not None:
+            raise ValueError("language_ids require a language-conditioned EchoDiT.")
+        cond_embed = self.cond_module(timestep_state)
         cond_embed = cond_embed[:, None]  # [B, 1, 3*model_size]
 
         # Project input
@@ -965,22 +1135,28 @@ class EchoDiT(nn.Module):
             if frame_text_state is not None:
                 raise ValueError("frame_text_state requires a duration-aligned NAR-VAE checkpoint.")
         else:
-            expected_shape = (x.shape[0], x.shape[1], self.frame_text_proj.in_features)
-            if frame_text_state is None or tuple(frame_text_state.shape) != expected_shape:
+            raw_expected_shape = (
+                batch_size,
+                raw_frames,
+                self.frame_text_proj.in_features // self.latent_patch_size,
+            )
+            if frame_text_state is None or tuple(frame_text_state.shape) != raw_expected_shape:
                 actual_shape = None if frame_text_state is None else tuple(frame_text_state.shape)
                 raise ValueError(
-                    f"Duration-aligned text state must have shape {expected_shape}; "
+                    f"Duration-aligned text state must have shape {raw_expected_shape}; "
                     f"got {actual_shape}."
                 )
-            x = x + self.frame_text_proj(frame_text_state.to(dtype=x.dtype))
-
-        if latent_mask is not None:
-            expected_shape = (x.shape[0], x.shape[1])
-            if tuple(latent_mask.shape) != expected_shape:
-                raise ValueError(
-                    f"Latent mask must have shape {expected_shape}; got {tuple(latent_mask.shape)}."
-                )
-            latent_mask = latent_mask.to(device=x.device, dtype=torch.bool)
+            frame_state = frame_text_state
+            if raw_mask is not None:
+                frame_state = frame_state.masked_fill(~raw_mask[:, :raw_frames, None], 0.0)
+            if pad_frames:
+                frame_state = F.pad(frame_state, (0, 0, 0, pad_frames))
+            frame_state = frame_state.reshape(
+                batch_size,
+                packed_frames,
+                self.frame_text_proj.in_features,
+            )
+            x = x + self.frame_text_proj(frame_state.to(dtype=x.dtype))
 
         # Apply DiT blocks
         for block in self.blocks:
@@ -994,8 +1170,8 @@ class EchoDiT(nn.Module):
                 start_pos=None,
                 kv_cache_latent=None,
             )
-            if latent_mask is not None:
-                block_kwargs["latent_mask"] = latent_mask
+            if packed_mask is not None:
+                block_kwargs["latent_mask"] = packed_mask
             if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
                 x = activation_checkpoint(
                     block,
@@ -1010,8 +1186,15 @@ class EchoDiT(nn.Module):
         x = self.out_norm(x)
         x = self.out_proj(x)
 
-        # Transpose back: [B, T, D] -> [B, D, T]
-        x = x.transpose(1, 2)
+        x = (
+            x.reshape(batch_size, packed_frames, self.latent_size, self.latent_patch_size)
+            .permute(0, 2, 1, 3)
+            .reshape(batch_size, self.latent_size, packed_frames * self.latent_patch_size)[
+                ..., :raw_frames
+            ]
+        )
+        if latent_mask is not None:
+            x = x.masked_fill(~latent_mask.to(device=x.device, dtype=torch.bool)[:, None, :], 0.0)
 
         return x.float()
 
@@ -1020,9 +1203,10 @@ class EchoDiT(nn.Module):
         text_input_ids: torch.Tensor,
         text_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
+        text_features: torch.Tensor | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Precompute text KV cache."""
-        text_state = self.encode_text(text_input_ids, text_mask, language_ids)
+        text_state = self.encode_text(text_input_ids, text_mask, language_ids, text_features)
         return self.project_text_kv_cache(text_state)
 
     def project_text_kv_cache(
@@ -1037,9 +1221,20 @@ class EchoDiT(nn.Module):
         text_input_ids: torch.Tensor,
         text_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
+        text_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode normalized text state for KV projection or auxiliary heads."""
-        text_state = self.text_encoder(text_input_ids, text_mask, language_ids)
+        if self.text_encoder_type == "scratch":
+            if text_features is not None:
+                raise ValueError("conditioning_features require a frozen-feature checkpoint.")
+            text_state = self.text_encoder(text_input_ids, text_mask, language_ids)
+        else:
+            text_state = self.text_encoder(
+                text_input_ids,
+                text_mask,
+                language_ids,
+                text_features,
+            )
         return self.text_norm(text_state)
 
     def get_kv_cache_speaker(

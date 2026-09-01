@@ -165,6 +165,7 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "gradient_accumulation_steps",
         "gradient_checkpointing",
         "intermediate_size",
+        "latent_patch_size",
         "learning_rate",
         "logging_dir",
         "logging_first_step",
@@ -205,6 +206,18 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "supported_language_pairs",
         "supported_reference_languages",
         "text_intermediate_size",
+        "text_adapter_bottleneck_ratio",
+        "text_encoder_type",
+        "frozen_text_input_size",
+        "text_frontend_dtype",
+        "text_frontend_input_mode",
+        "text_frontend_layer",
+        "text_frontend_license",
+        "text_frontend_max_length",
+        "text_frontend_model",
+        "text_frontend_revision",
+        "text_frontend_tokenizer_model",
+        "text_frontend_tokenizer_revision",
         "text_model_size",
         "text_num_heads",
         "text_num_layers",
@@ -1390,6 +1403,9 @@ def _validate_training_config_contract(config: Mapping[str, Any]) -> None:
         "freeze_first_n_layers": 0,
         "gradient_accumulation_steps": 1,
         "logging_steps": 1,
+        "latent_patch_size": 1,
+        "text_adapter_bottleneck_ratio": 1,
+        "text_frontend_max_length": 1,
         "num_strata": 1,
         "save_steps": 1,
         "save_total_limit": 1,
@@ -1436,6 +1452,73 @@ def _validate_training_config_contract(config: Mapping[str, Any]) -> None:
         or float(norm_eps) <= 0
     ):
         raise ValueError("norm_eps must be a finite positive number.")
+
+    text_encoder_type = config.get("text_encoder_type", "scratch")
+    if text_encoder_type not in {"scratch", "frozen_features"}:
+        raise ValueError("text_encoder_type must be 'scratch' or 'frozen_features'.")
+    if text_encoder_type == "frozen_features":
+        _config_integer(
+            config.get("frozen_text_input_size"),
+            name="frozen_text_input_size",
+            minimum=1,
+        )
+        for name in ("text_frontend_model", "text_frontend_license"):
+            value = config.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} is required for a frozen text frontend.")
+        revision = config.get("text_frontend_revision")
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+            raise ValueError(
+                "text_frontend_revision must be an immutable 40-character Hub commit SHA."
+            )
+        if config.get("text_frontend_input_mode") not in {"raw_text", "phonemes"}:
+            raise ValueError("text_frontend_input_mode must be 'raw_text' or 'phonemes'.")
+        if config.get("text_frontend_dtype") not in {"float16", "float32"}:
+            raise ValueError(
+                "text_frontend_dtype must be 'float16' or 'float32'; cached Arrow datasets "
+                "cannot preserve bfloat16 without a separate bit-storage contract."
+            )
+        layer = config.get("text_frontend_layer", -1)
+        if isinstance(layer, bool) or not isinstance(layer, int):
+            raise ValueError("text_frontend_layer must be an integer hidden-state index.")
+        _config_integer(
+            config.get("text_frontend_max_length"),
+            name="text_frontend_max_length",
+            minimum=1,
+        )
+        if config.get("freeze_text_encoder", False):
+            raise ValueError(
+                "freeze_text_encoder would freeze the trainable acoustic adapter. The external "
+                "pretrained frontend is always frozen and is never part of this model optimizer."
+            )
+
+    # Packing may shorten the sequence, but it must not force each raw velocity group through a
+    # lower-rank output bottleneck. This is especially important for the 128-channel DACVAE:
+    # small/384-wide models can safely use P1 or P2, but not P4 (512 output values per token).
+    from nar_vae.model_presets import resolve_model_architecture
+
+    # Minimal validation calls used by checkpoint-lineage tooling may not carry an acoustic
+    # architecture. Fully resolved train configs always do, and the model constructor repeats
+    # this invariant as a final boundary check.
+    if "dacvae_latent_dim" in config:
+        latent_width = _config_integer(
+            config["dacvae_latent_dim"],
+            name="dacvae_latent_dim",
+            minimum=1,
+        )
+        latent_patch_size = _config_integer(
+            config.get("latent_patch_size", 1),
+            name="latent_patch_size",
+            minimum=1,
+        )
+        model_width = resolve_model_architecture(config).model_size
+        packed_width = latent_width * latent_patch_size
+        if packed_width > model_width:
+            raise ValueError(
+                "latent_patch_size creates a rank-deficient acoustic projection: "
+                f"dacvae_latent_dim * latent_patch_size = {packed_width}, but model_size is "
+                f"{model_width}. Reduce latent_patch_size or use a wider model preset."
+            )
 
     do_validation = config.get("do_validation", False)
     if not isinstance(do_validation, bool):

@@ -2,6 +2,7 @@
 
 import unittest
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -146,6 +147,44 @@ class SpeakerReferenceTest(unittest.TestCase):
         self.assertIn(REPRESENTATION_CONTRACT_COLUMN, from_dict.call_args.args[0])
         dataset.save_to_disk.assert_called_once()
         write_manifest.assert_called_once_with(dataset, directory)
+
+    def test_prepared_dataset_preserves_declared_fp16_frozen_features(self):
+        sample = {
+            "latents": np.zeros((2, 3), dtype=np.float32),
+            "latent_num_frames": 3,
+            "conditioning_ids": [1, 2],
+            "conditioning_features": np.ones((2, 6), dtype=np.float16),
+            REPRESENTATION_CONTRACT_COLUMN: {
+                "contract_version": 3,
+                "text_frontend": {"feature_dtype": "float16"},
+            },
+        }
+        dataset = MagicMock()
+        dataset.__len__.return_value = 1
+        dataset.features = {
+            "conditioning_features": SimpleNamespace(
+                feature=SimpleNamespace(feature=SimpleNamespace(dtype="float16"))
+            )
+        }
+
+        with TemporaryDirectory() as directory:
+            with (
+                patch(
+                    "nar_vae.dataset.prepare_dataset.Dataset.from_dict",
+                    return_value=dataset,
+                ) as from_dict,
+                patch("nar_vae.dataset.prepare_dataset.write_prepared_dataset_manifest"),
+            ):
+                save_dataset([sample], directory)
+
+        saved = from_dict.call_args.args[0]["conditioning_features"][0]
+        self.assertEqual(saved.dtype, np.float16)
+        dataset.save_to_disk.assert_called_once()
+
+        invalid = dict(sample, conditioning_features=np.ones((2, 6), dtype=np.float32))
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "declares float16"):
+                save_dataset([invalid], directory)
 
     def test_prepared_dataset_rejects_partial_frame_metadata(self):
         samples = [

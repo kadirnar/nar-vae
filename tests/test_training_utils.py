@@ -369,7 +369,7 @@ class FreezeLayersTest(unittest.TestCase):
                 }
             )
 
-        with self.assertRaisesRegex(ValueError, "beyond English"):
+        with self.assertRaisesRegex(ValueError, "exactly one supported language"):
             resolve_language_training_options({"supported_languages": ["en", "es"]})
 
     def test_language_training_validates_target_and_reference_independently(self):

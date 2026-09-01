@@ -139,6 +139,7 @@ class EchoDiTTrainer(FrameBudgetTrainerMixin, Trainer):
         speaker_latent = inputs.get("speaker_latents", None)
         speaker_mask = inputs.get("speaker_mask", None)
         language_ids = inputs.get("language_ids", None)
+        conditioning_features = inputs.get("conditioning_features", None)
 
         loss = self.flow_loss_fn(
             model=model,
@@ -149,6 +150,7 @@ class EchoDiTTrainer(FrameBudgetTrainerMixin, Trainer):
             speaker_latent=speaker_latent,
             speaker_mask=speaker_mask,
             language_ids=language_ids,
+            conditioning_features=conditioning_features,
             accumulation_normalization=num_items_in_batch,
         )
 
@@ -667,6 +669,10 @@ def _pretrain(
             latent_size=config["dacvae_latent_dim"],
             text_vocab_size=config["text_vocab_size"],
             speaker_patch_size=speaker_patch_size,
+            latent_patch_size=config.get("latent_patch_size", 1),
+            text_encoder_type=config.get("text_encoder_type", "scratch"),
+            frozen_text_input_size=config.get("frozen_text_input_size"),
+            text_adapter_bottleneck_ratio=config.get("text_adapter_bottleneck_ratio", 4),
             **architecture.model_kwargs(),
             norm_eps=config.get("norm_eps", 1e-6),
             cfg_dropout=config.get("cfg_dropout", 0.1),
@@ -744,6 +750,8 @@ def _pretrain(
             expected_codec_sha256=config.get("dacvae_sha256"),
             expected_sample_rate=config.get("dacvae_sample_rate"),
             expected_hop_length=config.get("dacvae_hop_length"),
+            text_vocab_size=config.get("text_vocab_size"),
+            expected_representation=representation_from_config(config),
         ),
         description="pretraining dataset preflight",
     )
@@ -754,6 +762,11 @@ def _pretrain(
         lambda: FlowMatchingDataCollator(
             pad_token=pad_token,
             speaker_patch_size=speaker_patch_size,
+            conditioning_feature_dtype=(
+                config.get("text_frontend_dtype")
+                if config.get("text_encoder_type", "scratch") == "frozen_features"
+                else None
+            ),
         ),
         description="pretraining data-collator construction",
     )
