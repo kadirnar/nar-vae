@@ -1,0 +1,197 @@
+# NAR-VAE Flow-Matching TTS PRETRAINING Configuration
+#
+# This stage initializes every active acoustic-model component from random
+# weights. It never accepts an external pretrained TTS checkpoint. A same-run
+# Trainer checkpoint may be used only for exact interruption recovery.
+#
+# Prepared DACVAE latents are currently a separately versioned data dependency.
+# Truly end-to-end first-party pretraining additionally requires training and
+# evaluating a first-party codec before preparing this dataset.
+
+training_stage: "pretrain"
+model_initialization: "random"
+pretrained_checkpoint: null  # Must remain null; use finetune_config.yaml for SFT.
+resume_from_checkpoint: null  # true, or save_folder/checkpoint-N from this exact run.
+seed: 1337
+data_seed: 1337
+
+# ============================================================================
+# Acoustic Model Configuration
+# ============================================================================
+
+# DACVAE Configuration
+dacvae_model: "./codecs/dacvae/weights.pth"  # Exact local codec used during preparation.
+dacvae_revision: null  # For Hub preparation, use a full 40-character commit.
+dacvae_filename: null  # For Hub preparation, usually "weights.pth".
+dacvae_sha256: null  # Fill with the exact codec artifact hash before server training.
+dacvae_backend: "bundled"  # Exact resolved backend: "bundled" or "fast".
+dacvae_latent_dim: 128  # Actual DACVAE latent dimension (verified from data)
+dacvae_sample_rate: 44100  # Must match every prepared row's representation contract.
+dacvae_hop_length: 512     # Must match every prepared row's representation contract.
+
+# Small is a realistic single-GPU-oriented starting point. Quality claims
+# still require a trained checkpoint and held-out speech evaluation.
+model_preset: "small"     # tiny, small, medium, large, or xlarge
+model_size: 384
+num_layers: 12
+num_heads: 8
+intermediate_size: 1536
+
+# Text Encoder
+text_vocab_size: 100312    # tiktoken cl100k_base (100277) + special tokens (10) + emotion tags (25)
+text_model_size: 320       # Text encoder hidden size
+text_num_layers: 4         # Text encoder depth
+text_num_heads: 8          # Text encoder attention heads
+text_intermediate_size: 1280  # Text encoder MLP size
+
+# Speaker Encoder (for speaker conditioning)
+speaker_patch_size: 4      # Stored in checkpoint metadata and validated at load time
+speaker_model_size: 256    # Speaker encoder hidden size
+speaker_num_layers: 3      # Speaker encoder depth
+speaker_num_heads: 8       # Speaker encoder attention heads
+speaker_intermediate_size: 1024  # Speaker encoder MLP size
+use_speaker_conditioning: false  # Enable only with a validated speaker_latents dataset
+
+# Target-language conditioning. Enable this for multilingual training and list
+# only languages actually represented in the paired text/audio dataset.
+use_language_conditioning: false
+supported_languages: ["en"]
+# Set only for speaker-conditioned multilingual data. This exact source-audio
+# language set is stored in the checkpoint and gates cross-lingual inference.
+supported_reference_languages: null
+
+# Versioned learned frame count. These weights are trained from target latent
+# lengths; enabling the module does not retrofit an existing checkpoint.
+use_duration_predictor: true
+duration_predictor_hidden_size: 256
+duration_predictor_num_layers: 2
+duration_predictor_use_speaker: false
+duration_loss_weight: 0.1
+duration_huber_delta: 1.0
+use_mas_duration: false  # Compatibility base; canonical pretraining overrides this.
+duration_alignment_hidden_size: 64
+mas_duration_loss_weight: 0.0
+mas_alignment_loss_weight: 0.0
+
+# Conditioning
+timestep_embed_size: 192   # Timestep embedding dimension
+adaln_rank: 64             # Low-rank AdaLN rank (for efficiency)
+norm_eps: 1.0e-6           # Normalization epsilon
+
+# Flow Matching Configuration
+cfg_dropout: 0.1           # Default text/speaker conditioning dropout probability
+cfg_dropout_text: null     # Optional text-specific override; null inherits cfg_dropout
+cfg_dropout_speaker: null  # Optional speaker-specific override; null inherits cfg_dropout
+
+# Timestep Distribution
+timestep_distribution: "stratified_logit_normal"  # "uniform", "logit_normal", "stratified_logit_normal"
+logit_normal_loc: 0.0      # Mean for logit-normal distribution
+logit_normal_scale: 1.0    # Scale for logit-normal distribution
+num_strata: 10             # Number of strata for stratified sampling
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+
+# Training Arguments
+epochs: 10
+batch_size: 8              # Per-device; tune after measuring the target GPU.
+# Variable-size batches cap total unpadded DACVAE frames before collation.
+# 4096 supports every <=30 s sample from the default ~86 Hz preparation path.
+max_frames_per_batch: 4096
+max_examples_per_batch: null  # null uses batch_size as the example-count ceiling.
+frame_bucket_size: 128
+allow_legacy_frame_length_inference: false  # Re-prepare old data instead of loading every latent.
+allow_legacy_representation: false  # Require versioned frontend/codec metadata on every row.
+learning_rate: 1.0e-4
+weight_decay: 0.01
+warmup_steps: 0
+warmup_ratio: 0.05
+gradient_accumulation_steps: 4  # Effective global batch = 8 * 4 * world_size.
+ddp_bucket_cap_mb: 25      # DDP gradient bucket size per process
+ddp_find_unused_parameters: false  # Unreachable legacy prefix parameters are frozen explicitly.
+max_grad_norm: 1.0
+save_steps: 2000
+logging_steps: 10
+
+# Layer Freezing Configuration (for pretraining)
+freeze_text_encoder: false     # Set to true to freeze text encoder (default: false = train text encoder)
+freeze_speaker_encoder: false  # A from-scratch speaker encoder must remain trainable
+freeze_language_embedding: false  # A new language embedding must remain trainable
+freeze_first_n_layers: 0       # Number of first DiT layers to freeze (default: 0 = none frozen)
+
+# Datasets
+TTS_dataset: "owner/dataset"
+TTS_dataset_local: "./data/prepared"  # Requires nar_vae_dataset_manifest.json; null uses Hub.
+TTS_dataset_revision: null  # Full 40-character commit SHA when TTS_dataset_local is null.
+dataset_download_workers: 8  # Remote snapshot workers; validated in the range 1..32.
+
+# The tokenizer vocabulary and special IDs are versioned by the fixed text
+# frontend contract. Only padding is consumed by the training collator.
+pad_token: 100286
+
+# ============================================================================
+# Paths and Naming
+# ============================================================================
+
+save_folder: "checkpoints/nar_vae_small_pretrain"
+project_name: "nar-vae-pretraining"
+run_name: "nar-vae-small-pretrain"
+
+# ============================================================================
+# Hardware Optimization
+# ============================================================================
+
+use_fsdp: false  # Unsupported by this entry point; use DDP via torchrun.
+mixed_precision: "bf16"
+tf32: false  # Enable only after validating numerical parity on the named GPU.
+gradient_checkpointing: true   # Non-reentrant checkpointing for encoder and DiT blocks.
+torch_compile: false  # Opt in only after measuring stable frame buckets on the target GPU.
+dataloader_num_workers: 4
+dataloader_pin_memory: true
+dataloader_drop_last: true
+
+# ============================================================================
+# Validation
+# ============================================================================
+
+# Generated-audio validation is not implemented inside the Trainer entry point.
+# Keep this false; run explicit held-out evaluation on each exported checkpoint.
+do_validation: false
+
+# ============================================================================
+# Optimizer & Scheduler
+# ============================================================================
+
+optimizer: "adamw"  # adamw/adamw_torch; adamw_torch_fused is opt-in CUDA only.
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+lr_scheduler_type: "cosine"
+
+# ============================================================================
+# Logging
+# ============================================================================
+
+report_to: "none"  # Set to "wandb" to enable rank-zero-safe Trainer logging.
+logging_dir: "./logs"
+logging_first_step: true
+save_total_limit: 3
+save_safetensors: false
+wandb_project: "nar-vae-pretraining"
+wandb_run_name: "nar-vae-small-pretrain"
+wandb_log_model: false
+
+# ============================================================================
+# Notes
+# ============================================================================
+# Current acoustic-model implementation:
+# - Joint attention to text, speaker, and latent contexts
+# - Low-rank adaLN-Zero conditioning
+# - RMSNorm instead of LayerNorm
+# - RoPE for positional encoding
+# - Gated outputs in attention and MLP
+# - Versioned learned duration prediction from target-latent frame counts
+#
+# These are implementation facts, not performance or quality claims. Runtime,
+# memory, WER/CER, and acoustic quality must be measured on the server GPU.

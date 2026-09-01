@@ -1,0 +1,84 @@
+[presets.tiny]
+description = "Development and low-latency research baseline; quality must be established by training."
+model_size = 256
+num_layers = 8
+num_heads = 8
+intermediate_size = 1024
+text_model_size = 256
+text_num_layers = 2
+text_num_heads = 8
+text_intermediate_size = 1024
+speaker_model_size = 192
+speaker_num_layers = 2
+speaker_num_heads = 6
+speaker_intermediate_size = 768
+timestep_embed_size = 128
+adaln_rank = 64
+
+[presets.small]
+description = "Single-GPU-oriented training preset with more capacity than tiny."
+model_size = 384
+num_layers = 12
+num_heads = 8
+intermediate_size = 1536
+text_model_size = 320
+text_num_layers = 4
+text_num_heads = 8
+text_intermediate_size = 1280
+speaker_model_size = 256
+speaker_num_layers = 3
+speaker_num_heads = 8
+speaker_intermediate_size = 1024
+timestep_embed_size = 192
+adaln_rank = 64
+
+[presets.medium]
+description = "Balanced research preset for quality/latency scaling studies."
+model_size = 512
+num_layers = 16
+num_heads = 8
+intermediate_size = 2048
+text_model_size = 512
+text_num_layers = 6
+text_num_heads = 8
+text_intermediate_size = 2048
+speaker_model_size = 384
+speaker_num_layers = 4
+speaker_num_heads = 8
+speaker_intermediate_size = 1536
+timestep_embed_size = 256
+adaln_rank = 96
+
+[presets.large]
+description = "High-capacity preset intended for multi-GPU training."
+model_size = 768
+num_layers = 20
+num_heads = 12
+intermediate_size = 3072
+text_model_size = 640
+text_num_layers = 6
+text_num_heads = 10
+text_intermediate_size = 2560
+speaker_model_size = 512
+speaker_num_layers = 4
+speaker_num_heads = 8
+speaker_intermediate_size = 2048
+timestep_embed_size = 256
+adaln_rank = 128
+
+[presets.xlarge]
+description = "Approximately 650-700M-parameter compatibility preset, depending on conditioning."
+model_size = 1024
+num_layers = 24
+num_heads = 16
+intermediate_size = 4096
+text_model_size = 768
+text_num_layers = 6
+text_num_heads = 12
+text_intermediate_size = 3072
+speaker_model_size = 512
+speaker_num_layers = 4
+speaker_num_heads = 8
+speaker_intermediate_size = 2048
+timestep_embed_size = 256
+adaln_rank = 128

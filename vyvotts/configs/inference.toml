@@ -1,0 +1,70 @@
+[model]
+requires_explicit_checkpoint = true
+base_filename = "pytorch_model.bin"
+ema_filename = "pytorch_model_ema.bin"
+prefer_ema = true
+
+[codec]
+requires_explicit_source = true
+requires_manifest_sha256 = true
+
+[duration]
+seconds_per_character = 0.08
+minimum_seconds = 1.5
+maximum_seconds = 30.0
+
+[profiles.quality]
+num_steps = 50
+solver = "heun"
+cache_mode = "none"
+cfg_scale = 1.0
+cfg_mode = "joint"
+cfg_scale_text = 0.0
+cfg_scale_speaker = 0.0
+cfg_min_t = 0.0
+cfg_max_t = 1.0
+initial_noise_scale = 1.0
+temporal_rescale_k = 1.0
+temporal_rescale_sigma = 2.5
+
+[profiles.balanced]
+num_steps = 32
+solver = "euler"
+cache_mode = "none"
+cfg_scale = 1.0
+cfg_mode = "joint"
+cfg_scale_text = 0.0
+cfg_scale_speaker = 0.0
+cfg_min_t = 0.0
+cfg_max_t = 1.0
+initial_noise_scale = 1.0
+temporal_rescale_k = 1.0
+temporal_rescale_sigma = 2.5
+
+[profiles.fast]
+num_steps = 16
+solver = "euler"
+cache_mode = "none"
+cfg_scale = 1.0
+cfg_mode = "joint"
+cfg_scale_text = 0.0
+cfg_scale_speaker = 0.0
+cfg_min_t = 0.0
+cfg_max_t = 1.0
+initial_noise_scale = 1.0
+temporal_rescale_k = 1.0
+temporal_rescale_sigma = 2.5
+
+[profiles.turbo]
+num_steps = 16
+solver = "euler"
+cache_mode = "cache_dit"
+cfg_scale = 1.0
+cfg_mode = "joint"
+cfg_scale_text = 0.0
+cfg_scale_speaker = 0.0
+cfg_min_t = 0.0
+cfg_max_t = 1.0
+initial_noise_scale = 1.0
+temporal_rescale_k = 1.0
+temporal_rescale_sigma = 2.5

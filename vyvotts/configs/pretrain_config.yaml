@@ -1,0 +1,15 @@
+# Canonical NAR-VAE scratch-pretraining configuration.
+#
+# The shared scratch-training settings remain in echodit_config.yaml. The
+# pretraining loader resolves this single relative base, then applies any
+# overrides declared below. External pretrained TTS weights are rejected
+# regardless of which path is used.
+
+extends: "echodit_config.yaml"
+
+# Canonical scratch training learns monotonic token durations jointly with the
+# utterance-level frame-count auxiliary. These heads are random at this stage.
+use_mas_duration: true
+duration_alignment_hidden_size: 64
+mas_duration_loss_weight: 0.1
+mas_alignment_loss_weight: 0.01

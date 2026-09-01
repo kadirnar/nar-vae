@@ -1,0 +1,80 @@
+# NAR-VAE flow-native GRPO post-training configuration.
+#
+# This stage accepts only a local NAR-VAE SFT checkpoint whose model and training
+# manifests retain the original scratch-pretraining parent. It never imports a
+# third-party pretrained TTS model. Reward evaluators are injected through the
+# Python API and their exact identities must be recorded below.
+
+training_stage: "grpo"
+parent_checkpoint: "./checkpoints/nar_vae_small_sft/final/flow_model/pytorch_model.bin"
+prompt_dataset_local: "./posttrain_data"
+save_folder: "./checkpoints/nar_vae_small_grpo"
+resume_from_checkpoint: null  # true for latest valid, or this run's save_folder/checkpoint-N.
+
+seed: 1337
+data_seed: 1337
+epochs: 1
+max_steps: null
+prompt_batch_size: 1  # Rows are prompt groups; candidates never cross ranks.
+
+# One detached rollout is reused for at least two optimizer epochs. This is
+# required for new/old policy ratios to move away from one and activate clipping.
+policy_update_epochs: 2
+num_steps: 16
+group_size: 4
+sde_window_start: 1
+sde_window_size: 4
+noise_level: 0.7
+clip_ratio: 0.2
+kl_beta: 0.01
+supervised_replay_weight: 0.1
+max_grad_norm: 1.0
+advantage_epsilon: 1.0e-6
+log_ratio_clip: 20.0
+event_reduction: "mean"
+
+learning_rate: 1.0e-6
+weight_decay: 0.01
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+warmup_steps: 0
+lr_scheduler_type: "cosine"  # constant, linear, or cosine.
+
+save_steps: 100
+logging_steps: 1
+dataloader_num_workers: 4
+dataloader_pin_memory: true
+dataloader_drop_last: true
+mixed_precision: "bf16"  # fp32 or bf16; fp16 is deliberately unsupported.
+ddp_find_unused_parameters: false
+
+prompt_id_column: "utterance_id"
+freeze_text_encoder: false
+freeze_speaker_encoder: false
+freeze_language_embedding: false
+freeze_first_n_layers: 0
+
+report_to: "none"  # Set to wandb after installing nar-vae[wandb].
+wandb_project: "nar-vae-grpo"
+wandb_run_name: "nar-vae-flow-grpo"
+
+# The callback passed to grpo_post_train must return these exact component names
+# with [prompt_batch, group_size] tensors. Replace every identity before training.
+reward_weights:
+  intelligibility: 1.0
+  speaker_similarity: 0.5
+  perceptual_quality: 0.5
+reward_evaluators:
+  intelligibility:
+    implementation: "replace-with-language-appropriate-asr"
+    revision: "replace-with-immutable-revision"
+    sha256: "replace-with-lowercase-64-character-sha256"
+  speaker_similarity:
+    implementation: "replace-with-speaker-verifier"
+    revision: "replace-with-immutable-revision"
+    sha256: "replace-with-lowercase-64-character-sha256"
+  perceptual_quality:
+    implementation: "replace-with-perceptual-evaluator"
+    revision: "replace-with-immutable-revision"
+    sha256: "replace-with-lowercase-64-character-sha256"
