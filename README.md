@@ -1,8 +1,9 @@
 # NAR-VAE
 
 NAR-VAE is a non-autoregressive text-to-speech research library built around conditional flow
-matching, EchoDiT, and continuous DACVAE latents. It supports scratch pretraining, SFT, flow-native
-GRPO, single- and multi-GPU training, multilingual conditioning, and Cache-DiT inference.
+matching, EchoDiT, and continuous DACVAE latents. It supports acoustic-model scratch pretraining,
+SFT, flow-native GRPO, single- and multi-GPU training, multilingual conditioning, and Cache-DiT
+inference. The separately supplied DACVAE codec remains fixed in every implemented training stage.
 
 > NAR-VAE does not publish a trained acoustic checkpoint yet. Quality, WER, multilingual,
 > zero-shot, latency, and streaming claims require a trained model and held-out evaluation.
@@ -29,10 +30,12 @@ raw_row = {
     "audio": {"array": waveform_float32, "sampling_rate": 48000},
     "text": "The transcript matching this waveform.",
     "language": "en",  # Optional multilingual label.
-    "speaker_id": "speaker-1",  # Optional reference-voice grouping.
-    "session_id": "session-1",  # Optional cross-session grouping.
+    "speaker_id": "speaker-1",  # Optional same-speaker reference pairing.
 }
 ```
+
+Speaker-conditioned preparation selects another utterance from the same speaker; the target
+utterance is never used as its own voice reference.
 
 The prepared dataset contains:
 

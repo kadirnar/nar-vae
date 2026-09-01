@@ -71,6 +71,7 @@ class EmiliaPreparer:
             dacvae_model,
             backend=dacvae_backend,
             device=device,
+            freeze=True,
         )
         self.representation_contract = build_representation_contract(
             self.dacvae,

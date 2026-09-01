@@ -16,7 +16,8 @@ the strict capability metadata described in the README.
 - Do not create a speaker-specific adapter, embedding table entry, LoRA, prompt inversion, gradient
   update, or cached latent optimized for an evaluation or user voice.
 - A target utterance may never be its own reference. Select a different utterance from the same
-  speaker; prefer a different session, microphone, and acoustic environment.
+  speaker. When the data permits, vary microphones and acoustic environments to test channel
+  robustness without making either one a required grouping field.
 - Speaker IDs are data-management keys used for splitting, balancing, and pairing. They are not
   inference-time identities.
 - Target text language and reference-audio language remain independent. Cross-lingual examples use
@@ -40,7 +41,6 @@ Keep a raw, auditable manifest before DACVAE encoding. At minimum, each row shou
 | `text` | Human transcript or a reviewed transcript with recorded provenance and confidence. |
 | `language` | Explicit canonical language code; never infer it silently from text. |
 | `speaker_id` | Stable within the licensed source; required for split and reference safety. |
-| `session_id` | Recording session/device key; required when cross-session references are enforced. |
 | `license` / `consent` | Machine-checkable usage, redistribution, and voice-model permission. |
 | `duration` / quality fields | Duration, clipping, speech ratio, SNR estimate, and review state. |
 
@@ -52,8 +52,9 @@ and treated as ground truth.
 
 1. Split by speaker first, then build utterance pairs. Train, validation, and test speaker sets must
    be disjoint. Deduplicate audio and near-duplicate transcripts across all splits before encoding.
-2. Give every included speaker at least two usable utterances. For stronger channel robustness,
-   require at least two sessions and select references from a session different from the target.
+2. Give every included speaker at least two usable utterances and always select a reference
+   utterance different from the target. Evaluate channel variation separately when the source
+   metadata supports it.
 3. Build same-speaker/different-utterance pairs. Vary reference duration and choose one or several
    references within the configured duration bound; never concatenate the target audio itself.
 4. Preserve both roles: `language` is the target transcript/audio language and `speaker_language`
@@ -80,13 +81,11 @@ summary = validate_zero_shot_splits(
     speaker_id_column="speaker_id",
     utterance_id_column="utterance_id",
     language_column="language",
-    session_id_column="session_id",
-    require_cross_session_references=True,
 )
 print(summary)
 ```
 
-Preparation can enforce the same cross-session reference rule:
+Preparation applies the same-speaker/different-utterance reference rule:
 
 ```python
 from nar_vae.dataset import prepare_finetune_dataset
@@ -98,8 +97,6 @@ prepare_finetune_dataset(
     speaker_id_column="speaker_id",
     utterance_id_column="utterance_id",  # Omit to derive a content-bound ID.
     language_column="language",
-    session_id_column="session_id",
-    require_cross_session_references=True,
     max_reference_seconds=30.0,
     reference_seed=1234,
 )
@@ -116,7 +113,7 @@ punctuation, code switching, and long-form sentences—in labeled buckets instea
 short sentences to dominate.
 
 Sample by language and then speaker so raw hours from one language, corpus, or prolific speaker do
-not dominate. Track hours, speakers, sessions, transcript-review rate, and target/reference pair
+not dominate. Track hours, speakers, utterances, transcript-review rate, and target/reference pair
 counts for every language pair. Choose sampling temperatures and stage mixtures only from measured
 ablation results; this document deliberately does not present one universal ratio.
 
@@ -146,15 +143,15 @@ verified: codec reconstruction quality or lower training loss alone is not a rel
 
 ### Stage 2 — Reference-robust zero-shot cloning
 
-Train on same-speaker/different-utterance references, preferably from different sessions. Randomize
-reference length within deployment bounds and include realistic channel variation on the reference
-branch while keeping target recordings clean enough to remain trustworthy acoustic targets. Mix
-same-language and true cross-lingual pairs from multilingual speakers. Continue independent
-target-language and reference-language conditioning throughout the batch.
+Train on same-speaker/different-utterance references. Randomize reference length within deployment
+bounds and include realistic channel variation on the reference branch while keeping target
+recordings clean enough to remain trustworthy acoustic targets. Mix same-language and true
+cross-lingual pairs from multilingual speakers. Continue independent target-language and
+reference-language conditioning throughout the batch.
 
 This stage targets speaker preservation without memorizing an evaluation voice. Report speaker
 similarity separately for same-language and cross-lingual pairs and stratify it by reference length,
-session match, noise condition, and target language.
+reference channel, noise condition, and target language.
 
 ### Stage 3 — Intelligibility and hard-text continuation
 
@@ -251,8 +248,8 @@ Every run should record:
 
 - parent and candidate checkpoint hashes and exact capability metadata;
 - immutable manifest/data snapshot and rejected-row counts by reason;
-- speaker overlap, duplicate, and cross-session validation results;
-- hours/speakers/sessions by target language and target/reference language pair;
+- speaker overlap, duplicate, and target/reference-utterance separation results;
+- hours, speakers, and utterances by target language and target/reference language pair;
 - optimizer, learning-rate schedule, batch size, effective global batch, GPUs, precision, and seed;
 - all objective and listening metrics by language pair and challenge bucket;
 - the promotion decision, evidence, regressions, risks, and unresolved questions.

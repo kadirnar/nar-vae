@@ -75,6 +75,7 @@ class DatasetPreparer:
             dacvae_model,
             backend=dacvae_backend,
             device=device,
+            freeze=True,
         )
         self.representation_contract = build_representation_contract(
             self.dacvae,
@@ -247,8 +248,6 @@ def prepare_dataset(
     language_column: str | None = None,
     max_reference_utterances: int = 5,
     reference_seed: int = 1234,
-    session_id_column: str | None = None,
-    require_cross_session_references: bool = False,
     dataset_revision: str | None = None,
     dataset_download_workers: int = DEFAULT_DATASET_DOWNLOAD_WORKERS,
 ):
@@ -310,17 +309,6 @@ def prepare_dataset(
 
     # Build speaker index if using speaker-ID training
     speaker_to_indices = None
-    session_ids = None
-    if require_cross_session_references and not use_speaker_id:
-        raise ValueError("Cross-session references require use_speaker_id=True.")
-    if require_cross_session_references and session_id_column is None:
-        raise ValueError("Cross-session references require session_id_column.")
-    if session_id_column is not None:
-        if session_id_column not in ds.column_names:
-            raise ValueError(f"Session ID column not found: {session_id_column!r}")
-        session_ids = ds[session_id_column]
-        if require_cross_session_references and any(value in (None, "") for value in session_ids):
-            raise ValueError("Cross-session references require a session ID in every row.")
     if use_speaker_id:
         if is_main:
             print(f"\nBuilding speaker index from '{speaker_id_column}' column...")
@@ -371,11 +359,6 @@ def prepare_dataset(
                         target_index=original_idx,
                         maximum_utterances=max_reference_utterances,
                         seed=reference_seed,
-                        session_ids=session_ids,
-                        target_session_id=(
-                            example.get(session_id_column) if session_id_column else None
-                        ),
-                        require_different_session=require_cross_session_references,
                     )
                     speaker_ref_audio, speaker_reference_language = (
                         collect_reference_audio_with_language(

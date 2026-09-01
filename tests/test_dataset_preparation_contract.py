@@ -208,6 +208,7 @@ class RepresentationContractTest(unittest.TestCase):
             {"audio": {"array": [0.0], "sampling_rate": 48000}, "text": "hello"}
         )
         self.assertEqual(row[REPRESENTATION_CONTRACT_COLUMN], self.contract.to_dict())
+
         standard.extract_latents = lambda audio, sr: np.zeros((3, 3), dtype=np.float32)
         with self.assertRaisesRegex(RepresentationContractError, "latent width 3"):
             standard.process_sample(
@@ -247,6 +248,24 @@ class RepresentationContractTest(unittest.TestCase):
             text="hello",
         )
         self.assertEqual(row[REPRESENTATION_CONTRACT_COLUMN], self.contract.to_dict())
+
+    def test_every_preparer_loads_the_codec_frozen(self):
+        cases = (
+            ("nar_vae.dataset.prepare.load_dacvae", DatasetPreparer),
+            ("nar_vae.dataset.prepare_dataset.load_dacvae", FileDatasetPreparer),
+            ("nar_vae.dataset.finetune_prepare.load_dacvae", DataPreparer),
+            ("nar_vae.dataset.emilia_prepare.load_dacvae", EmiliaPreparer),
+        )
+
+        for load_target, preparer_class in cases:
+            with self.subTest(preparer=preparer_class.__name__):
+                with patch(
+                    load_target,
+                    return_value=fake_codec(identifier="codec.pth"),
+                ) as load_codec:
+                    preparer_class("codec.pth", device="cpu")
+
+                self.assertIs(load_codec.call_args.kwargs["freeze"], True)
 
 
 class DatasetLoadingThreadingTest(unittest.TestCase):

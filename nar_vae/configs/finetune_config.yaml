@@ -121,7 +121,7 @@ lr_scheduler_type: "cosine"
 
 TTS_dataset_local: "./finetune_data"  # Prepared data with nar_vae_dataset_manifest.json.
 # For zero-shot cloning, keep training/validation/test speakers disjoint and
-# prepare same-speaker, different-utterance references (prefer cross-session).
+# prepare same-speaker references that always differ from the target utterance.
 
 # The versioned text frontend fixes all vocabulary and special-token IDs.
 # Only padding is a collator input.

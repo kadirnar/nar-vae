@@ -10,18 +10,19 @@ training. No architecture choice by itself guarantees natural speech or low word
 
 ## Training stages
 
-1. **Codec pretraining** trains the first-party waveform VAE from raw audio when a new codec is
-   required. Until that pipeline is implemented, prepared latent datasets must record the exact
-   codec identity and are not evidence of end-to-end from-scratch training.
-2. **Acoustic pretraining** initializes every NAR-VAE text, duration, speaker, language, and flow
+Codec training is not implemented. Every current stage requires a separately trained DACVAE
+artifact, verifies its exact identity, and keeps it outside the acoustic optimizer. Consequently,
+the current pipeline is acoustic-model scratch training, not end-to-end codec-plus-TTS training.
+
+1. **Acoustic pretraining** initializes every NAR-VAE text, duration, speaker, language, and flow
    parameter randomly and optimizes paired text/audio latents. This is the required first model
    stage and never accepts a pretrained TTS checkpoint.
-3. **SFT** continues only a NAR-VAE checkpoint produced by the pretraining stage. Full-parameter
+2. **SFT** continues only a NAR-VAE checkpoint produced by the pretraining stage. Full-parameter
    SFT is the reference path; parameter-efficient adapters are optional experiments.
-4. **Future few-step distillation** may use only the project's own converged teacher. Quality,
+3. **Future few-step distillation** may use only the project's own converged teacher. Quality,
    balanced, and turbo students would be different trained checkpoints, not runtime switches that
    invent quality; this repository does not yet provide a distillation trainer.
-5. **Preference/RL post-training** is optional and the implemented GRPO entry point follows only a
+4. **Preference/RL post-training** is optional and the implemented GRPO entry point follows only a
    converged, hash-bound SFT export descended from this project's scratch pretraining stage.
    Flow-native GRPO needs stochastic trajectories, a frozen reference, KL/flow-loss anchoring,
    supervised replay, and independent evaluation. It is not a conventional supervised loss.

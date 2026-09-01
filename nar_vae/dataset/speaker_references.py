@@ -35,29 +35,12 @@ def select_reference_indices(
     target_index: int,
     maximum_utterances: int,
     seed: int,
-    session_ids: Mapping[int, Any] | Sequence[Any] | None = None,
-    target_session_id: Any = None,
-    require_different_session: bool = False,
 ) -> list[int]:
-    """Choose deterministic same-speaker peers, always excluding the target row.
-
-    Session filtering is opt-in and is useful for preventing a cloning model from
-    relying on recording-channel identity instead of speaker identity.
-    """
+    """Choose deterministic same-speaker peers, always excluding the target row."""
     if maximum_utterances <= 0:
         raise ValueError("maximum_utterances must be positive")
-    if require_different_session and session_ids is None:
-        raise ValueError("Cross-session references require session_ids.")
-    if require_different_session and target_session_id in (None, ""):
-        raise ValueError("Cross-session references require a target_session_id.")
 
     candidates = [index for index in speaker_index.get(speaker_id, ()) if index != target_index]
-    if require_different_session:
-        candidates = [
-            index
-            for index in candidates
-            if session_ids[index] not in (None, "") and session_ids[index] != target_session_id
-        ]
     random.Random(seed + target_index).shuffle(candidates)
     return candidates[:maximum_utterances]
 
@@ -68,24 +51,18 @@ def validate_zero_shot_splits(
     speaker_id_column: str = "speaker_id",
     utterance_id_column: str | None = None,
     language_column: str = "language",
-    session_id_column: str | None = None,
-    require_cross_session_references: bool = False,
     required_splits: Sequence[str] = ("train", "validation", "test"),
 ) -> dict[str, Any]:
     """Validate a speaker-disjoint raw-data contract for zero-shot cloning.
 
     Every speaker needs at least two utterances so a target can use a different
-    same-speaker reference. When cross-session references are required, every
-    speaker also needs at least two non-empty recording/session identifiers.
+    same-speaker reference.
     """
     if not datasets:
         raise ValueError("Zero-shot datasets cannot be empty.")
     missing_splits = set(required_splits) - set(datasets)
     if missing_splits:
         raise ValueError(f"Zero-shot datasets are missing splits: {sorted(missing_splits)}")
-    if require_cross_session_references and session_id_column is None:
-        raise ValueError("Cross-session references require session_id_column.")
-
     speakers_by_split: dict[str, set[Any]] = {}
     languages: set[str] = set()
     utterance_locations: dict[Any, tuple[str, int]] = {}
@@ -98,8 +75,6 @@ def validate_zero_shot_splits(
         required_columns = {speaker_id_column, language_column}
         if utterance_id_column is not None:
             required_columns.add(utterance_id_column)
-        if session_id_column is not None:
-            required_columns.add(session_id_column)
         missing_columns = required_columns - column_names
         if missing_columns:
             raise ValueError(
@@ -107,7 +82,6 @@ def validate_zero_shot_splits(
             )
 
         speaker_counts: dict[Any, int] = defaultdict(int)
-        speaker_sessions: dict[Any, set[Any]] = defaultdict(set)
         for index in range(len(dataset)):
             row = dataset[index]
             speaker_id = row.get(speaker_id_column)
@@ -128,11 +102,6 @@ def validate_zero_shot_splits(
                     )
                 utterance_locations[utterance_id] = (split, index)
 
-            if session_id_column is not None:
-                session_id = row.get(session_id_column)
-                if session_id not in (None, ""):
-                    speaker_sessions[speaker_id].add(session_id)
-
         insufficient = sorted(
             (str(speaker_id) for speaker_id, count in speaker_counts.items() if count < 2)
         )
@@ -140,17 +109,6 @@ def validate_zero_shot_splits(
             raise ValueError(
                 f"Split {split!r} speakers need at least two utterances: {insufficient}"
             )
-        if require_cross_session_references:
-            single_session = sorted(
-                str(speaker_id)
-                for speaker_id in speaker_counts
-                if len(speaker_sessions[speaker_id]) < 2
-            )
-            if single_session:
-                raise ValueError(
-                    f"Split {split!r} speakers need at least two sessions: {single_session}"
-                )
-
         speakers_by_split[split] = set(speaker_counts)
         total_utterances += len(dataset)
 
@@ -169,7 +127,6 @@ def validate_zero_shot_splits(
         "utterances": total_utterances,
         "speakers": sum(len(speakers) for speakers in speakers_by_split.values()),
         "languages": tuple(sorted(languages)),
-        "cross_session_references": require_cross_session_references,
     }
 
 

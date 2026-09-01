@@ -82,6 +82,7 @@ class DatasetPreparer:
             dacvae_model,
             backend=dacvae_backend,
             device=self.device,
+            freeze=True,
         )
         codec_sample_rate = int(self.dacvae.sample_rate)
         if target_sample_rate is not None and target_sample_rate != codec_sample_rate:
@@ -314,8 +315,6 @@ def prepare_from_hf_dataset(
     reference_seed: int = 1234,
     language: str = DEFAULT_LANGUAGE,
     language_column: str | None = None,
-    session_id_column: str | None = None,
-    require_cross_session_references: bool = False,
     dataset_revision: str | None = None,
     dataset_download_workers: int = DEFAULT_DATASET_DOWNLOAD_WORKERS,
 ):
@@ -355,17 +354,6 @@ def prepare_from_hf_dataset(
     speaker_index = (
         build_speaker_index(ds, speaker_id_column) if speaker_id_column is not None else None
     )
-    if require_cross_session_references and speaker_index is None:
-        raise ValueError("Cross-session references require speaker_id_column.")
-    if require_cross_session_references and session_id_column is None:
-        raise ValueError("Cross-session references require session_id_column.")
-    session_ids = None
-    if session_id_column is not None:
-        if session_id_column not in ds.column_names:
-            raise ValueError(f"Session ID column not found: {session_id_column!r}")
-        session_ids = ds[session_id_column]
-        if require_cross_session_references and any(value in (None, "") for value in session_ids):
-            raise ValueError("Cross-session references require a session ID in every row.")
 
     # Cast audio column
     if audio_column in ds.column_names:
@@ -396,9 +384,6 @@ def prepare_from_hf_dataset(
                 target_index=i,
                 maximum_utterances=max_reference_utterances,
                 seed=reference_seed,
-                session_ids=session_ids,
-                target_session_id=(sample.get(session_id_column) if session_id_column else None),
-                require_different_session=require_cross_session_references,
             )
             speaker_references, speaker_language = collect_reference_audio_with_language(
                 ds,

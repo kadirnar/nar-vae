@@ -45,13 +45,12 @@ def manifest_split(prefix, speakers):
     return ManifestDataset(
         [
             {
-                "utterance_id": f"{prefix}-{speaker}-{session}",
+                "utterance_id": f"{prefix}-{speaker}-{utterance}",
                 "speaker_id": speaker,
-                "session_id": session,
                 "language": language,
             }
             for speaker, languages in speakers.items()
-            for session, language in enumerate(languages, start=1)
+            for utterance, language in enumerate(languages, start=1)
         ]
     )
 
@@ -82,24 +81,7 @@ class SpeakerReferenceTest(unittest.TestCase):
             [],
         )
 
-    def test_reference_selection_can_require_a_different_session(self):
-        speaker_index = {"a": [0, 1, 2]}
-
-        self.assertEqual(
-            select_reference_indices(
-                speaker_index,
-                speaker_id="a",
-                target_index=0,
-                maximum_utterances=3,
-                seed=1,
-                session_ids=["studio-a", "studio-a", "studio-b"],
-                target_session_id="studio-a",
-                require_different_session=True,
-            ),
-            [2],
-        )
-
-    def test_zero_shot_splits_require_disjoint_speakers_and_cross_session_data(self):
+    def test_zero_shot_splits_require_disjoint_reference_ready_speakers(self):
         splits = {
             "train": manifest_split("train", {"train-a": ["en", "es"]}),
             "validation": manifest_split("validation", {"dev-a": ["en", "en"]}),
@@ -109,14 +91,12 @@ class SpeakerReferenceTest(unittest.TestCase):
         summary = validate_zero_shot_splits(
             splits,
             utterance_id_column="utterance_id",
-            session_id_column="session_id",
-            require_cross_session_references=True,
         )
 
         self.assertEqual(summary["utterances"], 6)
         self.assertEqual(summary["speakers"], 3)
         self.assertEqual(summary["languages"], ("en", "es", "tr"))
-        self.assertTrue(summary["cross_session_references"])
+        self.assertEqual(set(summary), {"splits", "utterances", "speakers", "languages"})
 
     def test_zero_shot_splits_reject_speaker_leakage(self):
         splits = {
@@ -137,21 +117,6 @@ class SpeakerReferenceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "at least two utterances"):
             validate_zero_shot_splits(splits)
-
-    def test_zero_shot_splits_reject_single_session_speakers_when_required(self):
-        splits = {
-            "train": manifest_split("train", {"train-a": ["en", "es"]}),
-            "validation": manifest_split("validation", {"dev-a": ["en", "en"]}),
-            "test": manifest_split("test", {"test-a": ["tr", "en"]}),
-        }
-        splits["train"].rows[1]["session_id"] = 1
-
-        with self.assertRaisesRegex(ValueError, "at least two sessions"):
-            validate_zero_shot_splits(
-                splits,
-                session_id_column="session_id",
-                require_cross_session_references=True,
-            )
 
     def test_prepared_dataset_preserves_speaker_latents(self):
         sample = {

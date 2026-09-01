@@ -111,6 +111,7 @@ class DataPreparer:
             dacvae_model,
             backend=dacvae_backend,
             device=device,
+            freeze=True,
         )
         self.representation_contract = build_representation_contract(
             self.dacvae,
@@ -260,9 +261,7 @@ def prepare_finetune_dataset(
     reference_seed: int = 1234,
     language: str = DEFAULT_LANGUAGE,
     language_column: str | None = None,
-    session_id_column: str | None = None,
     utterance_id_column: str | None = None,
-    require_cross_session_references: bool = False,
     dataset_revision: str | None = None,
     dataset_download_workers: int = DEFAULT_DATASET_DOWNLOAD_WORKERS,
 ) -> None:
@@ -332,17 +331,6 @@ def prepare_finetune_dataset(
     speaker_index = (
         build_speaker_index(ds, speaker_id_column) if speaker_id_column is not None else None
     )
-    if require_cross_session_references and speaker_index is None:
-        raise ValueError("Cross-session references require speaker_id_column.")
-    if require_cross_session_references and session_id_column is None:
-        raise ValueError("Cross-session references require session_id_column.")
-    session_ids = None
-    if session_id_column is not None:
-        if session_id_column not in ds.column_names:
-            raise ValueError(f"Session ID column not found: {session_id_column!r}")
-        session_ids = ds[session_id_column]
-        if require_cross_session_references and any(value in (None, "") for value in session_ids):
-            raise ValueError("Cross-session references require a session ID in every row.")
 
     # Split dataset for distributed processing
     if is_distributed:
@@ -377,11 +365,6 @@ def prepare_finetune_dataset(
                     target_index=original_index,
                     maximum_utterances=max_reference_utterances,
                     seed=reference_seed,
-                    session_ids=session_ids,
-                    target_session_id=(
-                        example.get(session_id_column) if session_id_column else None
-                    ),
-                    require_different_session=require_cross_session_references,
                 )
                 speaker_references, speaker_language = collect_reference_audio_with_language(
                     ds,
