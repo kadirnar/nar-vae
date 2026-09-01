@@ -17,6 +17,7 @@ from typing import Any, Literal
 DACVAEBackend = Literal["auto", "bundled", "fast"]
 DACVAE_BACKENDS = ("auto", "bundled", "fast")
 DEFAULT_DACVAE_BACKEND: DACVAEBackend = "bundled"
+DEFAULT_DACVAE_FILENAME = "weights.pth"
 _HUB_COMMIT_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -46,14 +47,14 @@ _FAST_DACVAE_MODEL_KWARGS = {
 class HubDACVAESource:
     """Explicit immutable Hub source for one DACVAE weight artifact.
 
-    Plain strings and paths are local-only.  This type is the sole public
-    opt-in to a DACVAE network download, and it deliberately requires a full
-    commit hash and an explicit repository-relative filename.
+    User-facing APIs also accept a plain Hugging Face repository ID together
+    with ``dacvae_revision``. This type is the normalized representation used
+    internally and remains available for advanced callers.
     """
 
     repo_id: str
     revision: str
-    filename: str = "weights.pth"
+    filename: str = DEFAULT_DACVAE_FILENAME
 
     def __post_init__(self) -> None:
         if (
@@ -79,6 +80,56 @@ class DACVAESourceDescription:
     identifier: str
     revision: str | None
     filename: str | None
+
+
+def _looks_like_hub_repo_id(source: str) -> bool:
+    """Return whether a plain string uses Hugging Face's ``owner/name`` shape."""
+    return (
+        source == source.strip()
+        and not source.startswith((".", "~", os.sep))
+        and source.count("/") == 1
+        and all(source.split("/"))
+    )
+
+
+def normalize_dacvae_source(
+    source: str | os.PathLike[str] | HubDACVAESource,
+    *,
+    dacvae_revision: str | None = None,
+    dacvae_filename: str | None = None,
+) -> str | os.PathLike[str] | HubDACVAESource:
+    """Normalize a local source or a commit-pinned Hugging Face repository ID.
+
+    A plain ``owner/name`` string is a Hub ID. It must be paired with a full
+    commit hash so training data and inference never depend on a mutable branch.
+    Use a :class:`~pathlib.Path` or an explicit ``./`` prefix for a local path
+    that happens to have the same two-component shape.
+    """
+    if isinstance(source, HubDACVAESource):
+        if dacvae_revision is not None or dacvae_filename is not None:
+            raise ValueError(
+                "Do not combine HubDACVAESource with dacvae_revision or dacvae_filename."
+            )
+        return source
+
+    if isinstance(source, str) and _looks_like_hub_repo_id(source):
+        if dacvae_revision is None:
+            raise ValueError(
+                "A Hugging Face-shaped dacvae_model cannot be used as an unpinned local "
+                "source; set dacvae_revision to a full 40-character commit hash."
+            )
+        return HubDACVAESource(
+            repo_id=source,
+            revision=dacvae_revision,
+            filename=(DEFAULT_DACVAE_FILENAME if dacvae_filename is None else dacvae_filename),
+        )
+
+    if dacvae_revision is not None or dacvae_filename is not None:
+        raise ValueError(
+            "dacvae_revision and dacvae_filename are only valid with a plain "
+            "'owner/name' Hugging Face ID."
+        )
+    return source
 
 
 def describe_dacvae_source(
@@ -129,8 +180,8 @@ def _resolve_dacvae_artifact(
         path = path / "weights.pth"
     if not path.exists():
         raise FileNotFoundError(
-            f"DACVAE checkpoint not found: {path}. Plain strings are local paths; "
-            "use HubDACVAESource for an explicit revision-pinned Hub artifact."
+            f"DACVAE checkpoint not found: {path}. Use a plain 'owner/name' Hugging Face ID "
+            "with dacvae_revision for a remote codec."
         )
     return path, description
 
@@ -352,6 +403,8 @@ def _load_fast_dacvae(
 def load_dacvae(
     model_name_or_path: str | os.PathLike[str] | HubDACVAESource,
     *,
+    dacvae_revision: str | None = None,
+    dacvae_filename: str | None = None,
     backend: str = DEFAULT_DACVAE_BACKEND,
     device: Any | None = None,
     freeze: bool = False,
@@ -361,11 +414,18 @@ def load_dacvae(
 ) -> Any:
     """Load and prepare a DACVAE model.
 
-    Both the bundled implementation and the optional ``fast-dacvae`` package
-    expose the ``load``, ``encode`` and ``decode`` methods used by NAR-VAE.
+    ``model_name_or_path`` may be a local artifact, an advanced
+    :class:`HubDACVAESource`, or a plain Hugging Face ``owner/name`` ID paired
+    with a full ``dacvae_revision``. Both codec backends expose the ``load``,
+    ``encode`` and ``decode`` methods used by NAR-VAE.
     """
     resolved_backend = resolve_dacvae_backend(backend)
-    checkpoint_path, source_description = _resolve_dacvae_artifact(model_name_or_path)
+    source = normalize_dacvae_source(
+        model_name_or_path,
+        dacvae_revision=dacvae_revision,
+        dacvae_filename=dacvae_filename,
+    )
+    checkpoint_path, source_description = _resolve_dacvae_artifact(source)
     artifact_sha256 = _file_sha256(checkpoint_path)
     if expected_sha256 is not None:
         if not isinstance(expected_sha256, str) or not _SHA256_PATTERN.fullmatch(expected_sha256):
@@ -410,6 +470,7 @@ def load_dacvae(
 __all__ = [
     "DACVAE_BACKENDS",
     "DEFAULT_DACVAE_BACKEND",
+    "DEFAULT_DACVAE_FILENAME",
     "DACVAEBackend",
     "DACVAESourceDescription",
     "FAST_DACVAE_REVISION",
@@ -419,5 +480,6 @@ __all__ = [
     "get_dacvae_class",
     "is_fast_dacvae_available",
     "load_dacvae",
+    "normalize_dacvae_source",
     "resolve_dacvae_backend",
 ]

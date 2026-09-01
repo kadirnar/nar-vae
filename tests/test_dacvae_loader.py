@@ -218,13 +218,72 @@ class DACVAELoaderTest(unittest.TestCase):
                     verbose=False,
                 )
 
-    def test_plain_hub_id_is_local_only_and_never_downloads(self):
+    def test_unpinned_hub_id_fails_before_download(self):
         with (
             patch("huggingface_hub.hf_hub_download") as download,
-            self.assertRaisesRegex(FileNotFoundError, "HubDACVAESource"),
+            self.assertRaisesRegex(ValueError, "unpinned local source"),
         ):
             loader.load_dacvae("owner/model", backend="bundled", verbose=False)
         download.assert_not_called()
+
+    def test_plain_hub_id_with_commit_downloads_default_artifact(self):
+        class FakeCodec:
+            sample_rate = 44100
+            hop_length = 512
+            quantizer = types.SimpleNamespace(out_proj=types.SimpleNamespace(in_channels=128))
+
+            def eval(self):
+                return self
+
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "weights.pth"
+            checkpoint.write_bytes(b"codec")
+            backend = types.SimpleNamespace(load=lambda path: FakeCodec())
+            with (
+                patch("huggingface_hub.hf_hub_download", return_value=str(checkpoint)) as download,
+                patch.object(loader, "get_dacvae_class", return_value=backend),
+            ):
+                codec = loader.load_dacvae(
+                    "owner/model",
+                    dacvae_revision=revision,
+                    backend="bundled",
+                    verbose=False,
+                )
+
+        download.assert_called_once_with(
+            repo_id="owner/model",
+            filename="weights.pth",
+            revision=revision,
+        )
+        self.assertEqual(codec.nar_vae_codec_identifier, "owner/model")
+        self.assertEqual(codec.nar_vae_codec_revision, revision)
+        self.assertEqual(codec.nar_vae_codec_filename, "weights.pth")
+
+    def test_plain_hub_id_rejects_mutable_revision_before_download(self):
+        with (
+            patch("huggingface_hub.hf_hub_download") as download,
+            self.assertRaisesRegex(ValueError, "40-character"),
+        ):
+            loader.load_dacvae(
+                "owner/model",
+                dacvae_revision="main",
+                backend="bundled",
+                verbose=False,
+            )
+        download.assert_not_called()
+
+    def test_explicit_local_path_rejects_hub_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "weights.pth"
+            checkpoint.touch()
+            with self.assertRaisesRegex(ValueError, "only valid"):
+                loader.load_dacvae(
+                    checkpoint,
+                    dacvae_revision="a" * 40,
+                    backend="bundled",
+                    verbose=False,
+                )
 
     def test_codec_sha_is_checked_before_deserialization(self):
         with tempfile.TemporaryDirectory() as directory:

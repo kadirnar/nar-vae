@@ -30,10 +30,10 @@ finetune_mode: "full"          # Only full SFT is implemented; unsupported modes
 # ============================================================================
 
 model_preset: "small"  # Must describe the selected checkpoint architecture
-dacvae_model: "./codecs/dacvae/weights.pth"  # Must exactly match the parent/data contract.
-dacvae_revision: null  # Full Hub commit only when the parent used a pinned Hub codec.
-dacvae_filename: null  # Repository-relative filename paired with dacvae_revision.
-dacvae_sha256: null  # Must exactly match the parent and prepared rows.
+dacvae_model: "facebook/dacvae-watermarked"  # Must exactly match the parent/data contract.
+dacvae_revision: "8680102d141858a21bd533543966a2eb2e569f92"
+dacvae_filename: "weights.pth"
+dacvae_sha256: "573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4"
 dacvae_backend: "bundled"  # Exact resolved backend: "bundled" or "fast".
 dacvae_latent_dim: 128
 dacvae_sample_rate: 44100

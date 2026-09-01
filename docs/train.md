@@ -1,8 +1,8 @@
 # Training
 
-This example trains the NAR-VAE acoustic model. The DACVAE codec is loaded from a checkpoint and
-kept frozen. The default `small` model has **77,210,945 total parameters**, all trainable. This
-count excludes the codec, optimizer state, gradients, and activations.
+This example trains the NAR-VAE acoustic model. The pinned DACVAE codec is downloaded from the
+Hugging Face Hub and kept frozen. The default `small` model has **77,210,945 total parameters**,
+all trainable. This count excludes the codec, optimizer state, gradients, and activations.
 
 Training is intended for an NVIDIA CUDA server. No training is run during installation.
 
@@ -27,7 +27,7 @@ The card says its audio was generated with `jordand/echo-tts-base`; NAR-VAE does
 model, but it is part of the data provenance. The dataset also contains one utterance for each
 speaker ID, so this small example does not enable speaker conditioning or train voice cloning.
 
-Place the exact DACVAE weights at `codecs/dacvae/weights.pth`, then create `prepare_data.py`:
+Create `prepare_data.py`:
 
 ```python
 from nar_vae.dataset import prepare_from_hf_dataset
@@ -37,7 +37,10 @@ prepare_from_hf_dataset(
     dataset_revision="28bbd4e65dd6d5ec4da30e21e8999c33b20a902f",
     split="train",
     output_dir="data/echo-ref-4k",
-    dacvae_model="codecs/dacvae/weights.pth",
+    dacvae_model="facebook/dacvae-watermarked",
+    dacvae_revision="8680102d141858a21bd533543966a2eb2e569f92",
+    dacvae_filename="weights.pth",
+    dacvae_sha256="573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4",
     dacvae_backend="bundled",
     language="en",
     device="cuda",
@@ -54,16 +57,17 @@ python prepare_data.py
 
 ```bash
 cp nar_vae/configs/echodit_config.yaml train.yaml
-sha256sum codecs/dacvae/weights.pth
 ```
 
 Edit these values in `train.yaml`:
 
 ```yaml
-dacvae_model: ./codecs/dacvae/weights.pth
-dacvae_sha256: <sha256 printed above>
+dacvae_model: facebook/dacvae-watermarked
+dacvae_revision: 8680102d141858a21bd533543966a2eb2e569f92
+dacvae_filename: weights.pth
+dacvae_sha256: 573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4
 dacvae_sample_rate: 44100
-dacvae_hop_length: <hop length of this codec>
+dacvae_hop_length: 512
 
 model_preset: small
 use_speaker_conditioning: false
@@ -82,8 +86,8 @@ wandb_project: nar-vae-pretraining
 wandb_run_name: echo-ref-4k-small
 ```
 
-The sample rate, hop length, latent width, and SHA-256 must match the loaded codec and prepared
-dataset. Do not guess these values.
+The Hub revision and SHA-256 pin the exact codec artifact. The sample rate, hop length, and latent
+width must also match the prepared dataset.
 
 ## 4. Train
 

@@ -15,6 +15,7 @@ from nar_vae.dacvae.loader import (
     DACVAESourceDescription,
     HubDACVAESource,
     describe_dacvae_source,
+    normalize_dacvae_source,
 )
 from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_VERSION,
@@ -225,33 +226,15 @@ def _codec_description_from_config(config: Mapping[str, Any]) -> DACVAESourceDes
     source = config.get("dacvae_model")
     if not isinstance(source, (str, os.PathLike)) or not os.fspath(source).strip():
         raise ModelManifestError("dacvae_model must identify the codec used to prepare the data.")
-    source_string = os.fspath(source)
-    revision = config.get("dacvae_revision")
-    filename = config.get("dacvae_filename")
-    if revision is None and filename is None:
-        looks_like_hub_id = (
-            not source_string.startswith((".", "~", os.sep))
-            and source_string.count("/") == 1
-            and not Path(source_string).suffix
-            and all(source_string.split("/"))
+    try:
+        normalized = normalize_dacvae_source(
+            source,
+            dacvae_revision=config.get("dacvae_revision"),
+            dacvae_filename=config.get("dacvae_filename"),
         )
-        if looks_like_hub_id:
-            raise ModelManifestError(
-                "A Hub-shaped dacvae_model cannot be stored as an unpinned local source; "
-                "set a full dacvae_revision and dacvae_filename."
-            )
-        return DACVAESourceDescription(source_string, None, None)
-    if not isinstance(revision, str) or not _HUB_COMMIT.fullmatch(revision):
-        raise ModelManifestError(
-            "A remote dacvae_model requires dacvae_revision as a full 40-character Hub commit."
-        )
-    if source_string.count("/") != 1 or not all(source_string.split("/")):
-        raise ModelManifestError("A revision-pinned dacvae_model must use 'owner/name' format.")
-    resolved_filename = _relative_filename(
-        "weights.pth" if filename is None else filename,
-        name="dacvae_filename",
-    )
-    return DACVAESourceDescription(source_string, revision.lower(), resolved_filename)
+    except ValueError as exc:
+        raise ModelManifestError(str(exc)) from exc
+    return describe_dacvae_source(normalized)
 
 
 def representation_from_config(config: Mapping[str, Any]) -> dict[str, Any]:

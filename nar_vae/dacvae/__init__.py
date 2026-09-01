@@ -8,6 +8,7 @@ from typing import Any
 from .loader import (
     DACVAE_BACKENDS,
     DEFAULT_DACVAE_BACKEND,
+    DEFAULT_DACVAE_FILENAME,
     FAST_DACVAE_REVISION,
     FAST_DACVAE_SOURCE_URL,
     DACVAEBackend,
@@ -17,6 +18,7 @@ from .loader import (
     get_dacvae_class,
     is_fast_dacvae_available,
     load_dacvae,
+    normalize_dacvae_source,
     resolve_dacvae_backend,
 )
 
@@ -26,6 +28,7 @@ __model_version__ = "latest"
 __all__ = [
     "DACVAE_BACKENDS",
     "DEFAULT_DACVAE_BACKEND",
+    "DEFAULT_DACVAE_FILENAME",
     "DACVAE",
     "DACVAEBackend",
     "DACVAESourceDescription",
@@ -38,6 +41,7 @@ __all__ = [
     "load_dacvae",
     "model",
     "nn",
+    "normalize_dacvae_source",
     "resolve_dacvae_backend",
 ]
 

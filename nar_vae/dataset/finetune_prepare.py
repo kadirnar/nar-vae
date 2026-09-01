@@ -12,7 +12,7 @@ import torchaudio
 from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
 from tqdm import tqdm
 
-from nar_vae.dacvae import HubDACVAESource, load_dacvae
+from nar_vae.dacvae import HubDACVAESource, load_dacvae, normalize_dacvae_source
 from nar_vae.dataset.identity import write_prepared_dataset_manifest
 from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_COLUMN,
@@ -98,24 +98,33 @@ class DataPreparer:
         dacvae_backend: str = "bundled",
         max_reference_seconds: float = 30.0,
         language: str = DEFAULT_LANGUAGE,
+        dacvae_revision: str | None = None,
+        dacvae_filename: str | None = None,
+        dacvae_sha256: str | None = None,
     ):
         self.device = device
         if max_reference_seconds <= 0:
             raise ValueError("max_reference_seconds must be positive")
         if dacvae_model is None:
             raise ValueError(
-                "dacvae_model is required; use a local path or revision-pinned HubDACVAESource."
+                "dacvae_model is required; use a local path or a pinned Hugging Face ID."
             )
 
-        self.dacvae = load_dacvae(
+        codec_source = normalize_dacvae_source(
             dacvae_model,
+            dacvae_revision=dacvae_revision,
+            dacvae_filename=dacvae_filename,
+        )
+        self.dacvae = load_dacvae(
+            codec_source,
             backend=dacvae_backend,
             device=device,
             freeze=True,
+            expected_sha256=dacvae_sha256,
         )
         self.representation_contract = build_representation_contract(
             self.dacvae,
-            codec_source=dacvae_model,
+            codec_source=codec_source,
         )
 
         self.sample_rate = self.dacvae.sample_rate  # 48000
@@ -264,6 +273,9 @@ def prepare_finetune_dataset(
     utterance_id_column: str | None = None,
     dataset_revision: str | None = None,
     dataset_download_workers: int = DEFAULT_DATASET_DOWNLOAD_WORKERS,
+    dacvae_revision: str | None = None,
+    dacvae_filename: str | None = None,
+    dacvae_sha256: str | None = None,
 ) -> None:
     """Prepare a Hugging Face dataset for EchoDiT fine-tuning.
 
@@ -326,6 +338,9 @@ def prepare_finetune_dataset(
         device=device,
         max_reference_seconds=max_reference_seconds,
         language=language,
+        dacvae_revision=dacvae_revision,
+        dacvae_filename=dacvae_filename,
+        dacvae_sha256=dacvae_sha256,
     )
 
     speaker_index = (

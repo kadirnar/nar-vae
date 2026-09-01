@@ -107,9 +107,11 @@ pretrained_checkpoint: null
 model_preset: small
 
 TTS_dataset_local: ./data/prepared
-dacvae_model: ./codecs/dacvae/weights.pth
+dacvae_model: facebook/dacvae-watermarked
+dacvae_revision: 8680102d141858a21bd533543966a2eb2e569f92
+dacvae_filename: weights.pth
 dacvae_backend: bundled
-dacvae_sha256: <64-character-lowercase-sha256>
+dacvae_sha256: 573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4
 save_folder: ./checkpoints/nar_vae_small_pretrain
 
 report_to: wandb
@@ -161,7 +163,8 @@ WER/CER, and listening quality before keeping them. FSDP is not implemented; use
 
 ## Inference
 
-Inference requires a locally trained NAR-VAE export and the exact codec used to prepare its data:
+Inference requires a locally trained NAR-VAE export. Its manifest supplies the exact codec revision,
+filename, and SHA-256:
 
 ```python
 from nar_vae import FlowMatchingTTSInference
@@ -169,7 +172,7 @@ from nar_vae import FlowMatchingTTSInference
 tts = FlowMatchingTTSInference.from_preset(
     "small",
     flow_model_path="checkpoints/nar_vae_small_sft/final/flow_model/pytorch_model.bin",
-    dacvae_model="codecs/dacvae/weights.pth",
+    dacvae_model="facebook/dacvae-watermarked",
     device="cuda",
 )
 

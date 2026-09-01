@@ -109,8 +109,8 @@ def run_benchmark(
         )
     if dacvae_model is None:
         raise ValueError(
-            "dacvae_model is required; pass an exact local artifact or a commit-pinned "
-            "HubDACVAESource."
+            "dacvae_model is required; pass a local artifact or the Hugging Face ID in the "
+            "checkpoint manifest."
         )
 
     requested_checkpoint = (
@@ -242,9 +242,11 @@ def run_benchmark(
     source_hashes = package_source_hashes(Path(__file__).parent)
 
     loaded_codec = getattr(tts, "dacvae", None)
+    resolved_dacvae_source = getattr(tts, "dacvae_source", dacvae_model)
+    resolved_dacvae_description = describe_dacvae_source(resolved_dacvae_source)
     loaded_codec_path = getattr(loaded_codec, "nar_vae_codec_path", None)
     dacvae_artifact = Path(loaded_codec_path) if loaded_codec_path is not None else None
-    if dacvae_artifact is None and not isinstance(dacvae_model, HubDACVAESource):
+    if dacvae_artifact is None and not isinstance(resolved_dacvae_source, HubDACVAESource):
         candidate = Path(requested_dacvae_model).expanduser()
         if candidate.is_dir():
             candidate = candidate / "weights.pth"
@@ -322,14 +324,18 @@ def run_benchmark(
         },
         "dacvae": {
             "source_kind": (
-                "huggingface_hub" if isinstance(dacvae_model, HubDACVAESource) else "local"
+                "huggingface_hub"
+                if isinstance(resolved_dacvae_source, HubDACVAESource)
+                else "local"
             ),
             "hf_id": (
-                dacvae_description.identifier if isinstance(dacvae_model, HubDACVAESource) else None
+                resolved_dacvae_description.identifier
+                if isinstance(resolved_dacvae_source, HubDACVAESource)
+                else None
             ),
             "requested_source": requested_dacvae_model,
-            "revision": dacvae_description.revision,
-            "filename": dacvae_description.filename,
+            "revision": resolved_dacvae_description.revision,
+            "filename": resolved_dacvae_description.filename,
             "sha256": getattr(loaded_codec, "nar_vae_codec_sha256", None),
             "backend": dacvae_backend,
             "sample_rate": int(tts.sample_rate),

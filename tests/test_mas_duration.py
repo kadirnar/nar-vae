@@ -21,6 +21,7 @@ from nar_vae.checkpoint import (
     inspect_monotonic_alignment_capability,
     load_pretrained_checkpoint,
 )
+from nar_vae.dacvae import HubDACVAESource
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss, _global_valid_mean
 from nar_vae.models.dit import LowRankAdaLN
@@ -377,6 +378,8 @@ class MASCheckpointTest(unittest.TestCase):
             hop_length=4,
             decode=lambda latent: latent,
         )
+        codec_id = "facebook/dacvae-watermarked"
+        codec_revision = "a" * 40
 
         with (
             patch("nar_vae.inference.FlowCheckpoint.load", return_value=checkpoint),
@@ -386,15 +389,22 @@ class MASCheckpointTest(unittest.TestCase):
             ) as factory,
             patch(
                 "nar_vae.inference.load_model_manifest",
-                return_value=SimpleNamespace(representation={"codec_sha256": "a" * 64}),
+                return_value=SimpleNamespace(
+                    representation={
+                        "codec_source": codec_id,
+                        "codec_revision": codec_revision,
+                        "codec_filename": "weights.pth",
+                        "codec_sha256": "a" * 64,
+                    }
+                ),
             ),
-            patch("nar_vae.inference.validate_inference_manifest"),
-            patch("nar_vae.inference.load_dacvae", return_value=codec),
+            patch("nar_vae.inference.validate_inference_manifest") as validate_manifest,
+            patch("nar_vae.inference.load_dacvae", return_value=codec) as load_codec,
             patch("nar_vae.inference.validate_loaded_codec"),
         ):
             runtime = FlowMatchingTTSInference(
                 checkpoint_path,
-                dacvae_model="codec.pth",
+                dacvae_model=codec_id,
                 device="cpu",
             )
 
@@ -402,6 +412,12 @@ class MASCheckpointTest(unittest.TestCase):
         self.assertTrue(factory.call_args.kwargs["use_mas_duration"])
         self.assertEqual(factory.call_args.kwargs["duration_alignment_hidden_size"], 3)
         checkpoint.load_into.assert_called_once_with(model)
+        resolved_source = load_codec.call_args.args[0]
+        self.assertIsInstance(resolved_source, HubDACVAESource)
+        self.assertEqual(resolved_source.repo_id, codec_id)
+        self.assertEqual(resolved_source.revision, codec_revision)
+        self.assertEqual(resolved_source.filename, "weights.pth")
+        self.assertIs(validate_manifest.call_args.kwargs["codec_source"], resolved_source)
 
     def test_capability_is_inferred_from_complete_checkpoint_state(self):
         model = tiny_model(mas=True)

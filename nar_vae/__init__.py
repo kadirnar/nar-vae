@@ -14,6 +14,7 @@ _LAZY_EXPORTS = {
     "AdaLNZero": ("nar_vae.modules", "AdaLNZero"),
     "DACVAE": ("nar_vae.dacvae", "DACVAE"),
     "DACVAE_BACKENDS": ("nar_vae.dacvae", "DACVAE_BACKENDS"),
+    "DEFAULT_DACVAE_FILENAME": ("nar_vae.dacvae", "DEFAULT_DACVAE_FILENAME"),
     "HubDACVAESource": ("nar_vae.dacvae", "HubDACVAESource"),
     "EchoDiT": ("nar_vae.models", "EchoDiT"),
     "EchoDurationPredictor": ("nar_vae.models", "EchoDurationPredictor"),
@@ -62,6 +63,7 @@ _LAZY_EXPORTS = {
     "grpo_post_train": ("nar_vae.post_training", "grpo_post_train"),
     "list_model_presets": ("nar_vae.model_presets", "list_model_presets"),
     "normalize_language": ("nar_vae.languages", "normalize_language"),
+    "normalize_dacvae_source": ("nar_vae.dacvae", "normalize_dacvae_source"),
     "load_dacvae": ("nar_vae.dacvae", "load_dacvae"),
 }
 

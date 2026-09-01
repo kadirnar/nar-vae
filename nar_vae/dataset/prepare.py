@@ -12,7 +12,7 @@ from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
-from nar_vae.dacvae import HubDACVAESource, load_dacvae
+from nar_vae.dacvae import HubDACVAESource, load_dacvae, normalize_dacvae_source
 from nar_vae.dataset.identity import write_prepared_dataset_manifest
 from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_COLUMN,
@@ -67,19 +67,28 @@ class DatasetPreparer:
         max_speaker_ref_seconds: int = 120,
         dacvae_backend: str = "bundled",
         language: str = DEFAULT_LANGUAGE,
+        dacvae_revision: str | None = None,
+        dacvae_filename: str | None = None,
+        dacvae_sha256: str | None = None,
     ):
         self.device = device
         self.max_speaker_ref_seconds = max_speaker_ref_seconds
 
-        self.dacvae = load_dacvae(
+        codec_source = normalize_dacvae_source(
             dacvae_model,
+            dacvae_revision=dacvae_revision,
+            dacvae_filename=dacvae_filename,
+        )
+        self.dacvae = load_dacvae(
+            codec_source,
             backend=dacvae_backend,
             device=device,
             freeze=True,
+            expected_sha256=dacvae_sha256,
         )
         self.representation_contract = build_representation_contract(
             self.dacvae,
-            codec_source=dacvae_model,
+            codec_source=codec_source,
         )
         self.sample_rate = self.dacvae.sample_rate
         self.max_speaker_ref_samples = max_speaker_ref_seconds * self.sample_rate
@@ -250,6 +259,9 @@ def prepare_dataset(
     reference_seed: int = 1234,
     dataset_revision: str | None = None,
     dataset_download_workers: int = DEFAULT_DATASET_DOWNLOAD_WORKERS,
+    dacvae_revision: str | None = None,
+    dacvae_filename: str | None = None,
+    dacvae_sha256: str | None = None,
 ):
     """Prepare a HuggingFace dataset with distributed processing support."""
     source = resolve_dataset_source(
@@ -302,6 +314,9 @@ def prepare_dataset(
         max_speaker_ref_seconds=max_speaker_ref_seconds,
         dacvae_backend=dacvae_backend,
         language=language,
+        dacvae_revision=dacvae_revision,
+        dacvae_filename=dacvae_filename,
+        dacvae_sha256=dacvae_sha256,
     )
 
     if is_main:

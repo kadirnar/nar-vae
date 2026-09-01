@@ -20,10 +20,10 @@ data_seed: 1337
 # ============================================================================
 
 # DACVAE Configuration
-dacvae_model: "./codecs/dacvae/weights.pth"  # Exact local codec used during preparation.
-dacvae_revision: null  # For Hub preparation, use a full 40-character commit.
-dacvae_filename: null  # For Hub preparation, usually "weights.pth".
-dacvae_sha256: null  # Fill with the exact codec artifact hash before server training.
+dacvae_model: "facebook/dacvae-watermarked"  # Hugging Face codec repository ID.
+dacvae_revision: "8680102d141858a21bd533543966a2eb2e569f92"
+dacvae_filename: "weights.pth"
+dacvae_sha256: "573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4"
 dacvae_backend: "bundled"  # Exact resolved backend: "bundled" or "fast".
 dacvae_latent_dim: 128  # Actual DACVAE latent dimension (verified from data)
 dacvae_sample_rate: 44100  # Must match every prepared row's representation contract.

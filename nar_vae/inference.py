@@ -19,7 +19,7 @@ from nar_vae.configuration import (
     load_inference_settings,
     validate_cache_dit_options,
 )
-from nar_vae.dacvae import HubDACVAESource, load_dacvae
+from nar_vae.dacvae import HubDACVAESource, load_dacvae, normalize_dacvae_source
 from nar_vae.languages import (
     DEFAULT_LANGUAGE,
     CrossLingualUnsupportedError,
@@ -63,7 +63,7 @@ class FlowMatchingTTSInference:
 
     Args:
         flow_model_path: Path to trained EchoDiT checkpoint
-        dacvae_model: Exact local codec artifact or revision-pinned Hub source
+        dacvae_model: Local codec artifact or Hugging Face repository ID
         dacvae_backend: DACVAE implementation ("bundled", "fast", or "auto")
         device: Device to run on (default: "cuda")
         latent_size: DACVAE latent dimension (default: 128)
@@ -243,8 +243,8 @@ class FlowMatchingTTSInference:
 
         if dacvae_model is None:
             raise ValueError(
-                "dacvae_model is required; pass the exact local codec artifact or a "
-                "revision-pinned HubDACVAESource from the checkpoint manifest."
+                "dacvae_model is required; pass the local codec artifact or the Hugging Face "
+                "ID recorded by the checkpoint manifest."
             )
         provenance = checkpoint.provenance
         manifest_path = (
@@ -258,6 +258,16 @@ class FlowMatchingTTSInference:
         # A mocked/custom FlowCheckpoint loader may not invoke the callback. Retain a
         # strict fallback while the built-in loader authenticates before torch.load.
         self.model_manifest = preloaded_manifest or load_model_manifest(manifest_path)
+        representation = self.model_manifest.representation
+        if isinstance(dacvae_model, str) and representation["codec_revision"] is not None:
+            codec_source = normalize_dacvae_source(
+                dacvae_model,
+                dacvae_revision=str(representation["codec_revision"]),
+                dacvae_filename=str(representation["codec_filename"]),
+            )
+        else:
+            codec_source = normalize_dacvae_source(dacvae_model)
+        self.dacvae_source = codec_source
         inference_architecture = {
             "latent_size": latent_size,
             "model_size": model_size,
@@ -304,7 +314,7 @@ class FlowMatchingTTSInference:
             ),
             architecture=inference_architecture,
             capabilities=checkpoint_capabilities,
-            codec_source=dacvae_model,
+            codec_source=codec_source,
             codec_backend=dacvae_backend,
         )
 
@@ -359,7 +369,7 @@ class FlowMatchingTTSInference:
         self.flow_model.eval()
 
         self.dacvae = load_dacvae(
-            dacvae_model,
+            codec_source,
             backend=dacvae_backend,
             device=self.device,
             freeze=True,

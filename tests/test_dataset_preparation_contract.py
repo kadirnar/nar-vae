@@ -30,6 +30,10 @@ from nar_vae.dataset.sources import resolve_dataset_source
 
 DATASET_REVISION_A = "a" * 40
 DATASET_REVISION_B = "b" * 40
+CODEC_ID = "facebook/dacvae-watermarked"
+CODEC_REVISION = "c" * 40
+CODEC_FILENAME = "weights.pth"
+CODEC_SHA256 = "f" * 64
 
 
 def fake_codec(
@@ -253,6 +257,45 @@ class RepresentationContractTest(unittest.TestCase):
 
                 self.assertIs(load_codec.call_args.kwargs["freeze"], True)
 
+    def test_every_preparer_normalizes_a_plain_hub_id_and_verifies_its_hash(self):
+        cases = (
+            ("nar_vae.dataset.prepare.load_dacvae", DatasetPreparer),
+            ("nar_vae.dataset.prepare_dataset.load_dacvae", FileDatasetPreparer),
+            ("nar_vae.dataset.finetune_prepare.load_dacvae", DataPreparer),
+        )
+        codec = fake_codec(
+            identifier=CODEC_ID,
+            revision=CODEC_REVISION,
+            filename=CODEC_FILENAME,
+        )
+
+        for load_target, preparer_class in cases:
+            with self.subTest(preparer=preparer_class.__name__):
+                with patch(load_target, return_value=codec) as load_codec:
+                    preparer = preparer_class(
+                        CODEC_ID,
+                        device="cpu",
+                        dacvae_revision=CODEC_REVISION,
+                        dacvae_filename=CODEC_FILENAME,
+                        dacvae_sha256=CODEC_SHA256,
+                    )
+
+                normalized_source = load_codec.call_args.args[0]
+                self.assertIsInstance(normalized_source, HubDACVAESource)
+                self.assertEqual(normalized_source.repo_id, CODEC_ID)
+                self.assertEqual(normalized_source.revision, CODEC_REVISION)
+                self.assertEqual(normalized_source.filename, CODEC_FILENAME)
+                self.assertEqual(load_codec.call_args.kwargs["expected_sha256"], CODEC_SHA256)
+                self.assertEqual(preparer.representation_contract.codec_source, CODEC_ID)
+                self.assertEqual(
+                    preparer.representation_contract.codec_revision,
+                    CODEC_REVISION,
+                )
+                self.assertEqual(
+                    preparer.representation_contract.codec_filename,
+                    CODEC_FILENAME,
+                )
+
 
 class DatasetLoadingThreadingTest(unittest.TestCase):
     def test_standard_remote_source_threads_revision_and_worker_bound(self):
@@ -332,7 +375,7 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch("nar_vae.dataset.prepare_dataset.load_dataset", return_value=raw) as load_hf,
-                patch("nar_vae.dataset.prepare_dataset.DatasetPreparer"),
+                patch("nar_vae.dataset.prepare_dataset.DatasetPreparer") as preparer_class,
                 patch("nar_vae.dataset.prepare_dataset.save_dataset"),
             ):
                 prepare_from_hf_dataset(
@@ -340,12 +383,29 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
                     str(Path(directory) / "hf"),
                     dataset_revision=DATASET_REVISION_A,
                     dataset_download_workers=4,
+                    dacvae_model=CODEC_ID,
+                    dacvae_revision=CODEC_REVISION,
+                    dacvae_filename=CODEC_FILENAME,
+                    dacvae_sha256=CODEC_SHA256,
                 )
             load_hf.assert_called_once_with(
                 "speech/example",
                 split="train",
                 revision=DATASET_REVISION_A,
                 num_proc=4,
+            )
+            self.assertEqual(preparer_class.call_args.kwargs["dacvae_model"], CODEC_ID)
+            self.assertEqual(
+                preparer_class.call_args.kwargs["dacvae_revision"],
+                CODEC_REVISION,
+            )
+            self.assertEqual(
+                preparer_class.call_args.kwargs["dacvae_filename"],
+                CODEC_FILENAME,
+            )
+            self.assertEqual(
+                preparer_class.call_args.kwargs["dacvae_sha256"],
+                CODEC_SHA256,
             )
 
             with (
@@ -359,7 +419,7 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
                 patch(
                     "nar_vae.dataset.finetune_prepare.DataPreparer",
                     return_value=SimpleNamespace(),
-                ),
+                ) as finetune_preparer_class,
                 patch(
                     "nar_vae.dataset.finetune_prepare.Dataset.from_list",
                     return_value=(prepared_finetune := saved_dataset()),
@@ -374,6 +434,10 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
                     str(Path(directory) / "finetune"),
                     dataset_revision=DATASET_REVISION_B,
                     dataset_download_workers=7,
+                    dacvae_model=CODEC_ID,
+                    dacvae_revision=CODEC_REVISION,
+                    dacvae_filename=CODEC_FILENAME,
+                    dacvae_sha256=CODEC_SHA256,
                 )
             load_finetune.assert_called_once_with(
                 "speech/example",
@@ -384,6 +448,18 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
             write_finetune_manifest.assert_called_once_with(
                 prepared_finetune,
                 str(Path(directory) / "finetune"),
+            )
+            self.assertEqual(
+                finetune_preparer_class.call_args.kwargs["dacvae_revision"],
+                CODEC_REVISION,
+            )
+            self.assertEqual(
+                finetune_preparer_class.call_args.kwargs["dacvae_filename"],
+                CODEC_FILENAME,
+            )
+            self.assertEqual(
+                finetune_preparer_class.call_args.kwargs["dacvae_sha256"],
+                CODEC_SHA256,
             )
 
 
