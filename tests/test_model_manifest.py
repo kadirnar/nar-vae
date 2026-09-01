@@ -86,6 +86,80 @@ class ModelManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(ModelManifestError, "manifest SHA-256"):
                 validate_manifest_weight(loaded, weights)
 
+    def test_manifest_v2_records_exact_language_pairs_authoritatively(self):
+        config = model_config("./codec/weights.pth")
+        config.update(
+            use_speaker_conditioning=True,
+            use_language_conditioning=True,
+            supported_languages=["en", "es"],
+            supported_reference_languages=["ja"],
+            supported_language_pairs=[["Spanish", "English"], ["en", "Japanese"]],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root, config)
+
+            self.assertEqual(manifest.raw["schema_version"], 2)
+            self.assertEqual(
+                manifest.capabilities["supported_language_pairs"],
+                [["es", "en"], ["en", "ja"]],
+            )
+            self.assertEqual(
+                manifest.capabilities["supported_reference_languages"],
+                ["en", "ja"],
+            )
+
+            raw = dict(manifest.raw)
+            raw["schema_version"] = 1
+            (root / MODEL_MANIFEST_FILENAME).write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ModelManifestError, "Unsupported.*schema"):
+                load_model_manifest(root / MODEL_MANIFEST_FILENAME)
+
+    def test_manifest_parser_rejects_multilingual_speaker_topology_without_exact_pairs(self):
+        config = model_config("./codec/weights.pth")
+        config.update(
+            use_speaker_conditioning=True,
+            use_language_conditioning=True,
+            supported_languages=["en", "es"],
+            supported_language_pairs=[["en", "en"], ["es", "es"]],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root, config)
+            raw = json.loads(json.dumps(manifest.raw))
+            raw["capabilities"]["supported_reference_languages"] = []
+            raw["capabilities"]["supported_language_pairs"] = []
+            manifest_path = root / MODEL_MANIFEST_FILENAME
+            manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ModelManifestError,
+                "require exact supported_language_pairs",
+            ):
+                load_model_manifest(manifest_path)
+
+    def test_manifest_parser_allows_pairless_single_conditioning_topologies(self):
+        configurations = {
+            "speaker-only": {
+                "use_speaker_conditioning": True,
+            },
+            "language-only": {
+                "use_language_conditioning": True,
+                "supported_languages": ["en", "es"],
+            },
+        }
+        for name, overrides in configurations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                config = model_config("./codec/weights.pth")
+                config.update(overrides)
+                root = Path(directory)
+                _, manifest = self._write(root, config)
+
+                loaded = load_model_manifest(root / MODEL_MANIFEST_FILENAME)
+
+                self.assertEqual(loaded.capabilities["supported_language_pairs"], [])
+                self.assertEqual(loaded.raw, manifest.raw)
+
     def test_hub_shaped_codec_requires_commit_filename_and_sha(self):
         unpinned = model_config("owner/codec")
         with tempfile.TemporaryDirectory() as directory:

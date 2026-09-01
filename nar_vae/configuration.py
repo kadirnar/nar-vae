@@ -202,6 +202,7 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "speaker_num_layers",
         "speaker_patch_size",
         "supported_languages",
+        "supported_language_pairs",
         "supported_reference_languages",
         "text_intermediate_size",
         "text_model_size",

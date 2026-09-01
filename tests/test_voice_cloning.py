@@ -1,6 +1,7 @@
 """Voice-cloning API tests that do not require a large checkpoint."""
 
 import unittest
+from inspect import signature
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import torch
 from nar_vae.inference import FlowMatchingTTSInference, VoiceCloningUnsupportedError
 from nar_vae.models.flow_matching import FlowMatchingEchoDiT, PreparedCFGConditioning
 from nar_vae.solvers.ode_solver import ODESolver
+from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 
 class FakeCodec:
@@ -36,6 +38,11 @@ def make_runtime(*, supported: bool) -> FlowMatchingTTSInference:
 
 
 class VoiceCloningTest(unittest.TestCase):
+    def test_inference_uses_the_shared_reference_duration_default(self):
+        parameter = signature(FlowMatchingTTSInference).parameters["max_reference_seconds"]
+
+        self.assertEqual(parameter.default, DEFAULT_MAX_REFERENCE_SECONDS)
+
     def test_public_text_only_checkpoint_rejects_reference_early(self):
         runtime = make_runtime(supported=False)
 
@@ -52,6 +59,21 @@ class VoiceCloningTest(unittest.TestCase):
         self.assertEqual(tuple(latent.shape), (1, 2, 8))
         torch.testing.assert_close(latent[..., :5], torch.ones(1, 2, 5))
         torch.testing.assert_close(latent[..., 5:], torch.zeros(1, 2, 3))
+
+    def test_reference_is_cropped_to_the_shared_duration_default(self):
+        runtime = make_runtime(supported=True)
+        runtime.max_reference_seconds = DEFAULT_MAX_REFERENCE_SECONDS
+        overlong_samples = int((DEFAULT_MAX_REFERENCE_SECONDS + 1.0) * runtime.sample_rate)
+
+        runtime.encode_reference_audio(
+            torch.ones(overlong_samples),
+            sample_rate=runtime.sample_rate,
+        )
+
+        self.assertEqual(
+            runtime.dacvae.last_waveform.shape[-1],
+            int(DEFAULT_MAX_REFERENCE_SECONDS * runtime.sample_rate),
+        )
 
     def test_reference_and_preencoded_latent_are_mutually_exclusive(self):
         runtime = make_runtime(supported=True)

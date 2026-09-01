@@ -28,6 +28,7 @@ from nar_vae.dataset.speaker_references import (
 )
 from nar_vae.languages import DEFAULT_LANGUAGE, normalize_language
 from nar_vae.tokenization import encode_tts_text
+from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 _DATASETS_IMPORT_ERROR: ImportError | None = None
 try:
@@ -63,7 +64,7 @@ class DatasetPreparer:
         target_sample_rate: int | None = None,
         max_duration: float = 30.0,  # Max audio duration in seconds
         min_duration: float = 0.5,  # Min audio duration in seconds
-        max_reference_duration: float = 30.0,
+        max_reference_duration: float = DEFAULT_MAX_REFERENCE_SECONDS,
         language: str = DEFAULT_LANGUAGE,
         dacvae_revision: str | None = None,
         dacvae_filename: str | None = None,
@@ -319,7 +320,7 @@ def prepare_from_hf_dataset(
     dacvae_model: str | os.PathLike[str] | HubDACVAESource | None = None,
     dacvae_backend: str = "bundled",
     speaker_id_column: str | None = None,
-    max_reference_seconds: float = 30.0,
+    max_reference_seconds: float = DEFAULT_MAX_REFERENCE_SECONDS,
     max_reference_utterances: int = 3,
     reference_seed: int = 1234,
     language: str = DEFAULT_LANGUAGE,

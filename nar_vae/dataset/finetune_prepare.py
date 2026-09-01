@@ -36,6 +36,7 @@ from nar_vae.distributed import (
 from nar_vae.distributed import initialize_distributed, shard_indices
 from nar_vae.languages import DEFAULT_LANGUAGE, normalize_language
 from nar_vae.tokenization import encode_tts_text
+from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 # Suppress audio decoding warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
@@ -96,7 +97,7 @@ class DataPreparer:
         dacvae_model: str | os.PathLike[str] | HubDACVAESource | None = None,
         device: str = "cuda",
         dacvae_backend: str = "bundled",
-        max_reference_seconds: float = 30.0,
+        max_reference_seconds: float = DEFAULT_MAX_REFERENCE_SECONDS,
         language: str = DEFAULT_LANGUAGE,
         dacvae_revision: str | None = None,
         dacvae_filename: str | None = None,
@@ -265,7 +266,7 @@ def prepare_finetune_dataset(
     dacvae_backend: str = "bundled",
     speaker_id_column: str | None = None,
     audio_column: str = "audio",
-    max_reference_seconds: float = 30.0,
+    max_reference_seconds: float = DEFAULT_MAX_REFERENCE_SECONDS,
     max_reference_utterances: int = 3,
     reference_seed: int = 1234,
     language: str = DEFAULT_LANGUAGE,

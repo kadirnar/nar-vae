@@ -1,3 +1,20 @@
+[presets.nano]
+description = "Lowest-cost scratch-training preset for rapid experiments; evaluate quality."
+model_size = 128
+num_layers = 6
+num_heads = 4
+intermediate_size = 512
+text_model_size = 128
+text_num_layers = 2
+text_num_heads = 4
+text_intermediate_size = 512
+speaker_model_size = 96
+speaker_num_layers = 2
+speaker_num_heads = 3
+speaker_intermediate_size = 384
+timestep_embed_size = 64
+adaln_rank = 32
+
 [presets.tiny]
 description = "Development and low-latency research baseline; quality must be established by training."
 model_size = 256

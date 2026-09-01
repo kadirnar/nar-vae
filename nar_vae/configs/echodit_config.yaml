@@ -29,36 +29,29 @@ dacvae_latent_dim: 128  # Actual DACVAE latent dimension (verified from data)
 dacvae_sample_rate: 44100  # Must match every prepared row's representation contract.
 dacvae_hop_length: 512     # Must match every prepared row's representation contract.
 
-# Small is a realistic single-GPU-oriented starting point. Quality claims
-# still require a trained checkpoint and held-out speech evaluation.
-model_preset: "small"     # tiny, small, medium, large, or xlarge
-model_size: 384
-num_layers: 12
-num_heads: 8
-intermediate_size: 1536
+# Approximate canonical totals (base text-only / speaker + multilingual + speaker-aware duration):
+# nano 16.3M / 16.8M; tiny 40.5M / 42.7M; small 77.2M / 83.1M
+# medium 169.6M / 186.2M; large 353.9M / 387.9M; xlarge 647.1M / 690.5M
+# The second count requires duration_predictor_use_speaker: true.
+# Small remains the quality-oriented starting point; nano is the cheapest tier.
+model_preset: "small"  # nano, tiny, small, medium, large, or xlarge
 
 # Text Encoder
 text_vocab_size: 100312    # tiktoken cl100k_base (100277) + special tokens (10) + emotion tags (25)
-text_model_size: 320       # Text encoder hidden size
-text_num_layers: 4         # Text encoder depth
-text_num_heads: 8          # Text encoder attention heads
-text_intermediate_size: 1280  # Text encoder MLP size
 
 # Speaker Encoder (for speaker conditioning)
 speaker_patch_size: 4      # Stored in checkpoint metadata and validated at load time
-speaker_model_size: 256    # Speaker encoder hidden size
-speaker_num_layers: 3      # Speaker encoder depth
-speaker_num_heads: 8       # Speaker encoder attention heads
-speaker_intermediate_size: 1024  # Speaker encoder MLP size
+# speaker_id is pairing/split metadata only. The model consumes speaker_latents encoded from
+# non-target reference audio, which also supports unseen-speaker voice cloning at inference.
 use_speaker_conditioning: false  # Enable only with a validated speaker_latents dataset
 
 # Target-language conditioning. Enable this for multilingual training and list
 # only languages actually represented in the paired text/audio dataset.
 use_language_conditioning: false
 supported_languages: ["en"]
-# Set only for speaker-conditioned multilingual data. This exact source-audio
-# language set is stored in the checkpoint and gates cross-lingual inference.
-supported_reference_languages: null
+# Exact [target, reference] pairs for multilingual voice cloning, for example:
+# [["en", "en"], ["tr", "tr"], ["tr", "en"]]. Preflight requires every declared pair.
+supported_language_pairs: null
 
 # Versioned learned frame count. These weights are trained from target latent
 # lengths; enabling the module does not retrofit an existing checkpoint.
@@ -74,8 +67,6 @@ mas_duration_loss_weight: 0.0
 mas_alignment_loss_weight: 0.0
 
 # Conditioning
-timestep_embed_size: 192   # Timestep embedding dimension
-adaln_rank: 64             # Low-rank AdaLN rank (for efficiency)
 norm_eps: 1.0e-6           # Normalization epsilon
 
 # Flow Matching Configuration
@@ -134,9 +125,9 @@ pad_token: 100286
 # Paths and Naming
 # ============================================================================
 
-save_folder: "checkpoints/nar_vae_small_pretrain"
+save_folder: "checkpoints/nar_vae_pretrain"
 project_name: "nar-vae-pretraining"
-run_name: "nar-vae-small-pretrain"
+run_name: "nar-vae-pretrain"
 
 # ============================================================================
 # Optional Hardware Optimizations
@@ -179,7 +170,7 @@ logging_first_step: true
 save_total_limit: 3
 save_safetensors: false
 wandb_project: "nar-vae-pretraining"
-wandb_run_name: "nar-vae-small-pretrain"
+wandb_run_name: "nar-vae-pretrain"
 wandb_log_model: false
 
 # ============================================================================

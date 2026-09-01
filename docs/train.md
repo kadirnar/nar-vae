@@ -15,6 +15,22 @@ wandb login
 
 W&B is required. On an offline server, use `WANDB_MODE=offline` instead of logging in.
 
+## Model presets
+
+Counts are approximate and exclude the frozen codec. The second column is the canonical text-only
+topology; the third also enables speaker, multilingual, and speaker-aware duration conditioning.
+
+| Preset | Base | Fully conditioned |
+| --- | ---: | ---: |
+| `nano` | 16.3M | 16.8M |
+| `tiny` | 40.5M | 42.7M |
+| `small` | 77.2M | 83.1M |
+| `medium` | 169.6M | 186.2M |
+| `large` | 353.9M | 387.9M |
+| `xlarge` | 647.1M | 690.5M |
+
+Use `nano` for the lowest-cost experiments. Preset size alone does not establish audio quality.
+
 ## 2. Prepare the mini dataset
 
 The example uses
@@ -24,8 +40,11 @@ English rows with `audio`, `text`, and `speaker_id` columns.
 
 The dataset card declares no license. Confirm that you have permission to use it before training.
 The card says its audio was generated with `jordand/echo-tts-base`; NAR-VAE does not load that
-model, but it is part of the data provenance. The dataset also contains one utterance for each
-speaker ID, so this small example does not enable speaker conditioning or train voice cloning.
+model, but it is part of the data provenance. Each speaker ID occurs only once, so there is no
+different same-speaker utterance to use as a safe reference. This example therefore cannot train
+voice cloning. `speaker_id` is only pairing and split metadata; it is never a model or inference
+input. The model uses reference-audio latents instead of a closed-set speaker-ID embedding so that
+an unseen voice can be supplied at inference time.
 
 Create `prepare_data.py`:
 
@@ -69,10 +88,11 @@ dacvae_sha256: 573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4
 dacvae_sample_rate: 44100
 dacvae_hop_length: 512
 
-model_preset: small
+model_preset: small  # nano, tiny, small, medium, large, or xlarge
 use_speaker_conditioning: false
 use_language_conditioning: false
 supported_languages: [en]
+supported_language_pairs: null
 
 use_mas_duration: true
 mas_duration_loss_weight: 0.1
@@ -114,3 +134,42 @@ torchrun --standalone --nproc-per-node=8 train_job.py
 
 Checkpoints are written under `save_folder`. This mini dataset is useful for checking that the
 pipeline works; it is not enough to demonstrate production speech quality or low WER.
+
+## 5. Reference-audio inference
+
+After training a speaker-conditioned multilingual checkpoint on suitable multi-speaker data, use
+reference audio directly. The checkpoint must declare the requested target/reference language
+coverage:
+
+```yaml
+use_speaker_conditioning: true
+use_language_conditioning: true
+supported_languages: [en, tr]
+supported_language_pairs:
+  - [en, en]
+  - [tr, tr]
+  - [tr, en]
+```
+
+Each training row needs a different-utterance `speaker_latents` reference and matching `language`
+and `speaker_language` metadata. Dataset preflight requires every declared pair before training.
+
+```python
+from nar_vae import FlowMatchingTTSInference
+
+tts = FlowMatchingTTSInference.from_preset(
+    "small",
+    flow_model_path="checkpoints/nar_vae_sft/final/flow_model/pytorch_model.bin",
+    dacvae_model="facebook/dacvae-watermarked",
+    device="cuda",
+)
+
+audio = tts.synthesize_with_config(
+    "Bu bir çok dilli ses klonlama örneğidir.",
+    tts.generation_profile("quality"),
+    reference_audio="reference_en.wav",
+    language="tr",
+    reference_language="en",
+)
+tts.save_audio(audio, "clone_tr.wav")
+```

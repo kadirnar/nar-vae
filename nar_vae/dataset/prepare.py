@@ -40,6 +40,7 @@ from nar_vae.tokenization import (
     TOKENIZER_LENGTH,
     encode_tts_text,
 )
+from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
@@ -64,7 +65,7 @@ class DatasetPreparer:
         self,
         dacvae_model: str | os.PathLike[str] | HubDACVAESource,
         device: str,
-        max_speaker_ref_seconds: int = 120,
+        max_speaker_ref_seconds: float = DEFAULT_MAX_REFERENCE_SECONDS,
         dacvae_backend: str = "bundled",
         language: str = DEFAULT_LANGUAGE,
         dacvae_revision: str | None = None,
@@ -91,7 +92,7 @@ class DatasetPreparer:
             codec_source=codec_source,
         )
         self.sample_rate = self.dacvae.sample_rate
-        self.max_speaker_ref_samples = max_speaker_ref_seconds * self.sample_rate
+        self.max_speaker_ref_samples = int(max_speaker_ref_seconds * self.sample_rate)
         self.language = normalize_language(language)
 
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -251,7 +252,7 @@ def prepare_dataset(
     push_to_hub: str,
     use_speaker_id: bool = False,
     speaker_id_column: str = "speaker_id",
-    max_speaker_ref_seconds: int = 120,
+    max_speaker_ref_seconds: float = DEFAULT_MAX_REFERENCE_SECONDS,
     dacvae_backend: str = "bundled",
     language: str = DEFAULT_LANGUAGE,
     language_column: str | None = None,

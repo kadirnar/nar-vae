@@ -646,12 +646,13 @@ def _pretrain(
         lambda: resolve_language_training_options(config),
         description="pretraining language-topology resolution",
     )
-    supported_reference_languages, _ = run_distributed_operation(
+    supported_reference_languages, supported_language_pairs, _ = run_distributed_operation(
         process,
         lambda: resolve_reference_language_training_options(
             config,
             use_speaker_conditioning=use_speaker_conditioning,
             use_language_conditioning=use_language_conditioning,
+            supported_languages=supported_languages,
         ),
         description="pretraining reference-language resolution",
     )
@@ -675,6 +676,7 @@ def _pretrain(
             use_language_conditioning=use_language_conditioning,
             supported_languages=supported_languages,
             supported_reference_languages=supported_reference_languages,
+            supported_language_pairs=supported_language_pairs or None,
             use_duration_predictor=duration_options.enabled,
             duration_predictor_hidden_size=duration_options.hidden_size,
             duration_predictor_num_layers=duration_options.num_layers,
@@ -731,6 +733,7 @@ def _pretrain(
             use_language_conditioning=use_language_conditioning,
             supported_languages=supported_languages,
             supported_reference_languages=supported_reference_languages,
+            supported_language_pairs=supported_language_pairs or None,
             require_language_coverage=True,
             use_mas_duration=duration_options.uses_mas,
             allow_legacy_representation=config.get("allow_legacy_representation", False),

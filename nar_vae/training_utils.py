@@ -19,10 +19,12 @@ from nar_vae.dataset.representation import (
 from nar_vae.dataset.sampling import LATENT_NUM_FRAMES_COLUMN, validate_latent_num_frames
 from nar_vae.languages import (
     DEFAULT_LANGUAGE,
+    LanguagePair,
     language_from_id,
     language_id,
     normalize_language,
     normalize_languages,
+    resolve_language_pair_support,
 )
 
 
@@ -157,26 +159,37 @@ def resolve_reference_language_training_options(
     *,
     use_speaker_conditioning: bool,
     use_language_conditioning: bool,
+    supported_languages: tuple[str, ...] | list[str] | None = None,
     pretrained_checkpoint: str | None = None,
-) -> tuple[tuple[str, ...] | None, bool]:
-    """Validate explicit source-reference coverage for cross-lingual fine-tuning."""
+) -> tuple[tuple[str, ...] | None, tuple[LanguagePair, ...], bool]:
+    """Validate exact target/reference coverage for multilingual voice cloning."""
     configured_languages = config.get("supported_reference_languages")
+    configured_pairs = config.get("supported_language_pairs")
     initialize_capability = _boolean_option(config, "initialize_cross_lingual_capability")
-    if configured_languages is None:
+    if configured_languages is None and configured_pairs is None:
+        if use_speaker_conditioning and use_language_conditioning:
+            raise ValueError(
+                "Speaker-conditioned multilingual training requires exact supported_language_pairs."
+            )
         if initialize_capability:
             raise ValueError(
-                "initialize_cross_lingual_capability requires supported_reference_languages."
+                "initialize_cross_lingual_capability requires supported_language_pairs or "
+                "supported_reference_languages."
             )
-        return None, False
+        return None, (), False
 
     if not use_speaker_conditioning or not use_language_conditioning:
         raise ValueError(
-            "supported_reference_languages requires both speaker and language conditioning."
+            "Reference-language pair support requires both speaker and language conditioning."
         )
-    supported_languages = normalize_languages(configured_languages)
+    reference_languages, language_pairs = resolve_language_pair_support(
+        supported_languages,
+        supported_reference_languages=configured_languages,
+        supported_language_pairs=configured_pairs,
+    )
     if initialize_capability and not pretrained_checkpoint:
         raise ValueError("initialize_cross_lingual_capability requires a pretrained_checkpoint.")
-    return supported_languages, initialize_capability
+    return reference_languages, language_pairs, initialize_capability
 
 
 def resolve_duration_training_options(
@@ -391,6 +404,7 @@ def validate_tts_dataset(
     use_language_conditioning: bool = False,
     supported_languages: tuple[str, ...] | list[str] | None = None,
     supported_reference_languages: tuple[str, ...] | list[str] | None = None,
+    supported_language_pairs=None,
     require_language_coverage: bool = False,
     use_mas_duration: bool = False,
     allow_legacy_representation: bool = True,
@@ -423,20 +437,35 @@ def validate_tts_dataset(
             "language_id column."
         )
 
-    supported = set(normalize_languages(supported_languages))
-    supported_references = (
-        set(normalize_languages(supported_reference_languages))
-        if supported_reference_languages is not None
-        else None
+    normalized_supported = normalize_languages(supported_languages)
+    supported = set(normalized_supported)
+    has_pair_declaration = (
+        supported_reference_languages is not None or supported_language_pairs is not None
     )
-    if supported_references is not None and not (
-        use_speaker_conditioning and use_language_conditioning
-    ):
+    if use_speaker_conditioning and use_language_conditioning and not has_pair_declaration:
         raise ValueError(
-            "supported_reference_languages requires both speaker and language conditioning."
+            "Speaker-conditioned multilingual training requires exact supported_language_pairs."
         )
+    if has_pair_declaration and not (use_speaker_conditioning and use_language_conditioning):
+        raise ValueError(
+            "Reference-language pair support requires both speaker and language conditioning."
+        )
+    if has_pair_declaration:
+        reference_languages, normalized_pairs = resolve_language_pair_support(
+            normalized_supported,
+            supported_reference_languages=supported_reference_languages,
+            supported_language_pairs=supported_language_pairs,
+        )
+        supported_references: set[str] | None = set(reference_languages)
+        supported_pairs: set[tuple[str, str]] | None = {
+            pair.as_tuple() for pair in normalized_pairs
+        }
+    else:
+        supported_references = None
+        supported_pairs = None
     seen_languages: set[str] = set()
     seen_reference_languages: set[str] = set()
+    seen_language_pairs: set[tuple[str, str]] = set()
     has_frame_metadata = LATENT_NUM_FRAMES_COLUMN in column_names
     has_representation_contract = REPRESENTATION_CONTRACT_COLUMN in column_names
     if not has_representation_contract and not allow_legacy_representation:
@@ -546,16 +575,17 @@ def validate_tts_dataset(
             if supported_references is None and reference_language != row_language:
                 raise ValueError(
                     f"Row {index} is cross-lingual ({reference_language!r} reference, "
-                    f"{row_language!r} target) but supported_reference_languages is not declared."
+                    f"{row_language!r} target) but language-pair support is not declared."
                 )
             if supported_references is not None:
-                if reference_language not in supported_references:
+                row_pair = (row_language, reference_language)
+                if supported_pairs is not None and row_pair not in supported_pairs:
                     raise ValueError(
-                        f"Row {index} uses unsupported reference language "
-                        f"{reference_language!r}; expected one of "
-                        f"{sorted(supported_references)}."
+                        f"Row {index} uses unsupported target/reference language pair "
+                        f"{row_pair!r}; expected one of {sorted(supported_pairs)}."
                     )
                 seen_reference_languages.add(reference_language)
+                seen_language_pairs.add(row_pair)
 
     if first_representation is not None:
         expected_values = {
@@ -591,6 +621,16 @@ def validate_tts_dataset(
             "supported_reference_languages: "
             f"observed={sorted(seen_reference_languages)}, "
             f"declared={sorted(supported_references)}."
+        )
+    if (
+        require_language_coverage
+        and supported_pairs is not None
+        and seen_language_pairs != supported_pairs
+    ):
+        raise ValueError(
+            "Dataset target/reference language-pair coverage does not match "
+            "supported_language_pairs: "
+            f"observed={sorted(seen_language_pairs)}, declared={sorted(supported_pairs)}."
         )
 
 

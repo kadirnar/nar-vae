@@ -22,6 +22,7 @@ from nar_vae.configuration import GenerationConfig, validate_cache_dit_options
 from nar_vae.dacvae import HubDACVAESource
 from nar_vae.inference import AudioReference, FlowMatchingTTSInference
 from nar_vae.solvers.ode_solver import ODESolver
+from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 
 def _mark_compiled_cuda_graph_step() -> None:
@@ -62,7 +63,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         use_speaker_conditioning: bool | None = None,
         cache_mode: str | None = None,
         prefer_ema: bool = True,
-        max_reference_seconds: float = 30.0,
+        max_reference_seconds: float = DEFAULT_MAX_REFERENCE_SECONDS,
         use_language_conditioning: bool | None = None,
         supported_languages: tuple[str, ...] | list[str] | None = None,
         text_model_size: int = 768,

@@ -12,7 +12,7 @@ from nar_vae.checkpoint import (
     LegacyLanguageCheckpointError,
     load_pretrained_checkpoint,
 )
-from nar_vae.languages import LANGUAGE_COUNT, language_id
+from nar_vae.languages import LANGUAGE_COUNT, LanguagePair, language_id
 from nar_vae.models.dit import TextEncoder
 from nar_vae.models.flow_matching import FlowMatchingEchoDiT
 from nar_vae.solvers.ode_solver import ODESolver
@@ -45,6 +45,7 @@ class MultilingualConditioningTest(unittest.TestCase):
         *,
         use_speaker_conditioning=False,
         supported_reference_languages=None,
+        supported_language_pairs=None,
     ):
         return FlowMatchingEchoDiT(
             latent_size=2,
@@ -68,6 +69,7 @@ class MultilingualConditioningTest(unittest.TestCase):
             supported_languages=supported_languages,
             use_speaker_conditioning=use_speaker_conditioning,
             supported_reference_languages=supported_reference_languages,
+            supported_language_pairs=supported_language_pairs,
         )
 
     def test_language_embedding_changes_text_state_without_changing_tokens(self):
@@ -176,6 +178,13 @@ class MultilingualConditioningTest(unittest.TestCase):
         self.assertTrue(capability.enabled)
         self.assertEqual(capability.supported_languages, ("en", "es", "ja"))
 
+    def test_multilingual_speaker_model_requires_exact_reference_pairs(self):
+        with self.assertRaisesRegex(ValueError, "require exact supported_language_pairs"):
+            self._tiny_multilingual_model(
+                ["en", "es"],
+                use_speaker_conditioning=True,
+            )
+
     def test_checkpoint_records_reference_languages_separately(self):
         model = self._tiny_multilingual_model(
             ["en", "es"],
@@ -191,6 +200,52 @@ class MultilingualConditioningTest(unittest.TestCase):
 
         self.assertTrue(capability.enabled)
         self.assertEqual(capability.supported_languages, ("en", "ja"))
+        self.assertEqual(
+            capability.supported_pairs,
+            (
+                LanguagePair("en", "en"),
+                LanguagePair("en", "ja"),
+                LanguagePair("es", "en"),
+                LanguagePair("es", "ja"),
+            ),
+        )
+
+    def test_checkpoint_records_exact_language_pairs_without_cartesian_overclaim(self):
+        model = self._tiny_multilingual_model(
+            ["en", "es"],
+            use_speaker_conditioning=True,
+            supported_reference_languages=["en", "ja"],
+            supported_language_pairs=[["es", "English"], ["en", "Japanese"]],
+        )
+
+        capability = FlowCheckpoint(
+            path=Path("exact-pairs.bin"),
+            state_dict=model.state_dict(),
+        ).reference_language_capability()
+
+        self.assertEqual(capability.supported_languages, ("en", "ja"))
+        self.assertEqual(
+            capability.supported_pairs,
+            (LanguagePair("es", "en"), LanguagePair("en", "ja")),
+        )
+
+    def test_v1_reference_language_metadata_fails_closed(self):
+        model = self._tiny_multilingual_model(
+            ["en", "es"],
+            use_speaker_conditioning=True,
+            supported_language_pairs=[["es", "en"]],
+        )
+        state_dict = model.state_dict()
+        state_dict["cross_lingual_capability_version"] = torch.tensor(1, dtype=torch.int32)
+
+        with self.assertRaisesRegex(
+            LegacyCrossLingualCheckpointError,
+            "Unsupported cross-lingual capability version: 1",
+        ):
+            FlowCheckpoint(
+                path=Path("v1-cross-lingual.bin"),
+                state_dict=state_dict,
+            ).reference_language_capability()
 
     def test_partial_reference_language_metadata_is_rejected(self):
         model = self._tiny_multilingual_model(
@@ -205,6 +260,67 @@ class MultilingualConditioningTest(unittest.TestCase):
         with self.assertRaisesRegex(LegacyCrossLingualCheckpointError, "incomplete"):
             checkpoint.reference_language_capability()
 
+    def test_malformed_exact_pair_metadata_is_rejected(self):
+        model = self._tiny_multilingual_model(
+            ["en", "es"],
+            use_speaker_conditioning=True,
+            supported_language_pairs=[["es", "en"]],
+        )
+        malformed_values = {
+            "wrong_shape": torch.tensor([language_id("es"), language_id("en")]),
+            "wrong_dtype": torch.tensor(
+                [[language_id("es"), language_id("en")]],
+                dtype=torch.float32,
+            ),
+            "empty": torch.empty((0, 2), dtype=torch.int32),
+            "duplicate": torch.tensor(
+                [
+                    [language_id("es"), language_id("en")],
+                    [language_id("es"), language_id("en")],
+                ],
+                dtype=torch.int32,
+            ),
+            "unknown_language": torch.tensor([[999, language_id("en")]], dtype=torch.int32),
+        }
+
+        for name, value in malformed_values.items():
+            with self.subTest(case=name):
+                state_dict = model.state_dict()
+                state_dict["supported_language_pair_ids_metadata"] = value
+                checkpoint = FlowCheckpoint(path=Path(f"{name}.bin"), state_dict=state_dict)
+
+                with self.assertRaises(LegacyCrossLingualCheckpointError):
+                    checkpoint.reference_language_capability()
+
+    def test_pair_metadata_must_match_target_and_reference_projections(self):
+        model = self._tiny_multilingual_model(
+            ["en", "es"],
+            use_speaker_conditioning=True,
+            supported_language_pairs=[["es", "en"]],
+        )
+
+        undeclared_target = model.state_dict()
+        undeclared_target["supported_language_pair_ids_metadata"] = torch.tensor(
+            [[language_id("ja"), language_id("en")]],
+            dtype=torch.int32,
+        )
+        with self.assertRaisesRegex(LegacyCrossLingualCheckpointError, "outside"):
+            FlowCheckpoint(
+                path=Path("undeclared-target.bin"),
+                state_dict=undeclared_target,
+            ).reference_language_capability()
+
+        wrong_projection = model.state_dict()
+        wrong_projection["supported_reference_language_ids_metadata"] = torch.tensor(
+            [language_id("ja")],
+            dtype=torch.int32,
+        )
+        with self.assertRaisesRegex(LegacyCrossLingualCheckpointError, "projection"):
+            FlowCheckpoint(
+                path=Path("wrong-projection.bin"),
+                state_dict=wrong_projection,
+            ).reference_language_capability()
+
     def test_training_loader_rejects_same_shape_different_language_sets(self):
         source = self._tiny_multilingual_model(["en", "es"])
         target = self._tiny_multilingual_model(["en", "fr"])
@@ -217,20 +333,20 @@ class MultilingualConditioningTest(unittest.TestCase):
 
     def test_training_loader_rejects_same_shape_different_reference_sets(self):
         source = self._tiny_multilingual_model(
-            ["en", "es"],
+            ["en", "es", "ja"],
             use_speaker_conditioning=True,
-            supported_reference_languages=["en"],
+            supported_language_pairs=[["en", "en"], ["es", "en"]],
         )
         target = self._tiny_multilingual_model(
-            ["en", "es"],
+            ["en", "es", "ja"],
             use_speaker_conditioning=True,
-            supported_reference_languages=["es"],
+            supported_language_pairs=[["en", "en"], ["ja", "en"]],
         )
         with tempfile.TemporaryDirectory() as directory:
             checkpoint_path = Path(directory) / "cross-lingual.bin"
             torch.save(source.state_dict(), checkpoint_path)
 
-            with self.assertRaisesRegex(RuntimeError, "different reference languages"):
+            with self.assertRaisesRegex(RuntimeError, "different exact reference-language pairs"):
                 load_pretrained_checkpoint(target, checkpoint_path)
 
     def test_unversioned_language_embedding_is_rejected(self):

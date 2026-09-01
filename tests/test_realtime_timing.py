@@ -1,6 +1,7 @@
 """Tests for synchronized realtime timing fields."""
 
 import unittest
+from inspect import signature
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from nar_vae.caching import (
 from nar_vae.configuration import load_inference_settings
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.inference_realtime import RealtimeTTSInference, _mark_compiled_cuda_graph_step
+from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 
 class FakeTokenizer:
@@ -32,6 +34,11 @@ class ConstantVelocityModel(torch.nn.Module):
 
 
 class RealtimeTimingTest(unittest.TestCase):
+    def test_realtime_uses_the_shared_reference_duration_default(self):
+        parameter = signature(RealtimeTTSInference).parameters["max_reference_seconds"]
+
+        self.assertEqual(parameter.default, DEFAULT_MAX_REFERENCE_SECONDS)
+
     def test_compiled_cuda_marker_fails_clearly_on_an_unsupported_torch_build(self):
         with (
             patch("nar_vae.inference_realtime.torch.compiler", object()),

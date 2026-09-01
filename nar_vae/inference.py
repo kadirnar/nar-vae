@@ -39,6 +39,7 @@ from nar_vae.model_presets import get_model_preset
 from nar_vae.models.flow_matching import create_flow_matching_echodit
 from nar_vae.solvers.ode_solver import ODESolver
 from nar_vae.tokenization import PAD_TOKEN, TOTAL_VOCAB_SIZE, encode_tts_text
+from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 AudioReference = str | Path | torch.Tensor
 
@@ -104,7 +105,7 @@ class FlowMatchingTTSInference:
         speaker_intermediate_size: int = 2048,
         use_speaker_conditioning: bool | None = None,
         prefer_ema: bool = True,
-        max_reference_seconds: float = 30.0,
+        max_reference_seconds: float = DEFAULT_MAX_REFERENCE_SECONDS,
         use_language_conditioning: bool | None = None,
         supported_languages: tuple[str, ...] | list[str] | None = None,
         text_model_size: int = 768,
@@ -229,15 +230,21 @@ class FlowMatchingTTSInference:
         self.uses_mas_duration = checkpoint_alignment.enabled
         reference_language_capability = checkpoint.reference_language_capability()
         self.supported_reference_languages = reference_language_capability.supported_languages
+        checkpoint_language_pairs = reference_language_capability.supported_pairs
+        self.supported_language_pairs = (
+            checkpoint_language_pairs
+            if checkpoint_language_pairs
+            else (
+                (LanguagePair(target=DEFAULT_LANGUAGE, reference=DEFAULT_LANGUAGE),)
+                if self.supports_voice_cloning and not self.uses_language_conditioning
+                else ()
+            )
+        )
         self.supports_cross_lingual = bool(
             self.supports_voice_cloning
             and self.uses_language_conditioning
             and reference_language_capability.enabled
-            and any(
-                target != reference
-                for target in self.supported_languages
-                for reference in self.supported_reference_languages
-            )
+            and any(pair.is_cross_lingual for pair in checkpoint_language_pairs)
         )
         self.checkpoint_path = checkpoint.path
 
@@ -295,6 +302,9 @@ class FlowMatchingTTSInference:
             "language_conditioning": self.uses_language_conditioning,
             "supported_languages": list(self.supported_languages),
             "supported_reference_languages": list(self.supported_reference_languages),
+            "supported_language_pairs": [
+                list(pair.as_tuple()) for pair in checkpoint_language_pairs
+            ],
             "duration_predictor": self.uses_learned_duration,
             "duration_predictor_hidden_size": checkpoint_duration.hidden_size,
             "duration_predictor_num_layers": checkpoint_duration.num_layers,
@@ -352,6 +362,7 @@ class FlowMatchingTTSInference:
             use_language_conditioning=self.uses_language_conditioning,
             supported_languages=self.supported_languages,
             supported_reference_languages=self.supported_reference_languages or None,
+            supported_language_pairs=checkpoint_language_pairs or None,
             use_duration_predictor=self.uses_learned_duration,
             duration_predictor_hidden_size=checkpoint_duration.hidden_size or 256,
             duration_predictor_num_layers=checkpoint_duration.num_layers or 2,
@@ -453,22 +464,20 @@ class FlowMatchingTTSInference:
                 f"Checkpoint {self.checkpoint_path.name!r} does not support target language "
                 f"{pair.target!r}. Supported languages: {', '.join(supported)}."
             )
-        if pair.is_cross_lingual and not getattr(self, "supports_voice_cloning", False):
+        if has_reference and not getattr(self, "supports_voice_cloning", False):
             raise VoiceCloningUnsupportedError(
-                "Cross-lingual synthesis requires a speaker-conditioned checkpoint."
+                "Reference-audio synthesis requires a speaker-conditioned checkpoint."
             )
-        if pair.is_cross_lingual:
-            supported_references = getattr(self, "supported_reference_languages", ())
-            if not getattr(self, "supports_cross_lingual", False):
+        if has_reference:
+            supported_pairs = {
+                supported_pair.as_tuple()
+                for supported_pair in getattr(self, "supported_language_pairs", ())
+            }
+            if pair.as_tuple() not in supported_pairs:
                 raise CrossLingualUnsupportedError(
-                    "The checkpoint does not declare trained cross-lingual reference coverage. "
-                    "Same-language cloning remains available when speaker conditioning is enabled."
-                )
-            if pair.reference not in supported_references:
-                raise CrossLingualUnsupportedError(
-                    f"Checkpoint {self.checkpoint_path.name!r} does not support reference "
-                    f"language {pair.reference!r}. Supported reference languages: "
-                    f"{', '.join(supported_references)}."
+                    f"Checkpoint {self.checkpoint_path.name!r} does not declare trained "
+                    f"target/reference language pair {pair.as_tuple()!r}. Supported pairs: "
+                    f"{sorted(supported_pairs)}."
                 )
         return pair
 

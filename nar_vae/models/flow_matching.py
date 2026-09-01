@@ -1,4 +1,5 @@
 import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from numbers import Real
 
@@ -11,8 +12,11 @@ from nar_vae.languages import (
     LANGUAGE_COUNT,
     LANGUAGE_REGISTRY_VERSION,
     NULL_LANGUAGE_ID,
+    Language,
+    LanguagePair,
     language_id,
     normalize_languages,
+    resolve_language_pair_support,
 )
 from nar_vae.voice import (
     CROSS_LINGUAL_CAPABILITY_VERSION,
@@ -184,6 +188,9 @@ class FlowMatchingEchoDiT(nn.Module):
         use_language_conditioning: bool = False,
         supported_languages: tuple[str, ...] | list[str] | None = None,
         supported_reference_languages: tuple[str, ...] | list[str] | None = None,
+        supported_language_pairs: (
+            Iterable[LanguagePair | Sequence[str | Language]] | LanguagePair | None
+        ) = None,
         use_duration_predictor: bool = False,
         duration_predictor_hidden_size: int = 256,
         duration_predictor_num_layers: int = 2,
@@ -222,17 +229,33 @@ class FlowMatchingEchoDiT(nn.Module):
         self.supported_languages = (
             normalize_languages(supported_languages) if use_language_conditioning else ()
         )
-        if supported_reference_languages is not None and not (
-            use_speaker_conditioning and use_language_conditioning
+        if (
+            use_speaker_conditioning
+            and use_language_conditioning
+            and supported_reference_languages is None
+            and supported_language_pairs is None
         ):
             raise ValueError(
-                "supported_reference_languages requires both speaker and language conditioning."
+                "Speaker-conditioned multilingual models require exact supported_language_pairs."
             )
-        self.supported_reference_languages = (
-            normalize_languages(supported_reference_languages)
-            if supported_reference_languages is not None
-            else ()
-        )
+        if (
+            supported_reference_languages is not None or supported_language_pairs is not None
+        ) and not (use_speaker_conditioning and use_language_conditioning):
+            raise ValueError(
+                "Reference-language pair support requires both speaker and language conditioning."
+            )
+        if use_speaker_conditioning and use_language_conditioning:
+            (
+                self.supported_reference_languages,
+                self.supported_language_pairs,
+            ) = resolve_language_pair_support(
+                self.supported_languages,
+                supported_reference_languages=supported_reference_languages,
+                supported_language_pairs=supported_language_pairs,
+            )
+        else:
+            self.supported_reference_languages = ()
+            self.supported_language_pairs = ()
 
         # EchoDiT backbone
         self.dit = EchoDiT(
@@ -340,8 +363,12 @@ class FlowMatchingEchoDiT(nn.Module):
                 torch.tensor(supported_ids, dtype=torch.int32),
             )
 
-        if self.supported_reference_languages:
+        if self.supported_language_pairs:
             reference_ids = tuple(language_id(code) for code in self.supported_reference_languages)
+            pair_ids = tuple(
+                (language_id(pair.target), language_id(pair.reference))
+                for pair in self.supported_language_pairs
+            )
             self.register_buffer(
                 "cross_lingual_capability_version",
                 torch.tensor(CROSS_LINGUAL_CAPABILITY_VERSION, dtype=torch.int32),
@@ -353,6 +380,10 @@ class FlowMatchingEchoDiT(nn.Module):
             self.register_buffer(
                 "supported_reference_language_ids_metadata",
                 torch.tensor(reference_ids, dtype=torch.int32),
+            )
+            self.register_buffer(
+                "supported_language_pair_ids_metadata",
+                torch.tensor(pair_ids, dtype=torch.int32),
             )
 
     def _prepare_language_ids(
@@ -1554,6 +1585,9 @@ def create_flow_matching_echodit(
     use_language_conditioning: bool = False,
     supported_languages: tuple[str, ...] | list[str] | None = None,
     supported_reference_languages: tuple[str, ...] | list[str] | None = None,
+    supported_language_pairs: (
+        Iterable[LanguagePair | Sequence[str | Language]] | LanguagePair | None
+    ) = None,
     use_duration_predictor: bool = False,
     duration_predictor_hidden_size: int = 256,
     duration_predictor_num_layers: int = 2,
@@ -1579,6 +1613,7 @@ def create_flow_matching_echodit(
         use_language_conditioning: Enable a learned target-language embedding
         supported_languages: Canonical codes or aliases represented by training data
         supported_reference_languages: Languages represented by speaker-reference audio
+        supported_language_pairs: Exact target/reference pairs represented by training data
         use_duration_predictor: Add a versioned learned DACVAE frame-count head
         use_mas_duration: Add the independently versioned monotonic-alignment head
         duration_alignment_hidden_size: Fixed acoustic-projection and text-prior width
@@ -1601,6 +1636,7 @@ def create_flow_matching_echodit(
         use_language_conditioning=use_language_conditioning,
         supported_languages=supported_languages,
         supported_reference_languages=supported_reference_languages,
+        supported_language_pairs=supported_language_pairs,
         use_duration_predictor=use_duration_predictor,
         duration_predictor_hidden_size=duration_predictor_hidden_size,
         duration_predictor_num_layers=duration_predictor_num_layers,

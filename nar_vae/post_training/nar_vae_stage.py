@@ -11,7 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nar_vae.checkpoint import CheckpointProvenance, FlowCheckpoint
+from nar_vae.checkpoint import (
+    CheckpointProvenance,
+    DurationCheckpointInfo,
+    FlowCheckpoint,
+    MonotonicAlignmentCheckpointInfo,
+)
 from nar_vae.dacvae import HubDACVAESource, load_dacvae
 from nar_vae.dataset.data_collator import FlowMatchingDataCollator
 from nar_vae.dataset.identity import resolve_local_prepared_dataset_identity
@@ -24,10 +29,12 @@ from nar_vae.distributed import (
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
 from nar_vae.model_manifest import (
     ModelManifest,
+    ModelManifestError,
     validate_grpo_parent_manifest,
     validate_loaded_codec,
     validate_manifest_weight,
 )
+from nar_vae.models.duration import MONOTONIC_ALIGNMENT_VERSION
 from nar_vae.models.flow_matching import create_flow_matching_echodit
 from nar_vae.post_training.stage import (
     GRPOPreparedBatch,
@@ -91,6 +98,11 @@ def model_export_config_from_manifest(manifest: ModelManifest) -> dict[str, Any]
             if capabilities["supported_reference_languages"]
             else None
         ),
+        "supported_language_pairs": (
+            [list(pair) for pair in capabilities["supported_language_pairs"]]
+            if capabilities["supported_language_pairs"]
+            else None
+        ),
         "use_duration_predictor": capabilities["duration_predictor"],
         "duration_predictor_hidden_size": capabilities["duration_predictor_hidden_size"],
         "duration_predictor_num_layers": capabilities["duration_predictor_num_layers"],
@@ -144,7 +156,8 @@ def _new_model_from_manifest(
         use_speaker_conditioning=capabilities["speaker_conditioning"],
         use_language_conditioning=capabilities["language_conditioning"],
         supported_languages=capabilities["supported_languages"],
-        supported_reference_languages=capabilities["supported_reference_languages"],
+        supported_reference_languages=capabilities["supported_reference_languages"] or None,
+        supported_language_pairs=capabilities["supported_language_pairs"] or None,
         use_duration_predictor=capabilities["duration_predictor"],
         duration_predictor_hidden_size=capabilities["duration_predictor_hidden_size"] or 256,
         duration_predictor_num_layers=capabilities["duration_predictor_num_layers"] or 2,
@@ -166,6 +179,64 @@ def _preserve_flow_only_trainability(model: nn.Module) -> None:
     setter = getattr(getattr(model, "dit", None), "set_latent_prefix_trainable", None)
     if callable(setter):
         setter(False)
+
+
+def _validate_grpo_checkpoint_capabilities(
+    checkpoint: FlowCheckpoint,
+    manifest: ModelManifest,
+) -> None:
+    """Bind value-bearing checkpoint metadata to the already authenticated manifest."""
+    expected = manifest.capabilities
+    checkpoint_uses_speaker = checkpoint.infer_speaker_conditioning(False)
+    if checkpoint_uses_speaker != expected["speaker_conditioning"]:
+        raise ModelManifestError(
+            "GRPO checkpoint speaker conditioning does not match its model manifest."
+        )
+    if checkpoint_uses_speaker:
+        checkpoint_patch_size = checkpoint.infer_speaker_patch_size(0)
+        if checkpoint_patch_size != manifest.architecture["speaker_patch_size"]:
+            raise ModelManifestError(
+                "GRPO checkpoint speaker patch size does not match its model manifest."
+            )
+
+    language = checkpoint.language_capability()
+    if language.enabled != expected["language_conditioning"]:
+        raise ModelManifestError(
+            "GRPO checkpoint language conditioning does not match its model manifest."
+        )
+    if language.enabled and language.supported_languages != tuple(expected["supported_languages"]):
+        raise ModelManifestError(
+            "GRPO checkpoint target languages do not match its model manifest."
+        )
+
+    references = checkpoint.reference_language_capability()
+    expected_pairs = tuple(tuple(pair) for pair in expected["supported_language_pairs"])
+    checkpoint_pairs = tuple(pair.as_tuple() for pair in references.supported_pairs)
+    if references.enabled != bool(expected_pairs) or checkpoint_pairs != expected_pairs:
+        raise ModelManifestError(
+            "GRPO checkpoint target/reference language pairs do not match its model manifest."
+        )
+
+    expected_duration = DurationCheckpointInfo(
+        enabled=expected["duration_predictor"],
+        hidden_size=expected["duration_predictor_hidden_size"],
+        num_layers=expected["duration_predictor_num_layers"],
+        uses_speaker=expected["duration_predictor_use_speaker"],
+    )
+    if checkpoint.duration_capability() != expected_duration:
+        raise ModelManifestError(
+            "GRPO checkpoint duration-predictor configuration does not match its model manifest."
+        )
+
+    expected_alignment = MonotonicAlignmentCheckpointInfo(
+        enabled=expected["monotonic_alignment"],
+        hidden_size=expected["duration_alignment_hidden_size"],
+        version=(MONOTONIC_ALIGNMENT_VERSION if expected["monotonic_alignment"] else 0),
+    )
+    if checkpoint.monotonic_alignment_capability() != expected_alignment:
+        raise ModelManifestError(
+            "GRPO checkpoint monotonic-alignment configuration does not match its model manifest."
+        )
 
 
 def _validate_grpo_parent_before_deserialization(
@@ -427,6 +498,7 @@ def build_nar_vae_grpo_runtime(
             provenance,
         ),
     )
+    _validate_grpo_checkpoint_capabilities(parent_weights, parent_manifest)
     parent_weights.load_into(policy)
     parent_weights.load_into(reference)
     freeze_layers(
@@ -667,8 +739,14 @@ def _grpo_post_train(
             use_speaker_conditioning=parent_manifest.capabilities["speaker_conditioning"],
             use_language_conditioning=parent_manifest.capabilities["language_conditioning"],
             supported_languages=tuple(parent_manifest.capabilities["supported_languages"]),
-            supported_reference_languages=tuple(
-                parent_manifest.capabilities["supported_reference_languages"]
+            supported_reference_languages=(
+                tuple(parent_manifest.capabilities["supported_reference_languages"]) or None
+            ),
+            supported_language_pairs=(
+                tuple(
+                    tuple(pair) for pair in parent_manifest.capabilities["supported_language_pairs"]
+                )
+                or None
             ),
             require_language_coverage=True,
             use_mas_duration=parent_manifest.capabilities["monotonic_alignment"],

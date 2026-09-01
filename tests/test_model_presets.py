@@ -1,6 +1,10 @@
 """Tests for packaged EchoDiT model-size configurations."""
 
 import unittest
+from pathlib import Path
+
+import torch
+import yaml
 
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.model_presets import (
@@ -10,19 +14,54 @@ from nar_vae.model_presets import (
     list_model_presets,
     resolve_model_architecture,
 )
+from nar_vae.models.flow_matching import create_flow_matching_echodit
+
+ROOT = Path(__file__).resolve().parents[1]
+
+EXPECTED_PARAMETER_COUNTS = {
+    "nano": (16_267_393, 16_805_313),
+    "tiny": (40_514_049, 42_708_097),
+    "small": (77_210_945, 83_118_849),
+    "medium": (169_604_353, 186_234_369),
+    "large": (353_931_137, 387_900_161),
+    "xlarge": (647_064_065, 690_472_705),
+}
 
 
 class ModelPresetTest(unittest.TestCase):
-    def test_expected_presets_are_ordered_from_tiny_to_xlarge(self):
+    def test_expected_presets_are_ordered_from_nano_to_xlarge(self):
         self.assertEqual(
             list_model_presets(),
-            ("tiny", "small", "medium", "large", "xlarge"),
+            ("nano", "tiny", "small", "medium", "large", "xlarge"),
         )
 
         widths = [get_model_preset(name).model_size for name in list_model_presets()]
         layers = [get_model_preset(name).num_layers for name in list_model_presets()]
         self.assertEqual(widths, sorted(widths))
         self.assertEqual(layers, sorted(layers))
+
+    def test_nano_is_the_cheapest_valid_architecture(self):
+        nano = get_model_preset("nano")
+
+        self.assertEqual(
+            nano.model_kwargs(),
+            {
+                "model_size": 128,
+                "num_layers": 6,
+                "num_heads": 4,
+                "intermediate_size": 512,
+                "text_model_size": 128,
+                "text_num_layers": 2,
+                "text_num_heads": 4,
+                "text_intermediate_size": 512,
+                "speaker_model_size": 96,
+                "speaker_num_layers": 2,
+                "speaker_num_heads": 3,
+                "speaker_intermediate_size": 384,
+                "timestep_embed_size": 64,
+                "adaln_rank": 32,
+            },
+        )
 
     def test_every_preset_has_valid_attention_dimensions(self):
         for name in list_model_presets():
@@ -58,8 +97,48 @@ class ModelPresetTest(unittest.TestCase):
             ModelPreset(name="invalid", description="test", **values)
 
     def test_unknown_preset_has_actionable_choices(self):
-        with self.assertRaisesRegex(ValueError, "tiny, small, medium, large, xlarge"):
+        with self.assertRaisesRegex(ValueError, "nano, tiny, small, medium, large, xlarge"):
             get_model_preset("micro")
+
+    def test_packaged_training_configs_use_one_switch_for_every_preset(self):
+        for filename in ("echodit_config.yaml", "finetune_config.yaml"):
+            path = ROOT / "nar_vae" / "configs" / filename
+            with path.open(encoding="utf-8") as handle:
+                config = yaml.safe_load(handle)
+
+            self.assertFalse(set(ARCHITECTURE_FIELDS).intersection(config), filename)
+            for name in list_model_presets():
+                with self.subTest(filename=filename, preset=name):
+                    switched = dict(config, model_preset=name)
+                    self.assertEqual(resolve_model_architecture(switched), get_model_preset(name))
+
+    def test_every_preset_constructs_with_documented_parameter_counts(self):
+        for name, (expected_base, expected_full) in EXPECTED_PARAMETER_COUNTS.items():
+            preset_kwargs = get_model_preset(name).model_kwargs()
+            with self.subTest(preset=name, topology="base"), torch.device("meta"):
+                model = create_flow_matching_echodit(
+                    latent_size=128,
+                    text_vocab_size=100312,
+                    use_duration_predictor=True,
+                    use_mas_duration=True,
+                    **preset_kwargs,
+                )
+                self.assertEqual(model.get_num_params()["total"], expected_base)
+
+            with self.subTest(preset=name, topology="fully_conditioned"), torch.device("meta"):
+                model = create_flow_matching_echodit(
+                    latent_size=128,
+                    text_vocab_size=100312,
+                    use_speaker_conditioning=True,
+                    use_language_conditioning=True,
+                    supported_languages=("en", "tr"),
+                    supported_language_pairs=(("en", "en"), ("tr", "tr"), ("tr", "en")),
+                    use_duration_predictor=True,
+                    duration_predictor_use_speaker=True,
+                    use_mas_duration=True,
+                    **preset_kwargs,
+                )
+                self.assertEqual(model.get_num_params()["total"], expected_full)
 
     def test_inference_factory_passes_the_complete_preset(self):
         class RecordingInference(FlowMatchingTTSInference):

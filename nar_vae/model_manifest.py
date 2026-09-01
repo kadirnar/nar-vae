@@ -22,11 +22,15 @@ from nar_vae.dataset.representation import (
     TEXT_FRONTEND_NAME,
     TEXT_FRONTEND_VERSION,
 )
-from nar_vae.languages import normalize_languages
+from nar_vae.languages import (
+    normalize_language_pairs,
+    normalize_languages,
+    resolve_language_pair_support,
+)
 from nar_vae.model_presets import ARCHITECTURE_FIELDS, resolve_model_architecture
 
 MODEL_MANIFEST_FILENAME = "nar_vae_manifest.json"
-MODEL_MANIFEST_SCHEMA_VERSION = 1
+MODEL_MANIFEST_SCHEMA_VERSION = 2
 MODEL_MANIFEST_LIBRARY = "nar-vae"
 MODEL_MANIFEST_STAGES = ("pretrain", "sft", "grpo")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -46,6 +50,7 @@ _CAPABILITY_FIELDS = (
     "language_conditioning",
     "supported_languages",
     "supported_reference_languages",
+    "supported_language_pairs",
     "duration_predictor",
     "duration_predictor_hidden_size",
     "duration_predictor_num_layers",
@@ -177,21 +182,31 @@ def architecture_from_config(config: Mapping[str, Any]) -> dict[str, int | float
 
 def capabilities_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Build the explicit training capability declaration for an export."""
+    speaker_conditioning = _strict_boolean(config, "use_speaker_conditioning")
     language_conditioning = _strict_boolean(config, "use_language_conditioning")
     supported_languages = normalize_languages(config.get("supported_languages", ("en",)))
-    reference_languages = config.get("supported_reference_languages")
-    if reference_languages is None:
-        normalized_reference_languages: tuple[str, ...] = ()
-    else:
-        normalized_reference_languages = normalize_languages(reference_languages)
+    normalized_reference_languages, supported_language_pairs = resolve_language_pair_support(
+        supported_languages,
+        supported_reference_languages=config.get("supported_reference_languages"),
+        supported_language_pairs=config.get("supported_language_pairs"),
+    )
+    if supported_language_pairs and not (speaker_conditioning and language_conditioning):
+        raise ModelManifestError(
+            "Reference-language pair support requires speaker and language conditioning."
+        )
+    if speaker_conditioning and language_conditioning and not supported_language_pairs:
+        raise ModelManifestError(
+            "Speaker-conditioned multilingual manifests require exact supported_language_pairs."
+        )
     duration_predictor = _strict_boolean(config, "use_duration_predictor")
     monotonic_alignment = _strict_boolean(config, "use_mas_duration")
     duration_uses_speaker = _strict_boolean(config, "duration_predictor_use_speaker")
     return {
-        "speaker_conditioning": _strict_boolean(config, "use_speaker_conditioning"),
+        "speaker_conditioning": speaker_conditioning,
         "language_conditioning": language_conditioning,
         "supported_languages": list(supported_languages),
         "supported_reference_languages": list(normalized_reference_languages),
+        "supported_language_pairs": [list(pair.as_tuple()) for pair in supported_language_pairs],
         "duration_predictor": duration_predictor,
         "duration_predictor_hidden_size": (
             _positive_integer(
@@ -355,6 +370,35 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         normalized = list(normalize_languages(value)) if value else []
         if value != normalized:
             raise ModelManifestError(f"Manifest capability {name} is not normalized.")
+    pair_values = capabilities["supported_language_pairs"]
+    if not isinstance(pair_values, list) or not all(
+        isinstance(pair, list)
+        and len(pair) == 2
+        and all(isinstance(language, str) for language in pair)
+        for pair in pair_values
+    ):
+        raise ModelManifestError(
+            "Manifest capability supported_language_pairs must be a list of "
+            "[target, reference] language lists."
+        )
+    normalized_pairs = (
+        [list(pair.as_tuple()) for pair in normalize_language_pairs(pair_values)]
+        if pair_values
+        else []
+    )
+    if pair_values != normalized_pairs:
+        raise ModelManifestError("Manifest capability supported_language_pairs is not normalized.")
+    pair_targets = {pair[0] for pair in pair_values}
+    if not pair_targets.issubset(capabilities["supported_languages"]):
+        raise ModelManifestError(
+            "Manifest language-pair targets must be declared in supported_languages."
+        )
+    pair_references = list(dict.fromkeys(pair[1] for pair in pair_values))
+    if pair_references != capabilities["supported_reference_languages"]:
+        raise ModelManifestError(
+            "Manifest supported_reference_languages must equal the ordered reference "
+            "projection of supported_language_pairs."
+        )
     for name in (
         "duration_predictor_hidden_size",
         "duration_predictor_num_layers",
@@ -383,11 +427,19 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         raise ModelManifestError(
             "Monotonic-alignment capability and hidden-size metadata disagree."
         )
-    if capabilities["supported_reference_languages"] and not (
+    if capabilities["supported_language_pairs"] and not (
         capabilities["speaker_conditioning"] and capabilities["language_conditioning"]
     ):
         raise ModelManifestError(
-            "Reference-language coverage requires speaker and language conditioning."
+            "Reference-language pair coverage requires speaker and language conditioning."
+        )
+    if (
+        capabilities["speaker_conditioning"]
+        and capabilities["language_conditioning"]
+        and not capabilities["supported_language_pairs"]
+    ):
+        raise ModelManifestError(
+            "Speaker-conditioned multilingual manifests require exact supported_language_pairs."
         )
     if architecture["use_speaker_conditioning"] != capabilities["speaker_conditioning"]:
         raise ModelManifestError("Speaker topology and speaker capability metadata disagree.")
@@ -727,14 +779,17 @@ def validate_sft_parent_manifest(
         ("language_conditioning", "supported_languages"),
     )
     if _strict_boolean(config, "initialize_cross_lingual_capability"):
-        parent_reference_languages = migrated_capabilities["supported_reference_languages"]
-        requested_reference_languages = requested_capabilities["supported_reference_languages"]
-        if parent_reference_languages or not requested_reference_languages:
+        parent_language_pairs = migrated_capabilities["supported_language_pairs"]
+        requested_language_pairs = requested_capabilities["supported_language_pairs"]
+        if parent_language_pairs or not requested_language_pairs:
             raise ModelManifestError(
                 "initialize_cross_lingual_capability requires an additive SFT reference-"
-                "language migration from no declared coverage."
+                "language-pair migration from no declared coverage."
             )
-        migrated_capabilities["supported_reference_languages"] = requested_reference_languages
+        migrated_capabilities["supported_reference_languages"] = requested_capabilities[
+            "supported_reference_languages"
+        ]
+        migrated_capabilities["supported_language_pairs"] = requested_language_pairs
     migrate_capability(
         "initialize_duration_predictor",
         "duration_predictor",

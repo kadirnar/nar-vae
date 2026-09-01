@@ -105,6 +105,10 @@ class LanguageRegistryTest(unittest.TestCase):
         runtime.uses_language_conditioning = True
         runtime.supported_languages = ("en", "es")
         runtime.supported_reference_languages = ("en", "ja")
+        runtime.supported_language_pairs = (
+            LanguagePair("es", "en"),
+            LanguagePair("es", "ja"),
+        )
         runtime.supports_cross_lingual = True
 
         english_reference = runtime._resolve_language_pair(
@@ -133,13 +137,45 @@ class LanguageRegistryTest(unittest.TestCase):
         runtime.uses_language_conditioning = False
         runtime.supported_languages = ("en",)
         runtime.supported_reference_languages = ()
+        runtime.supported_language_pairs = ()
         runtime.supports_cross_lingual = False
 
         with self.assertRaisesRegex(
             CrossLingualUnsupportedError,
-            "does not declare trained cross-lingual reference coverage",
+            "does not declare trained target/reference language pair",
         ):
             runtime._resolve_language_pair("en", "es", has_reference=True)
+
+    def test_speaker_only_checkpoint_accepts_same_language_reference(self):
+        runtime = FlowMatchingTTSInference.__new__(FlowMatchingTTSInference)
+        runtime.checkpoint_path = Path("speaker-only.bin")
+        runtime.supports_voice_cloning = True
+        runtime.uses_language_conditioning = False
+        runtime.supported_languages = ("en",)
+        runtime.supported_reference_languages = ()
+        runtime.supported_language_pairs = (LanguagePair("en", "en"),)
+
+        pair = runtime._resolve_language_pair("en", None, has_reference=True)
+
+        self.assertEqual(pair, LanguagePair("en", "en"))
+
+    def test_inference_rejects_untrained_pair_from_supported_language_projections(self):
+        runtime = FlowMatchingTTSInference.__new__(FlowMatchingTTSInference)
+        runtime.checkpoint_path = Path("exact-pairs.bin")
+        runtime.supports_voice_cloning = True
+        runtime.uses_language_conditioning = True
+        runtime.supported_languages = ("en", "es")
+        runtime.supported_reference_languages = ("en", "ja")
+        runtime.supported_language_pairs = (
+            LanguagePair("es", "en"),
+            LanguagePair("en", "ja"),
+        )
+
+        runtime._resolve_language_pair("es", "en", has_reference=True)
+        with self.assertRaisesRegex(CrossLingualUnsupportedError, r"\('es', 'ja'\)"):
+            runtime._resolve_language_pair("es", "ja", has_reference=True)
+        with self.assertRaisesRegex(CrossLingualUnsupportedError, r"\('en', 'en'\)"):
+            runtime._resolve_language_pair("en", "en", has_reference=True)
 
     def test_inference_cannot_disable_checkpoint_language_conditioning(self):
         checkpoint = self._checkpoint(LanguageCheckpointInfo(True, ("en", "es")))

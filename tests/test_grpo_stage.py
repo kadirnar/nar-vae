@@ -8,17 +8,25 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn as nn
 
+from nar_vae.checkpoint import (
+    DurationCheckpointInfo,
+    LanguageCheckpointInfo,
+    MonotonicAlignmentCheckpointInfo,
+    ReferenceLanguageCheckpointInfo,
+)
 from nar_vae.configuration import write_training_lineage
 from nar_vae.dataset.finetune_prepare import (
     _content_bound_utterance_id,
     _validate_unique_prompt_ids,
 )
 from nar_vae.distributed import DistributedContext
+from nar_vae.languages import LanguagePair
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
 from nar_vae.model_manifest import (
     MODEL_MANIFEST_FILENAME,
@@ -27,6 +35,7 @@ from nar_vae.model_manifest import (
     validate_grpo_parent_manifest,
     write_model_manifest,
 )
+from nar_vae.models.duration import MONOTONIC_ALIGNMENT_VERSION
 from nar_vae.post_training import (
     DEFAULT_GRPO_CONFIG_PATH,
     FlowGRPOConfig,
@@ -268,6 +277,42 @@ def write_sft_parent(root: Path):
     return sft_weights, sft_manifest
 
 
+def matching_grpo_capability_contract():
+    checkpoint = Mock()
+    checkpoint.infer_speaker_conditioning.return_value = False
+    checkpoint.language_capability.return_value = LanguageCheckpointInfo(enabled=False)
+    checkpoint.reference_language_capability.return_value = ReferenceLanguageCheckpointInfo(
+        enabled=False
+    )
+    checkpoint.duration_capability.return_value = DurationCheckpointInfo(
+        enabled=True,
+        hidden_size=256,
+        num_layers=2,
+        uses_speaker=False,
+    )
+    checkpoint.monotonic_alignment_capability.return_value = MonotonicAlignmentCheckpointInfo(
+        enabled=True,
+        hidden_size=64,
+        version=MONOTONIC_ALIGNMENT_VERSION,
+    )
+    manifest = SimpleNamespace(
+        architecture={"speaker_patch_size": 4},
+        capabilities={
+            "speaker_conditioning": False,
+            "language_conditioning": False,
+            "supported_languages": ["en"],
+            "supported_language_pairs": [],
+            "duration_predictor": True,
+            "duration_predictor_hidden_size": 256,
+            "duration_predictor_num_layers": 2,
+            "duration_predictor_use_speaker": False,
+            "monotonic_alignment": True,
+            "duration_alignment_hidden_size": 64,
+        },
+    )
+    return checkpoint, manifest
+
+
 class GRPOStageTest(unittest.TestCase):
     def setUp(self):
         class NoOpWandbLogger:
@@ -285,6 +330,87 @@ class GRPOStageTest(unittest.TestCase):
         )
         self._wandb_logger_patch.start()
         self.addCleanup(self._wandb_logger_patch.stop)
+
+    def test_text_only_manifest_does_not_pass_empty_reference_capabilities_to_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, manifest = write_sft_parent(Path(directory))
+            expected = nn.Identity()
+
+            with patch.object(
+                nar_stage_module,
+                "create_flow_matching_echodit",
+                return_value=expected,
+            ) as create_model:
+                model = nar_stage_module._new_model_from_manifest(manifest)
+
+            self.assertIs(model, expected)
+            self.assertIsNone(create_model.call_args.kwargs["supported_reference_languages"])
+            self.assertIsNone(create_model.call_args.kwargs["supported_language_pairs"])
+
+    def test_grpo_rejects_checkpoint_pair_metadata_that_disagrees_with_manifest(self):
+        checkpoint = Mock()
+        checkpoint.infer_speaker_conditioning.return_value = True
+        checkpoint.infer_speaker_patch_size.return_value = 4
+        checkpoint.language_capability.return_value = LanguageCheckpointInfo(
+            enabled=True,
+            supported_languages=("en", "es"),
+        )
+        checkpoint.reference_language_capability.return_value = ReferenceLanguageCheckpointInfo(
+            enabled=True,
+            supported_languages=("en",),
+            supported_pairs=(LanguagePair("es", "en"),),
+        )
+        manifest = SimpleNamespace(
+            architecture={"speaker_patch_size": 4},
+            capabilities={
+                "speaker_conditioning": True,
+                "language_conditioning": True,
+                "supported_languages": ["en", "es"],
+                "supported_language_pairs": [["en", "en"]],
+            },
+        )
+
+        with self.assertRaisesRegex(ModelManifestError, "language pairs do not match"):
+            nar_stage_module._validate_grpo_checkpoint_capabilities(checkpoint, manifest)
+
+    def test_grpo_rejects_duration_capability_mismatches(self):
+        mismatches = {
+            "enabled": DurationCheckpointInfo(enabled=False),
+            "hidden_size": DurationCheckpointInfo(True, 128, 2, False),
+            "num_layers": DurationCheckpointInfo(True, 256, 3, False),
+            "uses_speaker": DurationCheckpointInfo(True, 256, 2, True),
+        }
+        for name, observed in mismatches.items():
+            with self.subTest(field=name):
+                checkpoint, manifest = matching_grpo_capability_contract()
+                checkpoint.duration_capability.return_value = observed
+
+                with self.assertRaisesRegex(ModelManifestError, "duration-predictor"):
+                    nar_stage_module._validate_grpo_checkpoint_capabilities(
+                        checkpoint,
+                        manifest,
+                    )
+
+    def test_grpo_rejects_monotonic_alignment_capability_mismatches(self):
+        mismatches = {
+            "enabled": MonotonicAlignmentCheckpointInfo(enabled=False),
+            "hidden_size": MonotonicAlignmentCheckpointInfo(
+                True,
+                32,
+                MONOTONIC_ALIGNMENT_VERSION,
+            ),
+            "version": MonotonicAlignmentCheckpointInfo(True, 64, 999),
+        }
+        for name, observed in mismatches.items():
+            with self.subTest(field=name):
+                checkpoint, manifest = matching_grpo_capability_contract()
+                checkpoint.monotonic_alignment_capability.return_value = observed
+
+                with self.assertRaisesRegex(ModelManifestError, "monotonic-alignment"):
+                    nar_stage_module._validate_grpo_checkpoint_capabilities(
+                        checkpoint,
+                        manifest,
+                    )
 
     def test_runtime_revalidates_sft_bytes_immediately_before_deserialization(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -318,6 +444,10 @@ class GRPOStageTest(unittest.TestCase):
                     nar_stage_module,
                     "_new_model_from_manifest",
                     side_effect=(ToyVelocity(), ToyVelocity()),
+                ),
+                patch.object(
+                    nar_stage_module,
+                    "_validate_grpo_checkpoint_capabilities",
                 ),
                 patch.object(nar_stage_module, "validate_manifest_weight", side_effect=validate),
                 patch.object(nar_stage_module, "validate_loaded_codec"),

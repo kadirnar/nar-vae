@@ -30,12 +30,19 @@ raw_row = {
     "audio": {"array": waveform_float32, "sampling_rate": 48000},
     "text": "The transcript matching this waveform.",
     "language": "en",  # Optional multilingual label.
-    "speaker_id": "speaker-1",  # Optional same-speaker reference pairing.
+    "speaker_id": "speaker-1",  # Optional dataset-only grouping key.
 }
 ```
 
 Speaker-conditioned preparation selects another utterance from the same speaker; the target
-utterance is never used as its own voice reference.
+utterance is never used as its own voice reference. `speaker_id` is used only for pairing,
+speaker-disjoint splits, and reference selection. It is not embedded or passed to the model at
+training or inference; zero-shot cloning is conditioned by reference audio. A learned speaker-ID
+table would be closed-set and could not represent a new voice, so it is intentionally absent.
+
+For multilingual cloning, set `supported_language_pairs` to exact `[target, reference]` pairs such
+as `[["en", "en"], ["tr", "tr"], ["tr", "en"]`. The checkpoint records these pairs and inference
+rejects combinations it was not trained to handle.
 
 The prepared dataset contains:
 
@@ -78,6 +85,13 @@ EchoDiT predicts the velocity. MAS produces hard monotonic token/frame alignment
 duration head and duration-expanded frame conditioning. No external language model or third-party
 TTS checkpoint initializes the acoustic model.
 
+### Model presets
+
+The packaged presets are `nano`, `tiny`, `small`, `medium`, `large`, and `xlarge`. `nano` is the
+lowest-cost tier; see the [training guide](docs/train.md#model-presets) for parameter counts. A
+larger preset does not establish better quality without a trained checkpoint and held-out
+evaluation.
+
 ## Pretraining
 
 Create an editable configuration from the packaged scratch-pretraining recipe:
@@ -104,7 +118,7 @@ Set at least these values:
 training_stage: pretrain
 model_initialization: random
 pretrained_checkpoint: null
-model_preset: small
+model_preset: small  # nano, tiny, small, medium, large, or xlarge
 
 TTS_dataset_local: ./data/prepared
 dacvae_model: facebook/dacvae-watermarked
@@ -157,30 +171,35 @@ torchrun --standalone --nproc-per-node=8 pretrain_job.py
 | eager execution | `torch_compile: true` after shape-bucket tests |
 | strict FP32 matmul behavior | `tf32: true` after numerical checks |
 
-The `tiny` and `small` presets reduce training cost. Larger presets, compilation, fused AdamW,
-TF32, and FA3 are not assumed to improve every server; measure throughput, memory, convergence,
-WER/CER, and listening quality before keeping them. FSDP is not implemented; use DDP.
+The `nano`, `tiny`, and `small` presets reduce training cost. Larger presets, compilation, fused
+AdamW, TF32, and FA3 are not assumed to improve every server; measure throughput, memory,
+convergence, WER/CER, and listening quality before keeping them. FSDP is not implemented; use DDP.
 
 ## Inference
 
 Inference requires a locally trained NAR-VAE export. Its manifest supplies the exact codec revision,
-filename, and SHA-256:
+filename, SHA-256, and trained capabilities. This cross-lingual cloning example requires a
+checkpoint whose manifest declares speaker conditioning, Turkish target speech, and English
+reference-audio coverage:
 
 ```python
 from nar_vae import FlowMatchingTTSInference
 
 tts = FlowMatchingTTSInference.from_preset(
     "small",
-    flow_model_path="checkpoints/nar_vae_small_sft/final/flow_model/pytorch_model.bin",
+    flow_model_path="checkpoints/nar_vae_sft/final/flow_model/pytorch_model.bin",
     dacvae_model="facebook/dacvae-watermarked",
     device="cuda",
 )
 
 audio = tts.synthesize_with_config(
-    "This sentence uses a locally trained checkpoint.",
+    "Bu cümle, İngilizce referans kaydındaki sesi kullanır.",
     tts.generation_profile("quality"),
+    reference_audio="reference_en.wav",
+    language="tr",
+    reference_language="en",
 )
-tts.save_audio(audio, "output.wav")
+tts.save_audio(audio, "clone_tr.wav")
 ```
 
 Inference verifies the model manifest, weight hashes, architecture, capabilities, tokenizer, and

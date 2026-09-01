@@ -29,7 +29,11 @@ finetune_mode: "full"          # Only full SFT is implemented; unsupported modes
 # Model Configuration (must match pretrained model)
 # ============================================================================
 
-model_preset: "small"  # Must describe the selected checkpoint architecture
+# Approximate canonical totals (base text-only / speaker + multilingual + speaker-aware duration):
+# nano 16.3M / 16.8M; tiny 40.5M / 42.7M; small 77.2M / 83.1M
+# medium 169.6M / 186.2M; large 353.9M / 387.9M; xlarge 647.1M / 690.5M
+# The second count requires duration_predictor_use_speaker: true.
+model_preset: "small"  # nano, tiny, small, medium, large, or xlarge; must match the parent
 dacvae_model: "facebook/dacvae-watermarked"  # Must exactly match the parent/data contract.
 dacvae_revision: "8680102d141858a21bd533543966a2eb2e569f92"
 dacvae_filename: "weights.pth"
@@ -39,29 +43,19 @@ dacvae_latent_dim: 128
 dacvae_sample_rate: 44100
 dacvae_hop_length: 512
 
-model_size: 384
-num_layers: 12
-num_heads: 8
-intermediate_size: 1536
-
 text_vocab_size: 100312    # tiktoken cl100k_base (100277) + special tokens (10) + emotion tags (25)
-text_model_size: 320
-text_num_layers: 4
-text_num_heads: 8
-text_intermediate_size: 1280
 
 speaker_patch_size: 4  # Must match the value stored by the parent checkpoint
-speaker_model_size: 256
-speaker_num_layers: 3
-speaker_num_heads: 8
-speaker_intermediate_size: 1024
+# speaker_id is pairing/split metadata only. The model consumes speaker_latents encoded from
+# non-target reference audio, including for unseen-speaker voice cloning at inference.
 use_speaker_conditioning: false  # Enable only with a validated speaker_latents dataset
 initialize_speaker_conditioning: false  # Set true when adding it to a text-only checkpoint
 
 use_language_conditioning: false  # Enable for a versioned multilingual checkpoint
 initialize_language_conditioning: false  # Set true when adding languages to monolingual weights
 supported_languages: ["en"]  # Must match training rows and checkpoint metadata
-supported_reference_languages: null  # Exact speaker-reference language coverage
+# Exact [target, reference] pairs; preflight and inference reject undeclared combinations.
+supported_language_pairs: null  # Example: [["en", "en"], ["tr", "tr"], ["tr", "en"]]
 initialize_cross_lingual_capability: false  # Add metadata only while training matching rows
 freeze_language_embedding: false
 
@@ -81,8 +75,6 @@ duration_alignment_hidden_size: 64
 mas_duration_loss_weight: 0.1
 mas_alignment_loss_weight: 0.01
 
-timestep_embed_size: 192
-adaln_rank: 64
 norm_eps: 1.0e-6
 cfg_dropout: 0.1           # Default text/speaker conditioning dropout probability
 cfg_dropout_text: null     # Optional text-specific override; null inherits cfg_dropout
@@ -131,9 +123,9 @@ pad_token: 100286
 # Paths and Naming
 # ============================================================================
 
-save_folder: "checkpoints/nar_vae_small_sft"
+save_folder: "checkpoints/nar_vae_sft"
 project_name: "nar-vae-sft"
-run_name: "nar-vae-small-sft"
+run_name: "nar-vae-sft"
 
 # ============================================================================
 # Optional Hardware Optimizations
@@ -184,5 +176,5 @@ logging_first_step: true
 save_total_limit: 3
 save_safetensors: false
 wandb_project: "nar-vae-sft"
-wandb_run_name: "nar-vae-small-sft"
+wandb_run_name: "nar-vae-sft"
 wandb_log_model: false

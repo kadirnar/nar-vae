@@ -689,6 +689,7 @@ def _finetune(
     )
     (
         supported_reference_languages,
+        supported_language_pairs,
         initialize_cross_lingual_capability,
     ) = run_distributed_operation(
         process,
@@ -696,6 +697,7 @@ def _finetune(
             config,
             use_speaker_conditioning=use_speaker_conditioning,
             use_language_conditioning=use_language_conditioning,
+            supported_languages=supported_languages,
             pretrained_checkpoint=checkpoint_context,
         ),
         description="SFT reference-language resolution",
@@ -720,6 +722,7 @@ def _finetune(
             use_language_conditioning=use_language_conditioning,
             supported_languages=supported_languages,
             supported_reference_languages=supported_reference_languages,
+            supported_language_pairs=supported_language_pairs or None,
             use_duration_predictor=duration_options.enabled,
             duration_predictor_hidden_size=duration_options.hidden_size,
             duration_predictor_num_layers=duration_options.num_layers,
@@ -821,6 +824,7 @@ def _finetune(
             use_language_conditioning=use_language_conditioning,
             supported_languages=supported_languages,
             supported_reference_languages=supported_reference_languages,
+            supported_language_pairs=supported_language_pairs or None,
             require_language_coverage=True,
             use_mas_duration=duration_options.uses_mas,
             allow_legacy_representation=config.get("allow_legacy_representation", False),

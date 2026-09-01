@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import torch
 
 from nar_vae.dacvae import HubDACVAESource
 from nar_vae.dataset import prepare_from_hf_dataset
@@ -27,6 +29,7 @@ from nar_vae.dataset.representation import (
     build_representation_contract,
 )
 from nar_vae.dataset.sources import resolve_dataset_source
+from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 DATASET_REVISION_A = "a" * 40
 DATASET_REVISION_B = "b" * 40
@@ -69,6 +72,67 @@ def saved_dataset():
     dataset = MagicMock()
     dataset.__len__.return_value = 0
     return dataset
+
+
+class DatasetPreparationDefaultsTest(unittest.TestCase):
+    def test_every_public_preparation_path_uses_the_shared_reference_duration_default(self):
+        parameters = (
+            (DatasetPreparer, "max_speaker_ref_seconds"),
+            (prepare_dataset, "max_speaker_ref_seconds"),
+            (FileDatasetPreparer, "max_reference_duration"),
+            (prepare_from_hf_dataset, "max_reference_seconds"),
+            (DataPreparer, "max_reference_seconds"),
+            (prepare_finetune_dataset, "max_reference_seconds"),
+        )
+
+        for callable_object, parameter_name in parameters:
+            with self.subTest(callable=callable_object, parameter=parameter_name):
+                parameter = signature(callable_object).parameters[parameter_name]
+                self.assertEqual(parameter.default, DEFAULT_MAX_REFERENCE_SECONDS)
+
+    def test_every_preparer_caps_the_total_across_multiple_references(self):
+        cases = (
+            (
+                DatasetPreparer,
+                "extract_speaker_latents",
+                {"sample_rate": 10, "max_speaker_ref_samples": 12},
+            ),
+            (
+                DataPreparer,
+                "extract_speaker_latents",
+                {"sample_rate": 10, "max_reference_samples": 12},
+            ),
+            (
+                FileDatasetPreparer,
+                "encode_speaker_audio",
+                {"target_sample_rate": 10, "max_reference_duration": 1.2},
+            ),
+        )
+        references = [
+            (np.ones(10, dtype=np.float32), 10),
+            (np.ones(10, dtype=np.float32), 10),
+        ]
+
+        for preparer_class, method_name, attributes in cases:
+            with self.subTest(preparer=preparer_class.__name__):
+                preparer = preparer_class.__new__(preparer_class)
+                preparer.device = "cpu"
+                for name, value in attributes.items():
+                    setattr(preparer, name, value)
+                preparer.dacvae = SimpleNamespace(
+                    encode=MagicMock(
+                        side_effect=lambda waveform: torch.zeros(
+                            (1, 4, waveform.shape[-1]),
+                            dtype=torch.float32,
+                        )
+                    )
+                )
+
+                result = getattr(preparer, method_name)(references)
+
+                encoded = preparer.dacvae.encode.call_args.args[0]
+                self.assertEqual(tuple(encoded.shape), (1, 1, 12))
+                self.assertEqual(result.shape, (4, 12))
 
 
 class DatasetSourceContractTest(unittest.TestCase):

@@ -10,6 +10,7 @@ from nar_vae.dataset.representation import (
     TEXT_FRONTEND_NAME,
     TEXT_FRONTEND_VERSION,
 )
+from nar_vae.languages import LanguagePair
 from nar_vae.training_utils import (
     freeze_layers,
     resolve_duration_training_options,
@@ -414,8 +415,86 @@ class FreezeLayersTest(unittest.TestCase):
                 use_speaker_conditioning=True,
                 use_language_conditioning=True,
             ),
-            (("en", "ja"), False),
+            (
+                ("en", "ja"),
+                (LanguagePair("en", "en"), LanguagePair("en", "ja")),
+                False,
+            ),
         )
+
+        with self.assertRaisesRegex(ValueError, "requires exact supported_language_pairs"):
+            resolve_reference_language_training_options(
+                {},
+                use_speaker_conditioning=True,
+                use_language_conditioning=True,
+                supported_languages=("en", "es"),
+            )
+
+    def test_exact_language_pairs_are_authoritative_over_legacy_shorthand(self):
+        references, pairs, initialize = resolve_reference_language_training_options(
+            {
+                "supported_reference_languages": ["Japanese"],
+                "supported_language_pairs": [["Spanish", "English"], ["en", "ja"]],
+            },
+            use_speaker_conditioning=True,
+            use_language_conditioning=True,
+            supported_languages=("en", "es"),
+        )
+
+        self.assertEqual(references, ("en", "ja"))
+        self.assertEqual(
+            pairs,
+            (LanguagePair("es", "en"), LanguagePair("en", "ja")),
+        )
+        self.assertFalse(initialize)
+
+    def test_dataset_rejects_untrained_language_pair_and_pair_overclaim(self):
+        rows = [
+            {
+                "latents": torch.zeros(2, 3),
+                "conditioning_ids": [1],
+                "language": "es",
+                "speaker_latents": torch.zeros(2, 4),
+                "speaker_language": "en",
+            }
+        ]
+
+        validate_tts_dataset(
+            rows,
+            latent_size=2,
+            use_speaker_conditioning=True,
+            use_language_conditioning=True,
+            supported_languages=("en", "es"),
+            supported_language_pairs=(("es", "en"),),
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported target/reference language pair"):
+            validate_tts_dataset(
+                rows,
+                latent_size=2,
+                use_speaker_conditioning=True,
+                use_language_conditioning=True,
+                supported_languages=("en", "es"),
+                supported_language_pairs=(("es", "ja"),),
+            )
+        with self.assertRaisesRegex(ValueError, "language-pair coverage"):
+            validate_tts_dataset(
+                rows
+                + [
+                    {
+                        "latents": torch.zeros(2, 3),
+                        "conditioning_ids": [1],
+                        "language": "en",
+                        "speaker_latents": torch.zeros(2, 4),
+                        "speaker_language": "ja",
+                    }
+                ],
+                latent_size=2,
+                use_speaker_conditioning=True,
+                use_language_conditioning=True,
+                supported_languages=("en", "es"),
+                supported_language_pairs=(("es", "en"), ("en", "ja"), ("es", "ja")),
+                require_language_coverage=True,
+            )
 
     def test_strict_language_coverage_prevents_checkpoint_overclaiming(self):
         rows = [

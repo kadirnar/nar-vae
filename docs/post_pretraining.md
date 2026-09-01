@@ -18,8 +18,8 @@ the strict capability metadata described in the README.
 - A target utterance may never be its own reference. Select a different utterance from the same
   speaker. When the data permits, vary microphones and acoustic environments to test channel
   robustness without making either one a required grouping field.
-- Speaker IDs are data-management keys used for splitting, balancing, and pairing. They are not
-  inference-time identities.
+- Speaker IDs are data-management keys used for split validation and same-speaker reference
+  pairing. They are not model inputs or inference-time identities.
 - Target text language and reference-audio language remain independent. Cross-lingual examples use
   a target utterance in one language and a different reference utterance from the same speaker in
   another language.
@@ -72,8 +72,13 @@ from datasets import load_dataset
 
 from nar_vae.dataset import validate_zero_shot_splits
 
+DATASET_REVISION = "0123456789abcdef0123456789abcdef01234567"  # Replace with the real commit.
 splits = {
-    name: load_dataset("owner/multilingual-speech", split=name)
+    name: load_dataset(
+        "owner/multilingual-speech",
+        revision=DATASET_REVISION,
+        split=name,
+    )
     for name in ("train", "validation", "test")
 }
 summary = validate_zero_shot_splits(
@@ -90,14 +95,22 @@ Preparation applies the same-speaker/different-utterance reference rule:
 ```python
 from nar_vae.dataset import prepare_finetune_dataset
 
+DATASET_REVISION = "0123456789abcdef0123456789abcdef01234567"  # Replace with the real commit.
+
 prepare_finetune_dataset(
     "owner/multilingual-speech",
+    dataset_revision=DATASET_REVISION,
     output_dir="posttrain_data",
     split="train",
+    dacvae_model="facebook/dacvae-watermarked",
+    dacvae_revision="8680102d141858a21bd533543966a2eb2e569f92",
+    dacvae_filename="weights.pth",
+    dacvae_sha256="573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4",
+    dacvae_backend="bundled",
     speaker_id_column="speaker_id",
     utterance_id_column="utterance_id",  # Omit to derive a content-bound ID.
     language_column="language",
-    max_reference_seconds=30.0,
+    max_reference_seconds=12.0,
     reference_seed=1234,
 )
 ```
@@ -112,10 +125,10 @@ transcript-mismatched material. Keep useful but harder clean speech—names, num
 punctuation, code switching, and long-form sentences—in labeled buckets instead of allowing easy
 short sentences to dominate.
 
-Sample by language and then speaker so raw hours from one language, corpus, or prolific speaker do
-not dominate. Track hours, speakers, utterances, transcript-review rate, and target/reference pair
-counts for every language pair. Choose sampling temperatures and stage mixtures only from measured
-ablation results; this document deliberately does not present one universal ratio.
+If speaker/language balancing is needed, perform it while building the external dataset or sampler;
+the packaged trainer only frame-buckets prepared rows. Track hours, speakers, utterances,
+transcript-review rate, and target/reference pair counts for every language pair. Choose sampling
+temperatures and stage mixtures only from measured ablation results.
 
 ## Training stages after broad pretraining
 
@@ -146,8 +159,9 @@ verified: codec reconstruction quality or lower training loss alone is not a rel
 Train on same-speaker/different-utterance references. Randomize reference length within deployment
 bounds and include realistic channel variation on the reference branch while keeping target
 recordings clean enough to remain trustworthy acoustic targets. Mix same-language and true
-cross-lingual pairs from multilingual speakers. Continue independent target-language and
-reference-language conditioning throughout the batch.
+cross-lingual pairs from multilingual speakers. Continue learned target-language conditioning and
+track exact target/reference language-pair metadata throughout the batch; reference language is a
+validated capability label, not a separate model embedding.
 
 This stage targets speaker preservation without memorizing an evaluation voice. Report speaker
 similarity separately for same-language and cross-lingual pairs and stratify it by reference length,

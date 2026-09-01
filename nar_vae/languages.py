@@ -7,7 +7,7 @@ version and providing a checkpoint migration.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 LANGUAGE_CONDITIONING_VERSION = 1
@@ -161,6 +161,95 @@ class LanguagePair:
     def is_cross_lingual(self) -> bool:
         return self.reference is not None and self.reference != self.target
 
+    def as_tuple(self) -> tuple[str, str]:
+        """Return the complete pair used by training/checkpoint capability metadata."""
+        if self.reference is None:
+            raise ValueError("A supported language pair must include a reference language.")
+        return self.target, self.reference
+
+
+def normalize_language_pairs(
+    values: Iterable[LanguagePair | Sequence[str | Language]] | LanguagePair | None,
+) -> tuple[LanguagePair, ...]:
+    """Normalize and de-duplicate an ordered collection of complete language pairs."""
+    if values is None:
+        return ()
+    if isinstance(values, LanguagePair):
+        values = (values,)
+
+    normalized: list[LanguagePair] = []
+    seen: set[tuple[str, str]] = set()
+    for index, value in enumerate(values):
+        if isinstance(value, LanguagePair):
+            if value.reference is None:
+                raise ValueError(
+                    f"supported_language_pairs[{index}] must include a reference language"
+                )
+            pair = LanguagePair(
+                target=normalize_language(value.target),
+                reference=normalize_language(value.reference),
+            )
+        else:
+            if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+                raise TypeError(
+                    f"supported_language_pairs[{index}] must be a two-language sequence"
+                )
+            if len(value) != 2:
+                raise ValueError(
+                    f"supported_language_pairs[{index}] must contain target and reference"
+                )
+            pair = LanguagePair(
+                target=normalize_language(value[0]),
+                reference=normalize_language(value[1]),
+            )
+        key = pair.as_tuple()
+        if key not in seen:
+            normalized.append(pair)
+            seen.add(key)
+    if not normalized:
+        raise ValueError("supported_language_pairs must contain at least one language pair")
+    return tuple(normalized)
+
+
+def resolve_language_pair_support(
+    supported_languages: Iterable[str | Language] | str | Language | None,
+    *,
+    supported_reference_languages: Iterable[str | Language] | str | Language | None = None,
+    supported_language_pairs: (
+        Iterable[LanguagePair | Sequence[str | Language]] | LanguagePair | None
+    ) = None,
+) -> tuple[tuple[str, ...], tuple[LanguagePair, ...]]:
+    """Resolve exact pair coverage, with reference languages as a legacy shorthand.
+
+    When ``supported_language_pairs`` is supplied it is authoritative. Otherwise,
+    the legacy reference-language collection expands to its Cartesian product with
+    every supported target language.
+    """
+    targets = normalize_languages(supported_languages)
+    target_set = set(targets)
+    if supported_language_pairs is not None:
+        pairs = normalize_language_pairs(supported_language_pairs)
+        undeclared_targets = tuple(
+            dict.fromkeys(pair.target for pair in pairs if pair.target not in target_set)
+        )
+        if undeclared_targets:
+            raise ValueError(
+                "supported_language_pairs contains target languages outside "
+                f"supported_languages: {undeclared_targets!r}"
+            )
+        references = tuple(dict.fromkeys(pair.reference for pair in pairs))
+        return references, pairs
+
+    if supported_reference_languages is None:
+        return (), ()
+    references = normalize_languages(supported_reference_languages)
+    pairs = tuple(
+        LanguagePair(target=target, reference=reference)
+        for target in targets
+        for reference in references
+    )
+    return references, pairs
+
 
 __all__ = [
     "DEFAULT_LANGUAGE",
@@ -180,5 +269,7 @@ __all__ = [
     "language_from_id",
     "language_id",
     "normalize_language",
+    "normalize_language_pairs",
     "normalize_languages",
+    "resolve_language_pair_support",
 ]

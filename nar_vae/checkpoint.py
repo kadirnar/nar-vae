@@ -16,6 +16,7 @@ from nar_vae.languages import (
     LANGUAGE_CONDITIONING_VERSION,
     LANGUAGE_COUNT,
     LANGUAGE_REGISTRY_VERSION,
+    LanguagePair,
     language_from_id,
 )
 from nar_vae.models.duration import (
@@ -47,6 +48,7 @@ CROSS_LINGUAL_STATE_KEYS = {
     "cross_lingual_capability_version",
     "reference_language_registry_version",
     "supported_reference_language_ids_metadata",
+    "supported_language_pair_ids_metadata",
 }
 DURATION_METADATA_KEYS = {
     "echodit_architecture_version",
@@ -166,6 +168,7 @@ class ReferenceLanguageCheckpointInfo:
 
     enabled: bool
     supported_languages: tuple[str, ...] = ()
+    supported_pairs: tuple[LanguagePair, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -497,6 +500,32 @@ def _language_id_metadata(
     return ids
 
 
+def _language_pair_id_metadata(
+    state_dict: Mapping[str, torch.Tensor],
+    key: str,
+    error_type: type[RuntimeError],
+) -> tuple[tuple[int, int], ...]:
+    value = state_dict[key]
+    integer_dtypes = {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim != 2
+        or value.shape[1] != 2
+        or value.dtype not in integer_dtypes
+    ):
+        raise error_type(f"Checkpoint metadata {key!r} must be a rank-2 [N, 2] integer tensor.")
+    pairs = tuple((int(row[0]), int(row[1])) for row in value.tolist())
+    if not pairs or len(set(pairs)) != len(pairs):
+        raise error_type(f"Checkpoint metadata {key!r} must be non-empty and unique.")
+    return pairs
+
+
 def inspect_language_conditioning(
     state_dict: Mapping[str, torch.Tensor],
 ) -> LanguageCheckpointInfo:
@@ -595,7 +624,7 @@ def inspect_reference_language_capability(
             "Reference-language metadata requires versioned target-language conditioning."
         )
     infer_speaker_conditioning_from_state_dict(state_dict, False)
-    inspect_language_conditioning(state_dict)
+    target_capability = inspect_language_conditioning(state_dict)
 
     capability_version = _scalar_metadata(
         state_dict,
@@ -624,9 +653,43 @@ def inspect_reference_language_capability(
         supported_languages = tuple(language_from_id(value).code for value in supported_ids)
     except ValueError as exc:
         raise LegacyCrossLingualCheckpointError(str(exc)) from exc
+    supported_pair_ids = _language_pair_id_metadata(
+        state_dict,
+        "supported_language_pair_ids_metadata",
+        LegacyCrossLingualCheckpointError,
+    )
+    try:
+        supported_pairs = tuple(
+            LanguagePair(
+                target=language_from_id(target_id).code,
+                reference=language_from_id(reference_id).code,
+            )
+            for target_id, reference_id in supported_pair_ids
+        )
+    except ValueError as exc:
+        raise LegacyCrossLingualCheckpointError(str(exc)) from exc
+    undeclared_targets = tuple(
+        dict.fromkeys(
+            pair.target
+            for pair in supported_pairs
+            if pair.target not in target_capability.supported_languages
+        )
+    )
+    if undeclared_targets:
+        raise LegacyCrossLingualCheckpointError(
+            "Language-pair metadata contains targets outside the checkpoint's supported "
+            f"target languages: {undeclared_targets!r}."
+        )
+    pair_references = tuple(dict.fromkeys(pair.reference for pair in supported_pairs))
+    if pair_references != supported_languages:
+        raise LegacyCrossLingualCheckpointError(
+            "Reference-language metadata must equal the ordered reference projection of "
+            "supported_language_pair_ids_metadata."
+        )
     return ReferenceLanguageCheckpointInfo(
         enabled=True,
         supported_languages=supported_languages,
+        supported_pairs=supported_pairs,
     )
 
 
@@ -999,14 +1062,12 @@ def load_pretrained_checkpoint(
                 "checkpoint does not. Set initialize_cross_lingual_capability: true while "
                 "fine-tuning on validated cross-lingual rows."
             )
-        elif (
-            model_reference_languages.supported_languages
-            != checkpoint_reference_languages.supported_languages
-        ):
+        elif model_reference_languages != checkpoint_reference_languages:
             raise RuntimeError(
-                "The model and pretrained checkpoint declare different reference languages: "
-                f"{model_reference_languages.supported_languages!r} != "
-                f"{checkpoint_reference_languages.supported_languages!r}."
+                "The model and pretrained checkpoint declare different exact reference-"
+                "language pairs: "
+                f"{model_reference_languages.supported_pairs!r} != "
+                f"{checkpoint_reference_languages.supported_pairs!r}."
             )
     elif checkpoint_reference_languages.enabled and model_uses_speaker and model_uses_language:
         raise RuntimeError(
