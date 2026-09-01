@@ -111,10 +111,16 @@ def _load_cache_dit() -> ModuleType:
 
 
 def _cache_dit_version(module: ModuleType) -> str | None:
+    # Prefer the version exposed by the module that is actually imported. This
+    # stays correct for vendored/test modules and avoids reporting metadata for
+    # a different distribution that happens to share the environment.
+    module_version = getattr(module, "__version__", None)
+    if module_version is not None:
+        return str(module_version)
     try:
         return distribution_version("cache-dit")
     except PackageNotFoundError:
-        return getattr(module, "__version__", None)
+        return None
 
 
 def _turbo_step_mask(num_steps: int) -> list[int]:

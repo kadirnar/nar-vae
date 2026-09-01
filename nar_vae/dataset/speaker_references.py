@@ -51,6 +51,7 @@ def validate_zero_shot_splits(
     speaker_id_column: str = "speaker_id",
     utterance_id_column: str | None = None,
     language_column: str = "language",
+    audio_hash_column: str = "audio_sha256",
     required_splits: Sequence[str] = ("train", "validation", "test"),
 ) -> dict[str, Any]:
     """Validate a speaker-disjoint raw-data contract for zero-shot cloning.
@@ -66,6 +67,7 @@ def validate_zero_shot_splits(
     speakers_by_split: dict[str, set[Any]] = {}
     languages: set[str] = set()
     utterance_locations: dict[Any, tuple[str, int]] = {}
+    audio_locations: dict[str, tuple[str, int]] = {}
     total_utterances = 0
 
     for split, dataset in datasets.items():
@@ -101,6 +103,21 @@ def validate_zero_shot_splits(
                         f"{previous} and {(split, index)}."
                     )
                 utterance_locations[utterance_id] = (split, index)
+
+            if audio_hash_column in column_names:
+                audio_hash = row.get(audio_hash_column)
+                if (
+                    not isinstance(audio_hash, str)
+                    or len(audio_hash) != 64
+                    or any(character not in "0123456789abcdef" for character in audio_hash)
+                ):
+                    raise ValueError(f"Split {split!r} row {index} has an invalid audio SHA-256.")
+                if audio_hash in audio_locations:
+                    previous = audio_locations[audio_hash]
+                    raise ValueError(
+                        f"Audio content is duplicated at {previous} and {(split, index)}."
+                    )
+                audio_locations[audio_hash] = (split, index)
 
         insufficient = sorted(
             (str(speaker_id) for speaker_id, count in speaker_counts.items() if count < 2)

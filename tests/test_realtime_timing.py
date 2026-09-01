@@ -15,6 +15,7 @@ from nar_vae.caching import (
 from nar_vae.configuration import load_inference_settings
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.inference_realtime import RealtimeTTSInference, _mark_compiled_cuda_graph_step
+from nar_vae.objectives import VP_DIFFUSION_OBJECTIVE
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 
@@ -28,8 +29,16 @@ class ConstantVelocityModel(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
 
-    def forward(self, latents, conditioning_ids, timesteps, attention_mask=None):
-        del conditioning_ids, timesteps, attention_mask
+    def forward(
+        self,
+        latents,
+        conditioning_ids,
+        timesteps,
+        attention_mask=None,
+        token_language_ids=None,
+        alignment_mask=None,
+    ):
+        del conditioning_ids, timesteps, attention_mask, token_language_ids, alignment_mask
         return torch.ones_like(latents)
 
 
@@ -42,7 +51,7 @@ class RealtimeTimingTest(unittest.TestCase):
     def test_compiled_cuda_marker_fails_clearly_on_an_unsupported_torch_build(self):
         with (
             patch("nar_vae.inference_realtime.torch.compiler", object()),
-            self.assertRaisesRegex(RuntimeError, "torch>=2.7.1"),
+            self.assertRaisesRegex(RuntimeError, "torch>=2.9"),
         ):
             _mark_compiled_cuda_graph_step()
 
@@ -389,6 +398,8 @@ class RealtimeTimingTest(unittest.TestCase):
 
     def test_turbo_profile_uses_block_cache_at_the_same_step_count(self):
         tts = self.create_runtime()
+        tts.generative_objective = VP_DIFFUSION_OBJECTIVE
+        tts.diffusion_schedule_shift = 1.0
         captured = {}
 
         class FakeCacheDiTSession:
@@ -414,6 +425,7 @@ class RealtimeTimingTest(unittest.TestCase):
         def fake_sample(**kwargs):
             captured["solver_steps"] = kwargs["num_steps"]
             captured["solver"] = kwargs["solver"]
+            captured["generative_objective"] = kwargs["generative_objective"]
             captured["scm_ctx"] = kwargs["scm_ctx"]
             captured["fuse_cfg_branches"] = kwargs["fuse_cfg_branches"]
             return torch.zeros(kwargs["latent_shape"])
@@ -433,6 +445,7 @@ class RealtimeTimingTest(unittest.TestCase):
         self.assertEqual(captured["session_steps"], 16)
         self.assertEqual(captured["solver_steps"], 16)
         self.assertEqual(captured["solver"], "euler")
+        self.assertEqual(captured["generative_objective"], VP_DIFFUSION_OBJECTIVE)
         self.assertIsNone(captured["scm_ctx"])
         self.assertTrue(captured["fuse_cfg_branches"])
         legacy_cache.assert_not_called()

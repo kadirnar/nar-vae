@@ -1,216 +1,185 @@
 # NAR-VAE
 
-NAR-VAE is a non-autoregressive text-to-speech research library built around conditional flow
-matching, EchoDiT, and continuous DACVAE latents. It supports acoustic-model scratch pretraining,
-SFT, flow-native GRPO, single- and multi-GPU training, multilingual conditioning, and Cache-DiT
-inference. The separately supplied DACVAE codec remains fixed in every implemented training stage.
+NAR-VAE is a low-cost, non-autoregressive latent-diffusion TTS library for multilingual speech
+and zero-shot reference-audio voice cloning. The new checkpoint topology uses strict cosine
+variance-preserving (VP) diffusion with v-prediction, a frozen multilingual phoneme backbone, a
+compact learned voice resampler, and an unchanged DACVAE codec.
 
-> NAR-VAE does not publish a trained acoustic checkpoint yet. Quality, WER, multilingual,
-> zero-shot, latency, and streaming claims require a trained model and held-out evaluation.
+No trained NAR-VAE checkpoint is published yet. The implementation and compatibility contracts
+are ready for training, but naturalness, WER/CER, speaker similarity, and speed must be measured
+after training. Configuration profile names are not quality claims.
 
-## Setup
+## Architecture
 
-Python 3.10 or newer is required. Training is intended for an NVIDIA CUDA server.
+```text
+reviewed multilingual phones
+        |
+        v
+pinned frozen XPhoneBERT --cached states--> small trainable adapter --+
+                                                                    |
+reference audio -> unchanged DACVAE encoder -> speaker encoder       +--> small EchoDiT
+                  (sampled posterior, content-seeded externally)     |     VP v-prediction
+                                             -> 8 learned summaries  |
+                                                                    |
+Gaussian noise -----------------------------------------------------+--> DDIM/ODE
+                                                                         |
+                                                                         v
+                                                      unchanged DACVAE decoder -> audio
+```
+
+For clean DACVAE latent `x`, Gaussian noise `epsilon`, and generation-direction time
+`t in [0, 1]`:
+
+```text
+alpha(t) = sin(pi*t/2)
+sigma(t) = cos(pi*t/2)
+x_t      = alpha(t) * x + sigma(t) * epsilon
+v_target = sigma(t) * x - alpha(t) * epsilon
+```
+
+This is diffusion, not the straight rectified-flow interpolation used by Echo-TTS and Irodori.
+Legacy flow checkpoints remain loadable and are identified separately; objective and schedule
+metadata cannot be mixed.
+
+The design review, source links, accepted ideas, rejected alternatives, and required ablations are
+in [docs/research_2025_2026.md](docs/research_2025_2026.md).
+
+## Why training is relatively cheap
+
+- XPhoneBERT is frozen, runs during data preparation, and its token-aligned states are cached.
+  It is not saved in the acoustic checkpoint or evaluated at every diffusion step.
+- The canonical `small` acoustic model has about 44.85M trainable parameters with multilingual,
+  duration/MAS, and voice-cloning modules. The external text backbone and frozen codec are reported
+  separately.
+- Arbitrary-length reference state is compressed to eight learned summary tokens before DiT
+  cross-attention.
+- Target-latent `P2` packing halves the DiT time axis outside DACVAE; `P1` remains the quality
+  control and `P4` an aggressive ablation.
+- Frozen text states, target DACVAE latents, and source utterance latents are prepared once.
+- BF16, activation checkpointing, padded-attention cost batching, exact batched GPU MAS, DDP, and
+  optional Muon/AdamW are supported.
+
+Canonical trainable parameter counts for the frozen-text, voice-conditioned topology are:
+
+| Preset | Trainable acoustic parameters |
+| --- | ---: |
+| nano | 3.60M |
+| tiny | 15.32M |
+| small | 44.85M |
+| medium | 109.66M |
+| large | 284.41M |
+| xlarge | 556.22M |
+
+These counts exclude the immutable DACVAE and frozen 88M-class XPhoneBERT provider.
+
+## Install
+
+Python 3.10+ is supported. Training requires a suitable NVIDIA CUDA server.
 
 ```bash
 git clone https://github.com/kadirnar/nar-vae.git
 cd nar-vae
 python -m pip install -e .
+wandb login
 ```
 
-`pyproject.toml` is the only dependency manifest. This single installation includes training, W&B,
-testing, Cache-DiT, and the supported attention integration.
+`pyproject.toml` is the dependency manifest. W&B is required by the current training entry points;
+use `WANDB_MODE=offline` on an isolated server.
 
-## Dataset format
+## Prepare multilingual cloning data
 
-Dataset preparation accepts Hugging Face-style paired audio and text rows:
+Each raw row should contain audio, a transcript, language, stable speaker/utterance identity, and
+reviewed, provider-native phonemes compatible with the pinned XPhoneBERT vocabulary. The value
+below is deliberately a placeholder: do not copy an IPA string until your language frontend has
+been tested against the pinned tokenizer.
 
 ```python
-raw_row = {
-    "audio": {"array": waveform_float32, "sampling_rate": 48000},
-    "text": "The transcript matching this waveform.",
-    "language": "en",  # Optional multilingual label.
-    "speaker_id": "speaker-1",  # Optional dataset-only grouping key.
+{
+    "audio": {"array": waveform_float32, "sampling_rate": 44100},
+    "text": "Merhaba dünya.",
+    "phonemes": reviewed_provider_phones,
+    "language": "tr",
+    "speaker_id": "corpus-a/speaker-001",
+    "utterance_id": "corpus-a/recording-001",
 }
 ```
 
-Speaker-conditioned preparation selects another utterance from the same speaker; the target
-utterance is never used as its own voice reference. `speaker_id` is used only for pairing,
-speaker-disjoint splits, and reference selection. It is not embedded or passed to the model at
-training or inference; zero-shot cloning is conditioned by reference audio. A learned speaker-ID
-table would be closed-set and could not represent a new voice, so it is intentionally absent.
+Canonical frozen-feature preparation requires supplied phones; it does not guess G2P. Pin and
+test normalization/G2P separately for every language you intend to advertise. Unknown phones,
+unsupported control tags, mixed provider contracts, and changed artifact hashes fail closed.
 
-For multilingual cloning, set `supported_language_pairs` to exact `[target, reference]` pairs such
-as `[["en", "en"], ["tr", "tr"], ["tr", "en"]`. The checkpoint records these pairs and inference
-rejects combinations it was not trained to handle.
+Voice-cloning speakers need at least two genuinely different utterances. Preparation stores one
+target latent per utterance. During training, `DynamicReferenceDataset` selects and crops another
+same-speaker recording, so speaker IDs are never model inputs and reference arrays are not
+duplicated on disk.
 
-The prepared dataset contains:
+See [docs/train.md](docs/train.md) for provider construction and dataset preparation.
 
-```text
-latents:                 float32[latent_width, frames]
-latent_num_frames:       int
-conditioning_ids:        list[int]
-language:                str
-representation_contract: tokenizer and exact codec identity
-speaker_latents:         float32[latent_width, reference_frames]  # optional
-speaker_language:        str                                      # optional
-utterance_id:            str                                      # SFT/GRPO
-```
+## Train
 
-Preparation saves the dataset with `Dataset.save_to_disk` and writes
-`nar_vae_dataset_manifest.json`. Training verifies the dataset inventory, tokenizer contract, codec
-revision, and codec SHA-256 before loading or resuming.
-
-## Scratch-pretraining architecture
-
-Every acoustic-model component starts from random weights. The DACVAE codec is a fixed
-representation dependency, not a pretrained TTS teacher.
-
-```text
-text IDs -> trainable text encoder --------------------+
-language embedding (optional) -------------------------+
-speaker latents -> speaker encoder (optional) ---------+-> EchoDiT -> velocity
-noise + clean codec latents -> flow interpolation -----+
-clean latents + text states -> MAS/duration path -------+
-```
-
-For noise `x0`, clean codec latents `x1`, and timestep `t`:
-
-```text
-xt = (1 - t) * x0 + t * x1
-target velocity = x1 - x0
-```
-
-EchoDiT predicts the velocity. MAS produces hard monotonic token/frame alignments for the learned
-duration head and duration-expanded frame conditioning. No external language model or third-party
-TTS checkpoint initializes the acoustic model.
-
-### Model presets
-
-The packaged presets are `nano`, `tiny`, `small`, `medium`, `large`, and `xlarge`. `nano` is the
-lowest-cost tier; see the [training guide](docs/train.md#model-presets) for parameter counts. A
-larger preset does not establish better quality without a trained checkpoint and held-out
-evaluation.
-
-## Pretraining
-
-Create an editable configuration from the packaged scratch-pretraining recipe:
+Copy the base and stage configurations, then edit the dataset, output, language, and exact
+target/reference-language pairs:
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-
-import yaml
-
-from nar_vae.train import DEFAULT_TRAIN_CONFIG_PATH
-
-entry = Path(DEFAULT_TRAIN_CONFIG_PATH)
-overrides = yaml.safe_load(entry.read_text(encoding="utf-8"))
-base = yaml.safe_load((entry.parent / overrides.pop("extends")).read_text(encoding="utf-8"))
-base.update(overrides)
-Path("pretrain.yaml").write_text(yaml.safe_dump(base, sort_keys=False), encoding="utf-8")
-PY
+cp nar_vae/configs/echodit_config.yaml echodit_config.yaml
+cp nar_vae/configs/pretrain_config.yaml train.yaml
 ```
-
-Set at least these values:
-
-```yaml
-training_stage: pretrain
-model_initialization: random
-pretrained_checkpoint: null
-model_preset: small  # nano, tiny, small, medium, large, or xlarge
-
-TTS_dataset_local: ./data/prepared
-dacvae_model: facebook/dacvae-watermarked
-dacvae_revision: 8680102d141858a21bd533543966a2eb2e569f92
-dacvae_filename: weights.pth
-dacvae_backend: bundled
-dacvae_sha256: 573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4
-save_folder: ./checkpoints/nar_vae_small_pretrain
-
-report_to: wandb
-wandb_project: nar-vae-pretraining
-wandb_run_name: small-baseline
-```
-
-W&B is mandatory for pretraining, SFT, and GRPO. Authenticate normally for online logging or set
-`WANDB_MODE=offline` on an isolated server. Only rank zero creates a W&B run.
-
-Create `pretrain_job.py`:
 
 ```python
 from nar_vae.train import pretrain
 
 if __name__ == "__main__":
-    pretrain("pretrain.yaml")
+    pretrain("train.yaml")
 ```
 
-Single GPU:
+One GPU:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python pretrain_job.py
+python train_job.py
 ```
 
-Multi-GPU DDP:
+DDP:
 
 ```bash
-torchrun --standalone --nproc-per-node=8 pretrain_job.py
+torchrun --standalone --nproc-per-node=8 train_job.py
 ```
 
-### Training optimizations
+The default is `small`, strict VP diffusion, `P2` target packing, eight speaker summaries, frozen
+768-D text states, learned duration, and exact MAS. The frozen provider is a data/inference
+dependency; only its small adapter is trained.
 
-| Packaged default | Optional or tunable |
-| --- | --- |
-| BF16 mixed precision | FP32/FP16 comparison runs |
-| non-reentrant activation checkpointing | disable if memory is plentiful |
-| frame-budget batching and bucketing | tune frame budget and workers per server |
-| stratified logit-normal timestep sampling | uniform or logit-normal sampling |
-| pinned-memory loading and DDP-safe `drop_last` | DDP bucket-size tuning |
-| AdamW and gradient clipping | fused AdamW on supported CUDA builds |
-| PyTorch SDPA attention | FA3 with `NAR_VAE_USE_FA3=1` after parity tests |
-| eager execution | `torch_compile: true` after shape-bucket tests |
-| strict FP32 matmul behavior | `tf32: true` after numerical checks |
-
-The `nano`, `tiny`, and `small` presets reduce training cost. Larger presets, compilation, fused
-AdamW, TF32, and FA3 are not assumed to improve every server; measure throughput, memory,
-convergence, WER/CER, and listening quality before keeping them. FSDP is not implemented; use DDP.
-
-## Inference
-
-Inference requires a locally trained NAR-VAE export. Its manifest supplies the exact codec revision,
-filename, SHA-256, and trained capabilities. This cross-lingual cloning example requires a
-checkpoint whose manifest declares speaker conditioning, Turkish target speech, and English
-reference-audio coverage:
+## Voice-cloning inference
 
 ```python
 from nar_vae import FlowMatchingTTSInference
 
 tts = FlowMatchingTTSInference.from_preset(
     "small",
-    flow_model_path="checkpoints/nar_vae_sft/final/flow_model/pytorch_model.bin",
+    flow_model_path="checkpoints/pretrain/final/flow_model/pytorch_model.bin",
     dacvae_model="facebook/dacvae-watermarked",
     device="cuda",
 )
 
 audio = tts.synthesize_with_config(
-    "Bu cümle, İngilizce referans kaydındaki sesi kullanır.",
+    "Bu bir ses klonlama örneğidir.",
     tts.generation_profile("quality"),
-    reference_audio="reference_en.wav",
+    phonemes=reviewed_provider_phones,
+    reference_audio="speaker.wav",
     language="tr",
     reference_language="en",
 )
-tts.save_audio(audio, "clone_tr.wav")
+tts.save_audio(audio, "clone.wav")
 ```
 
-Inference verifies the model manifest, weight hashes, architecture, capabilities, tokenizer, and
-codec SHA-256. Profile names describe numerical settings, not demonstrated quality. Current
-inference returns a complete waveform after ODE integration and codec decoding; it is not streaming.
+Inference authenticates the model manifest, objective, schedule, architecture, frozen-provider
+identity, codec hash, speaker-summary topology, language capability, and requested language pair
+before model use. The provider is evaluated once per request; DDIM then reuses its cached state.
 
-## More documentation
+The packaged VP profiles use 32, 16, and 8 deterministic DDIM evaluations. Start with `quality`
+and compare all faster profiles against held-out listening, WER/CER, and speaker-similarity gates.
 
-- [Simple training guide](docs/train.md)
-- [Architecture and training](docs/architecture.md)
-- [SFT, GRPO, and evaluation](docs/post_pretraining.md)
-- [Inference optimization](docs/inference_optimization.md)
+More detail: [architecture](docs/architecture.md), [training](docs/train.md),
+[post-training](docs/post_pretraining.md), and
+[inference optimization](docs/inference_optimization.md).
 
 MIT licensed.

@@ -1,7 +1,8 @@
-# NAR-VAE Flow-Matching TTS PRETRAINING Configuration
+# NAR-VAE strict latent-diffusion TTS PRETRAINING Configuration
 #
 # This stage initializes every active acoustic-model component from random
-# weights. It never accepts an external pretrained TTS checkpoint. A same-run
+# weights while consuming cached states from an immutable frozen multilingual
+# text backbone. It never accepts an external pretrained TTS checkpoint. A same-run
 # Trainer checkpoint may be used only for exact interruption recovery.
 #
 # Prepared DACVAE latents are currently a separately versioned data dependency.
@@ -22,43 +23,70 @@ data_seed: 1337
 # DACVAE Configuration
 dacvae_model: "facebook/dacvae-watermarked"  # Hugging Face codec repository ID.
 dacvae_revision: "8680102d141858a21bd533543966a2eb2e569f92"
-dacvae_filename: "weights.pth"
 dacvae_sha256: "573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4"
 dacvae_backend: "bundled"  # Exact resolved backend: "bundled" or "fast".
 dacvae_latent_dim: 128  # Actual DACVAE latent dimension (verified from data)
 dacvae_sample_rate: 44100  # Must match every prepared row's representation contract.
 dacvae_hop_length: 512     # Must match every prepared row's representation contract.
 
-# Approximate canonical totals (base text-only / speaker + multilingual + speaker-aware duration):
-# nano 16.3M / 16.8M; tiny 40.5M / 42.7M; small 77.2M / 83.1M
-# medium 169.6M / 186.2M; large 353.9M / 387.9M; xlarge 647.1M / 690.5M
-# The second count requires duration_predictor_use_speaker: true.
-# Small remains the quality-oriented starting point; nano is the cheapest tier.
+# The frozen backbone has zero trainable parameters and runs during cache
+# preparation, not inside each acoustic-training step. Report its resident
+# parameters separately from the trainable acoustic model.
 model_preset: "small"  # nano, tiny, small, medium, large, or xlarge
 
-# Text Encoder
-text_vocab_size: 100312    # tiktoken cl100k_base (100277) + special tokens (10) + emotion tags (25)
+# Pinned XPhoneBERT features. The acoustic checkpoint contains only a 768->320
+# adapter, never the 87.6M-parameter backbone. `phonemes` requires reviewed IPA
+# or a separately pinned/tested G2P pipeline for every advertised language.
+text_conditioning_mode: "frozen_features"
+conditioning_feature_size: 768
+conditioning_feature_dtype: "float16"
+text_vocab_size: 1969
+pad_token: 1
+frozen_text_encoder_id: "vinai/xphonebert-base"
+frozen_text_encoder_revision: "cf2bc63858dec1c03880fa8f764fe2195accb1ab"
+frozen_text_config_sha256: "afe941f5c081c7b940cdac3458d7caba32c12b14d394834c236c62dcfa5c0a34"
+frozen_text_model_filename: "pytorch_model.bin"
+frozen_text_model_sha256: "3fd746d1348ceff1f7155ae12f06b841bc28f5d83fd6b6eeee640e7177555463"
+frozen_text_tokenizer_id: "vinai/xphonebert-base"
+frozen_text_tokenizer_revision: "cf2bc63858dec1c03880fa8f764fe2195accb1ab"
+frozen_text_tokenizer_filename: "tokenizer.json"
+frozen_text_tokenizer_sha256: "15d43733d44b25d9b3637647c7b790b3ff7346515656d894c8ba7904f5ca33fe"
+frozen_text_hidden_layer: -1
+frozen_text_frontend: "phonemes"
+frozen_text_alignment: "hf_non_special_tokens_v1"
+frozen_text_cache_version: 1
+
+# Patching is outside DACVAE. The x2 default halves the target attention length;
+# keep x1 as the quality control and x4 as an aggressive measured ablation.
+target_patch_size: 2
 
 # Speaker Encoder (for speaker conditioning)
 speaker_patch_size: 4      # Stored in checkpoint metadata and validated at load time
-# speaker_id is pairing/split metadata only. The model consumes speaker_latents encoded from
-# non-target reference audio, which also supports unseen-speaker voice cloning at inference.
-use_speaker_conditioning: false  # Enable only with a validated speaker_latents dataset
+speaker_num_summary_tokens: 8  # Fixed learned-query reference tokens; 0 keeps legacy topology.
+# speaker_id is pairing/split metadata only. DynamicReferenceDataset selects and crops another
+# cached utterance from the same speaker; the model consumes its codec latents, never speaker_id.
+use_speaker_conditioning: true
+reference_seed: 1337
+min_reference_seconds: 3.0
+short_reference_max_seconds: 8.0
+max_reference_seconds: 12.0
+short_reference_probability: 0.8
+dynamic_reference_strict: true
 
 # Target-language conditioning. Enable this for multilingual training and list
 # only languages actually represented in the paired text/audio dataset.
-use_language_conditioning: false
+use_language_conditioning: true
 supported_languages: ["en"]
 # Exact [target, reference] pairs for multilingual voice cloning, for example:
 # [["en", "en"], ["tr", "tr"], ["tr", "en"]]. Preflight requires every declared pair.
-supported_language_pairs: null
+supported_language_pairs: [["en", "en"]]
 
 # Versioned learned frame count. These weights are trained from target latent
 # lengths; enabling the module does not retrofit an existing checkpoint.
 use_duration_predictor: true
 duration_predictor_hidden_size: 256
 duration_predictor_num_layers: 2
-duration_predictor_use_speaker: false
+duration_predictor_use_speaker: true
 duration_loss_weight: 0.1
 duration_huber_delta: 1.0
 use_mas_duration: false  # Compatibility base; canonical pretraining overrides this.
@@ -69,7 +97,11 @@ mas_alignment_loss_weight: 0.0
 # Conditioning
 norm_eps: 1.0e-6           # Normalization epsilon
 
-# Flow Matching Configuration
+# Strict cosine-VP diffusion. Schedule/objective metadata is stored in every new checkpoint.
+generative_objective: "vp_diffusion_v"
+diffusion_schedule_shift: 1.0  # Safe v1 baseline; any shifted-schedule pilot needs new weights.
+
+# Classifier-free conditioning
 cfg_dropout: 0.1           # Default text/speaker conditioning dropout probability
 cfg_dropout_text: null     # Optional text-specific override; null inherits cfg_dropout
 cfg_dropout_speaker: null  # Optional speaker-specific override; null inherits cfg_dropout
@@ -92,6 +124,8 @@ batch_size: 8              # Per-device; tune after measuring the target GPU.
 max_frames_per_batch: 4096
 max_examples_per_batch: null  # null uses batch_size as the example-count ceiling.
 frame_bucket_size: 128
+batching_cost: "padded_attention"
+max_attention_cost_per_batch: 32000000  # Tune from measured server memory/throughput.
 allow_legacy_frame_length_inference: false  # Re-prepare old data instead of loading every latent.
 allow_legacy_representation: false  # Require versioned frontend/codec metadata on every row.
 learning_rate: 1.0e-4
@@ -106,7 +140,7 @@ save_steps: 2000
 logging_steps: 10
 
 # Layer Freezing Configuration (for pretraining)
-freeze_text_encoder: false     # Set to true to freeze text encoder (default: false = train text encoder)
+freeze_text_encoder: false     # Keep the small adapter trainable; the external backbone is frozen.
 freeze_speaker_encoder: false  # A from-scratch speaker encoder must remain trainable
 freeze_language_embedding: false  # A new language embedding must remain trainable
 freeze_first_n_layers: 0       # Number of first DiT layers to freeze (default: 0 = none frozen)
@@ -116,10 +150,6 @@ TTS_dataset: "owner/dataset"
 TTS_dataset_local: "./data/prepared"  # Requires nar_vae_dataset_manifest.json; null uses Hub.
 TTS_dataset_revision: null  # Full 40-character commit SHA when TTS_dataset_local is null.
 dataset_download_workers: 8  # Remote snapshot workers; validated in the range 1..32.
-
-# The tokenizer vocabulary and special IDs are versioned by the fixed text
-# frontend contract. Only padding is consumed by the training collator.
-pad_token: 100286
 
 # ============================================================================
 # Paths and Naming
@@ -141,6 +171,8 @@ torch_compile: false  # Optional; enable only after stable shape-bucket measurem
 dataloader_num_workers: 4
 dataloader_pin_memory: true
 dataloader_drop_last: true
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 2
 
 # ============================================================================
 # Validation
@@ -154,10 +186,19 @@ do_validation: false
 # Optimizer & Scheduler
 # ============================================================================
 
-optimizer: "adamw"  # adamw/adamw_torch; adamw_torch_fused is opt-in CUDA only.
+optimizer: "adamw"  # adamw/adamw_torch/adamw_torch_fused, or experimental muon.
 adam_beta1: 0.9
 adam_beta2: 0.999
 adam_epsilon: 1.0e-8
+# Muon uses hidden 2-D Linear weights; auxiliary parameters remain on AdamW.
+# Uncomment these only together with optimizer: "muon".
+# muon_learning_rate: 1.0e-4  # Omit to reuse learning_rate.
+# muon_weight_decay: 0.01     # Omit to reuse weight_decay.
+# muon_momentum: 0.95
+# muon_nesterov: true
+# muon_ns_steps: 5
+# muon_epsilon: 1.0e-7
+# muon_adjust_lr_fn: "match_rms_adamw"  # Reuses an AdamW-tuned LR scale.
 lr_scheduler_type: "cosine"
 
 # ============================================================================

@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from nar_vae.configuration import resolve_frame_budget_batching
 from nar_vae.dataset.sampling import FrameBudgetBatchSampler
 from nar_vae.training_data import (
+    EpochAwareFrameBudgetBatchSampler,
     FrameBudgetTrainerMixin,
+    PaddedAttentionBatchSampler,
     build_accumulation_loss_normalization,
     build_frame_budget_train_dataloader,
 )
@@ -23,13 +29,14 @@ try:
     from transformers import TrainingArguments
 
     from nar_vae.finetune import EchoDiTFineTuner
-    from nar_vae.train import EchoDiTTrainer
+    from nar_vae.train import EchoDiTTrainer, _materialize_flow_model_weights
 except (ImportError, RuntimeError):
     _TRAINING_DEPENDENCIES_AVAILABLE = False
     BatchSamplerShard = None
     DataLoaderShard = None
     EchoDiTFineTuner = None
     EchoDiTTrainer = None
+    _materialize_flow_model_weights = None
     TrainingArguments = None
     nn = None
 
@@ -54,6 +61,27 @@ class MetadataDataset:
                 "sample_id": key,
             }
         raise KeyError(key)
+
+
+class AttentionMetadataDataset(MetadataDataset):
+    column_names = (
+        "latent_num_frames",
+        "conditioning_num_tokens",
+        "speaker_num_frames",
+        "sample_id",
+    )
+
+    def __init__(self, lengths, text_lengths, speaker_lengths):
+        super().__init__(lengths)
+        self.text_lengths = list(text_lengths)
+        self.speaker_lengths = list(speaker_lengths)
+
+    def __getitem__(self, key):
+        if key == "conditioning_num_tokens":
+            return self.text_lengths
+        if key == "speaker_num_frames":
+            return self.speaker_lengths
+        return super().__getitem__(key)
 
 
 class CapturingAccelerator:
@@ -104,6 +132,109 @@ class TrainingDataLoaderTest(unittest.TestCase):
         self.assertTrue(issubclass(EchoDiTTrainer, FrameBudgetTrainerMixin))
         self.assertTrue(issubclass(EchoDiTFineTuner, FrameBudgetTrainerMixin))
 
+    def test_flow_export_hardlinks_the_existing_trainer_state_dict(self):
+        with TemporaryDirectory() as directory:
+            output = Path(directory)
+            flow_output = output / "flow_model"
+            flow_output.mkdir()
+            trainer_weights = output / "pytorch_model.bin"
+            trainer_weights.write_bytes(b"one serialized state dict")
+
+            flow_weights = _materialize_flow_model_weights(output, flow_output, object())
+
+            self.assertTrue(os.path.samefile(trainer_weights, flow_weights))
+            self.assertEqual(flow_weights.read_bytes(), trainer_weights.read_bytes())
+
+    def test_sft_export_reuses_trainer_weights_before_manifest_sealing(self):
+        import nar_vae.finetune as finetune_module
+
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "sft-export"
+            trainer = object.__new__(EchoDiTFineTuner)
+            trainer.config = {}
+            trainer.flow_model = object()
+            trainer.ema_model = None
+            trainer.parent_lineage = None
+            trainer.parent_model_manifest = None
+            trainer.is_world_process_zero = lambda: True
+            root_payload = b"one exact SFT Trainer state dict"
+
+            def save_trainer_weights(_trainer, output_dir, _internal_call=False):
+                del _trainer, _internal_call
+                destination = Path(output_dir)
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / "pytorch_model.bin").write_bytes(root_payload)
+
+            def assert_manifest_input(flow_model_dir, *_args, **kwargs):
+                root_weights = output / "pytorch_model.bin"
+                flow_weights = Path(flow_model_dir) / "pytorch_model.bin"
+                self.assertTrue(os.path.samefile(root_weights, flow_weights))
+                self.assertEqual(
+                    hashlib.sha256(flow_weights.read_bytes()).hexdigest(),
+                    hashlib.sha256(root_payload).hexdigest(),
+                )
+                self.assertEqual(kwargs["checkpoint_files"], ["pytorch_model.bin"])
+
+            with (
+                patch.object(finetune_module.Trainer, "save_model", new=save_trainer_weights),
+                patch.object(finetune_module, "write_training_lineage"),
+                patch.object(
+                    finetune_module,
+                    "write_model_manifest",
+                    side_effect=assert_manifest_input,
+                ) as write_manifest,
+                patch.object(finetune_module, "write_training_checkpoint_manifest"),
+            ):
+                trainer.save_model(output)
+
+            write_manifest.assert_called_once()
+            self.assertTrue(
+                os.path.samefile(
+                    output / "pytorch_model.bin",
+                    output / "flow_model" / "pytorch_model.bin",
+                )
+            )
+
+    def test_sft_export_keeps_cpu_state_dict_fallback_without_root_pytorch_artifact(self):
+        import nar_vae.finetune as finetune_module
+
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "sft-safetensors-export"
+            model = nn.Linear(3, 2)
+            trainer = object.__new__(EchoDiTFineTuner)
+            trainer.config = {}
+            trainer.flow_model = model
+            trainer.ema_model = None
+            trainer.parent_lineage = None
+            trainer.parent_model_manifest = None
+            trainer.is_world_process_zero = lambda: True
+
+            def save_without_pytorch_artifact(_trainer, output_dir, _internal_call=False):
+                del _trainer, _internal_call
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+            with (
+                patch.object(
+                    finetune_module.Trainer,
+                    "save_model",
+                    new=save_without_pytorch_artifact,
+                ),
+                patch.object(finetune_module, "write_training_lineage"),
+                patch.object(finetune_module, "write_model_manifest"),
+                patch.object(finetune_module, "write_training_checkpoint_manifest"),
+            ):
+                trainer.save_model(output)
+
+            exported = torch.load(
+                output / "flow_model" / "pytorch_model.bin",
+                map_location="cpu",
+                weights_only=True,
+            )
+            expected = model.state_dict()
+            self.assertEqual(exported.keys(), expected.keys())
+            for name in expected:
+                torch.testing.assert_close(exported[name], expected[name])
+
     def test_accumulation_normalization_counts_each_objective_over_full_window(self):
         first = {
             "latents": torch.zeros(1, 2, 4),
@@ -126,6 +257,47 @@ class TrainingDataLoaderTest(unittest.TestCase):
         self.assertEqual(counts.examples.item(), 3)
         self.assertEqual(counts.text_tokens.item(), 7)
         self.assertEqual(counts.alignment_frames.item(), 9)
+        self.assertTrue(counts.globally_reduced)
+        self.assertEqual(counts.world_size, 1)
+
+    def test_accumulation_normalization_uses_alignment_tokens_and_one_collective(self):
+        batch = {
+            "latents": torch.zeros(1, 2, 4),
+            "latent_mask": torch.tensor([[True, True, False, False]]),
+            "conditioning_ids": torch.ones(1, 4, dtype=torch.long),
+            "conditioning_mask": torch.tensor([[True, True, True, False]]),
+            "alignment_mask": torch.tensor([[False, True, False, False]]),
+        }
+
+        def add_remote_counts(totals, op):
+            self.assertIs(op, torch.distributed.ReduceOp.SUM)
+            totals.add_(torch.tensor([8.0, 2.0, 3.0, 4.0]))
+
+        with (
+            patch("nar_vae.training_data.dist.is_available", return_value=True),
+            patch("nar_vae.training_data.dist.is_initialized", return_value=True),
+            patch("nar_vae.training_data.dist.get_world_size", return_value=2),
+            patch(
+                "nar_vae.training_data.dist.all_reduce",
+                side_effect=add_remote_counts,
+            ) as all_reduce,
+        ):
+            counts = build_accumulation_loss_normalization([batch], torch.device("cpu"))
+
+        all_reduce.assert_called_once()
+        torch.testing.assert_close(
+            torch.stack(
+                (
+                    counts.velocity_elements,
+                    counts.examples,
+                    counts.text_tokens,
+                    counts.alignment_frames,
+                )
+            ),
+            torch.tensor([12.0, 3.0, 4.0, 6.0]),
+        )
+        self.assertTrue(counts.globally_reduced)
+        self.assertEqual(counts.world_size, 2)
 
     def test_optimizer_window_collection_supports_old_and_new_transformers_signatures(self):
         batches = [
@@ -230,6 +402,115 @@ class TrainingDataLoaderTest(unittest.TestCase):
         for batch in batches:
             self.assertLessEqual(sum(dataset.lengths[index] for index in batch), 10)
             self.assertLessEqual(len(batch), 3)
+
+    def test_padded_attention_budget_accounts_for_text_and_reference_padding(self):
+        sampler = PaddedAttentionBatchSampler(
+            [8, 8],
+            text_lengths=[2, 20],
+            speaker_frame_lengths=[4, 40],
+            max_attention_cost=1_500,
+            speaker_patch_size=2,
+            max_frames=100,
+            max_examples=2,
+            shuffle=False,
+        )
+
+        batches = list(sampler)
+
+        self.assertEqual(batches, [[0], [1]])
+        self.assertTrue(all(sampler.batch_cost(batch) <= 1_500 for batch in batches))
+        patched = PaddedAttentionBatchSampler(
+            [8],
+            text_lengths=[2],
+            speaker_frame_lengths=[4],
+            max_attention_cost=1_500,
+            speaker_patch_size=2,
+            target_patch_size=2,
+            max_frames=100,
+            max_examples=1,
+            shuffle=False,
+        )
+        self.assertLess(patched.batch_cost((0,)), sampler.batch_cost((0,)))
+
+    def test_builder_selects_padded_attention_mode_from_training_config(self):
+        trainer, _, _ = self._trainer([8, 8])
+        dataset = AttentionMetadataDataset([8, 8], [2, 20], [4, 40])
+        trainer.train_dataset = dataset
+        trainer.training_config = {
+            "batching_cost": "padded_attention",
+            "max_attention_cost_per_batch": 1_500,
+            "speaker_patch_size": 2,
+            "use_speaker_conditioning": True,
+        }
+        settings = resolve_frame_budget_batching(
+            {
+                "batch_size": 2,
+                "max_frames_per_batch": 100,
+            }
+        )
+
+        dataloader = build_frame_budget_train_dataloader(trainer, settings)
+
+        self.assertIsInstance(trainer._frame_budget_batch_sampler, PaddedAttentionBatchSampler)
+        self.assertEqual(sorted(tuple(batch) for batch in dataloader), [(0,), (1,)])
+
+    def test_padded_attention_batches_are_balanced_in_ddp_step_groups(self):
+        sampler = PaddedAttentionBatchSampler(
+            [8, 7, 6, 5, 4, 3, 2, 1],
+            text_lengths=[1] * 8,
+            speaker_frame_lengths=[0] * 8,
+            max_attention_cost=1_000,
+            speaker_patch_size=2,
+            step_world_size=2,
+            max_frames=10,
+            max_examples=1,
+            bucket_size=8,
+            seed=31,
+            shuffle=True,
+        )
+
+        batches = list(sampler)
+        cost_order = sorted(
+            range(8),
+            key=lambda index: sampler.batch_cost((index,)),
+            reverse=True,
+        )
+        expected_groups = {frozenset(cost_order[start : start + 2]) for start in range(0, 8, 2)}
+        actual_groups = {
+            frozenset(batch[0] for batch in batches[start : start + 2]) for start in range(0, 8, 2)
+        }
+
+        self.assertEqual(actual_groups, expected_groups)
+
+    def test_epoch_aware_sampler_refreshes_dynamic_reference_metadata(self):
+        class DynamicReferences:
+            def __init__(self):
+                self.epoch = 0
+
+            def set_epoch(self, epoch):
+                self.epoch = epoch
+
+            def metadata(self):
+                return [2, 2], [4 + self.epoch, 6 + self.epoch]
+
+        dataset = DynamicReferences()
+        sampler = PaddedAttentionBatchSampler(
+            [4, 4],
+            text_lengths=[2, 2],
+            speaker_frame_lengths=[4, 6],
+            max_attention_cost=1_000,
+            speaker_patch_size=2,
+            metadata_provider=dataset.metadata,
+            epoch_target=dataset,
+            max_frames=10,
+            max_examples=2,
+        )
+
+        sampler.set_epoch(3)
+
+        self.assertEqual(dataset.epoch, 3)
+        self.assertEqual(sampler.speaker_frame_lengths, (7, 9))
+        self.assertIsInstance(sampler, EpochAwareFrameBudgetBatchSampler)
 
     def test_disabled_setting_delegates_to_the_normal_trainer_loader(self):
         sentinel = object()

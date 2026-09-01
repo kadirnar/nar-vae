@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
@@ -27,6 +28,7 @@ from nar_vae.dataset.identity import (
     resolve_hub_dataset_identity,
     resolve_local_prepared_dataset_identity,
 )
+from nar_vae.dataset.utterance_store import DynamicReferenceDataset
 from nar_vae.distributed import (
     distributed_cleanup_guard,
     initialize_distributed,
@@ -36,11 +38,13 @@ from nar_vae.distributed import (
     resolve_node_consistent_value,
     run_distributed_operation,
 )
+from nar_vae.frozen_text_provider import FrozenTextProviderSpec
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
 from nar_vae.model_manifest import representation_from_config, write_model_manifest
 from nar_vae.model_presets import resolve_model_architecture
 from nar_vae.models.flow_matching import create_flow_matching_echodit
 from nar_vae.training_data import FrameBudgetTrainerMixin
+from nar_vae.training_optimizers import MuonTrainerMixin
 from nar_vae.training_utils import (
     freeze_layers,
     resolve_duration_training_options,
@@ -77,7 +81,34 @@ def _require_wandb() -> None:
         ) from exc
 
 
-class EchoDiTTrainer(FrameBudgetTrainerMixin, Trainer):
+def _materialize_flow_model_weights(
+    output_dir: str | os.PathLike[str],
+    flow_model_dir: str | os.PathLike[str],
+    model,
+) -> Path:
+    """Create the inference weight path without duplicating Trainer serialization."""
+    trainer_weights = Path(output_dir) / "pytorch_model.bin"
+    flow_weights = Path(flow_model_dir) / "pytorch_model.bin"
+    if flow_weights.exists() or flow_weights.is_symlink():
+        flow_weights.unlink()
+    if trainer_weights.is_file():
+        try:
+            os.link(trainer_weights, flow_weights)
+        except OSError:
+            shutil.copyfile(trainer_weights, flow_weights)
+        return flow_weights
+
+    # Safe fallback for explicitly requested safetensors or Trainer backends
+    # whose root artifact cannot be consumed by the inference checkpoint loader.
+    model_to_save = unwrap_training_model(model)
+    cpu_state_dict = {
+        key: value.detach().cpu() for key, value in model_to_save.state_dict().items()
+    }
+    torch.save(cpu_state_dict, flow_weights)
+    return flow_weights
+
+
+class EchoDiTTrainer(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
     """
     Trainer for EchoDiT flow matching TTS.
 
@@ -107,6 +138,8 @@ class EchoDiTTrainer(FrameBudgetTrainerMixin, Trainer):
         # Flow matching loss with stratified logit-normal timestep distribution
         self.flow_loss_fn = FlowMatchingLoss(
             sigma_min=training_config.get("flow_sigma_min", 1e-4),
+            generative_objective=training_config.get("generative_objective", "rectified_flow"),
+            diffusion_schedule_shift=training_config.get("diffusion_schedule_shift", 1.0),
             velocity_weighted=training_config.get("flow_velocity_weighted", False),
             timestep_distribution=training_config.get(
                 "timestep_distribution",
@@ -139,12 +172,18 @@ class EchoDiTTrainer(FrameBudgetTrainerMixin, Trainer):
         speaker_latent = inputs.get("speaker_latents", None)
         speaker_mask = inputs.get("speaker_mask", None)
         language_ids = inputs.get("language_ids", None)
+        token_language_ids = inputs.get("token_language_ids", None)
+        alignment_mask = inputs.get("alignment_mask", None)
+        conditioning_features = inputs.get("conditioning_features", None)
 
         loss = self.flow_loss_fn(
             model=model,
             latents=latents,
             conditioning_ids=conditioning_ids,
             conditioning_mask=conditioning_mask,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            conditioning_features=conditioning_features,
             latent_mask=latent_mask,
             speaker_latent=speaker_latent,
             speaker_mask=speaker_mask,
@@ -165,11 +204,11 @@ class EchoDiTTrainer(FrameBudgetTrainerMixin, Trainer):
         if self.is_world_process_zero():
             flow_model_dir = os.path.join(output_dir, "flow_model")
             os.makedirs(flow_model_dir, exist_ok=True)
-            model_to_save = unwrap_training_model(self.flow_model)
-            cpu_state_dict = {
-                key: value.detach().cpu() for key, value in model_to_save.state_dict().items()
-            }
-            torch.save(cpu_state_dict, os.path.join(flow_model_dir, "pytorch_model.bin"))
+            # The pretraining config defaults to the same PyTorch state-dict
+            # format required by inference. A hard link avoids serializing and
+            # storing an identical multi-GB checkpoint twice while retaining
+            # both paths expected by exact Trainer resume and model manifests.
+            _materialize_flow_model_weights(output_dir, flow_model_dir, self.flow_model)
             with open(os.path.join(flow_model_dir, "config.yaml"), "w", encoding="utf-8") as file:
                 yaml.safe_dump(self.training_config, file, sort_keys=True)
             write_training_lineage(
@@ -656,6 +695,31 @@ def _pretrain(
         ),
         description="pretraining reference-language resolution",
     )
+    if use_speaker_conditioning:
+        ds_tts = run_distributed_operation(
+            process,
+            lambda: DynamicReferenceDataset(
+                ds_tts,
+                supported_language_pairs=supported_language_pairs or None,
+                seed=config.get(
+                    "reference_seed",
+                    config.get("data_seed", config.get("seed", 1337)),
+                ),
+                min_reference_seconds=config.get("min_reference_seconds", 3.0),
+                short_reference_max_seconds=config.get(
+                    "short_reference_max_seconds",
+                    8.0,
+                ),
+                max_reference_seconds=config.get("max_reference_seconds", 12.0),
+                short_reference_probability=config.get(
+                    "short_reference_probability",
+                    0.8,
+                ),
+                speaker_patch_size=speaker_patch_size,
+                strict=config.get("dynamic_reference_strict", True),
+            ),
+            description="dynamic speaker-reference dataset construction",
+        )
     architecture = run_distributed_operation(
         process,
         lambda: resolve_model_architecture(config),
@@ -666,7 +730,11 @@ def _pretrain(
         lambda: create_flow_matching_echodit(
             latent_size=config["dacvae_latent_dim"],
             text_vocab_size=config["text_vocab_size"],
+            text_conditioning_mode=config.get("text_conditioning_mode", "scratch_tokens"),
+            conditioning_feature_size=config.get("conditioning_feature_size"),
             speaker_patch_size=speaker_patch_size,
+            speaker_num_summary_tokens=config.get("speaker_num_summary_tokens", 0),
+            target_patch_size=config.get("target_patch_size", 1),
             **architecture.model_kwargs(),
             norm_eps=config.get("norm_eps", 1e-6),
             cfg_dropout=config.get("cfg_dropout", 0.1),
@@ -683,6 +751,8 @@ def _pretrain(
             duration_predictor_use_speaker=duration_options.uses_speaker,
             use_mas_duration=duration_options.uses_mas,
             duration_alignment_hidden_size=duration_options.alignment_hidden_size,
+            generative_objective=config.get("generative_objective", "rectified_flow"),
+            diffusion_schedule_shift=config.get("diffusion_schedule_shift", 1.0),
         ),
         description="pretraining model construction",
     )
@@ -736,6 +806,15 @@ def _pretrain(
             supported_language_pairs=supported_language_pairs or None,
             require_language_coverage=True,
             use_mas_duration=duration_options.uses_mas,
+            text_conditioning_mode=config.get("text_conditioning_mode", "scratch_tokens"),
+            conditioning_feature_size=config.get("conditioning_feature_size"),
+            frozen_text_provider_spec=(
+                FrozenTextProviderSpec.from_config(config)
+                if config.get("text_conditioning_mode", "scratch_tokens") == "frozen_features"
+                else None
+            ),
+            text_vocab_size=config.get("text_vocab_size"),
+            text_pad_token=config.get("pad_token"),
             allow_legacy_representation=config.get("allow_legacy_representation", False),
             expected_codec_source=config.get("dacvae_model"),
             expected_codec_backend=config.get("dacvae_backend"),

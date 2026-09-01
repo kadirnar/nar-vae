@@ -33,6 +33,7 @@ class DummyRealtimeTTS:
         self.sample_rate = 16
         self.hop_length = 4
         self.closed = False
+        self.calls = []
 
     @staticmethod
     def _effective_cfg(**kwargs):
@@ -44,7 +45,7 @@ class DummyRealtimeTTS:
         )
 
     def synthesize_fast(self, text, **kwargs):
-        del text, kwargs
+        self.calls.append((text, kwargs))
         return torch.zeros(16), {
             "ttft": 0.1,
             "ttfa": 0.7,
@@ -158,6 +159,11 @@ class SolverBenchmarkTest(unittest.TestCase):
                     output=output,
                     markdown=markdown,
                     audio_dir=audio_dir,
+                    language="es",
+                    reference_audio=torch.ones(32),
+                    reference_sample_rate=16,
+                    reference_language="en",
+                    phonemes=("o", "l", "a"),
                 )
 
         self.assertIs(runtime_factory.call_args.kwargs["flow_model_path"], source)
@@ -170,6 +176,20 @@ class SolverBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["model"]["artifacts"]["selected"]["path"], "weights/ema.bin")
         self.assertEqual(result["model"]["artifacts"]["base"]["path"], "weights/base.bin")
         self.assertTrue(result["model"]["capabilities"]["monotonic_alignment"])
+        self.assertEqual(
+            result["configuration"]["language_pair"],
+            {"target": "es", "reference": "en", "cross_lingual": True},
+        )
+        self.assertEqual(
+            result["configuration"]["text_conditioning"],
+            {"phonemes": ["o", "l", "a"], "language_spans": None},
+        )
+        self.assertEqual(len(runtime.calls), len(SOLVERS))
+        for _, kwargs in runtime.calls:
+            self.assertEqual(kwargs["language"], "es")
+            self.assertEqual(kwargs["reference_language"], "en")
+            self.assertEqual(kwargs["phonemes"], ("o", "l", "a"))
+            torch.testing.assert_close(kwargs["reference_audio"], torch.ones(32))
         self.assertTrue(runtime.closed)
 
 

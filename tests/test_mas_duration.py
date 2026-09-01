@@ -24,6 +24,7 @@ from nar_vae.checkpoint import (
 from nar_vae.dacvae import HubDACVAESource
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss, _global_valid_mean
+from nar_vae.model_manifest import text_conditioning_from_config
 from nar_vae.models.dit import LowRankAdaLN
 from nar_vae.models.duration import (
     DurationAlignmentOutput,
@@ -328,6 +329,27 @@ class MASFlowTrainingTest(unittest.TestCase):
         result.backward()
         torch.testing.assert_close(numerator.grad, torch.tensor(0.2))
 
+    def test_pre_reduced_window_count_avoids_per_objective_collectives(self):
+        numerator = torch.tensor(6.0, requires_grad=True)
+        with (
+            patch("nar_vae.losses.flow_matching_loss.dist.is_available", return_value=True),
+            patch("nar_vae.losses.flow_matching_loss.dist.is_initialized", return_value=True),
+            patch("nar_vae.losses.flow_matching_loss.dist.get_world_size", return_value=2),
+            patch("nar_vae.losses.flow_matching_loss.dist.all_reduce") as all_reduce,
+        ):
+            result = _global_valid_mean(
+                numerator,
+                torch.tensor(2),
+                accumulation_count=torch.tensor(10),
+                accumulation_is_global=True,
+                normalization_world_size=2,
+            )
+
+        all_reduce.assert_not_called()
+        torch.testing.assert_close(result, torch.tensor(1.2))
+        result.backward()
+        torch.testing.assert_close(numerator.grad, torch.tensor(0.2))
+
     def test_accumulation_window_denominator_weights_ragged_microbatches_exactly(self):
         parameter = torch.tensor(2.0, requires_grad=True)
         first = _global_valid_mean(
@@ -390,12 +412,13 @@ class MASCheckpointTest(unittest.TestCase):
             patch(
                 "nar_vae.inference.load_model_manifest",
                 return_value=SimpleNamespace(
+                    text_conditioning=text_conditioning_from_config({}),
                     representation={
                         "codec_source": codec_id,
                         "codec_revision": codec_revision,
                         "codec_filename": "weights.pth",
                         "codec_sha256": "a" * 64,
-                    }
+                    },
                 ),
             ),
             patch("nar_vae.inference.validate_inference_manifest") as validate_manifest,

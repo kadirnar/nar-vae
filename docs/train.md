@@ -1,10 +1,13 @@
 # Training
 
-This example trains the NAR-VAE acoustic model. The pinned DACVAE codec is downloaded from the
-Hugging Face Hub and kept frozen. The default `small` model has **77,210,945 total parameters**,
-all trainable. This count excludes the codec, optimizer state, gradients, and activations.
+Canonical NAR-VAE training learns a small acoustic diffusion model from random initialization. It
+does not learn a text Transformer from token IDs. A pinned XPhoneBERT provider is frozen, evaluated
+during preparation, and reduced to cached token-aligned states. DACVAE is also frozen and remains
+unchanged.
 
-Training is intended for an NVIDIA CUDA server. No training is run during installation.
+No trained checkpoint is bundled. The configuration is a reproducible starting point; quality,
+speaker similarity, language coverage, memory, and training time must be measured on the selected
+data and hardware.
 
 ## 1. Install
 
@@ -13,105 +16,150 @@ python -m pip install -e .
 wandb login
 ```
 
-W&B is required. On an offline server, use `WANDB_MODE=offline` instead of logging in.
+The training entry points currently require W&B. Use `WANDB_MODE=offline` on an isolated server.
+Training requires a suitable NVIDIA GPU; dataset preparation may be distributed as well.
 
-## Model presets
+## 2. Build the text contract before preparing audio
 
-Counts are approximate and exclude the frozen codec. The second column is the canonical text-only
-topology; the third also enables speaker, multilingual, and speaker-aware duration conditioning.
+The canonical frontend consumes the exact phoneme sequence expected by XPhoneBERT. It never
+silently runs an unversioned G2P system and never substitutes an unknown phone. Each raw row needs
+audio, transcript, language, stable speaker and utterance identities, and reviewed provider-native
+phones:
 
-| Preset | Base | Fully conditioned |
-| --- | ---: | ---: |
-| `nano` | 16.3M | 16.8M |
-| `tiny` | 40.5M | 42.7M |
-| `small` | 77.2M | 83.1M |
-| `medium` | 169.6M | 186.2M |
-| `large` | 353.9M | 387.9M |
-| `xlarge` | 647.1M | 690.5M |
+```python
+{
+    "audio": {"array": waveform_float32, "sampling_rate": 44100},
+    "text": "The exact transcript.",
+    "phonemes": reviewed_provider_phones,
+    "language": "en",
+    "speaker_id": "corpus-a/speaker-001",
+    "utterance_id": "corpus-a/recording-001",
+}
+```
 
-Use `nano` for the lowest-cost experiments. Preset size alone does not establish audio quality.
+XPhoneBERT uses whitespace-separated phone units and the U+2581 `▁` word-boundary unit. Create
+the phones with a pinned normalization, segmentation, and G2P pipeline for each language, inspect
+its unknown-phone rate, and version that pipeline with the dataset. Do not copy a plausible-looking
+IPA example from this documentation and assume it belongs to the provider vocabulary.
 
-## 2. Prepare the mini dataset
+The acoustic config pins the provider repository, full commit, artifact hashes, vocabulary/PAD,
+hidden layer, output dtype, alignment policy, and cache version. Load that same config for dataset
+preparation:
 
-The example uses
-[`SynDataLab-EN-Refs/echo-ref-speakers-4k-en`](https://huggingface.co/datasets/SynDataLab-EN-Refs/echo-ref-speakers-4k-en/tree/28bbd4e65dd6d5ec4da30e21e8999c33b20a902f)
-at revision `28bbd4e65dd6d5ec4da30e21e8999c33b20a902f`. It contains 4,000 synthetic
-English rows with `audio`, `text`, and `speaker_id` columns.
+```python
+from pathlib import Path
 
-The dataset card declares no license. Confirm that you have permission to use it before training.
-The card says its audio was generated with `jordand/echo-tts-base`; NAR-VAE does not load that
-model, but it is part of the data provenance. Each speaker ID occurs only once, so there is no
-different same-speaker utterance to use as a safe reference. This example therefore cannot train
-voice cloning. `speaker_id` is only pairing and split metadata; it is never a model or inference
-input. The model uses reference-audio latents instead of a closed-set speaker-ID embedding so that
-an unseen voice can be supplied at inference time.
+import yaml
 
-Create `prepare_data.py`:
+model_config = yaml.safe_load(
+    Path("nar_vae/configs/echodit_config.yaml").read_text(encoding="utf-8")
+)
+```
+
+Passing ``frozen_text_config=model_config`` below constructs the provider only after distributed
+initialization has selected each process's local CUDA device. The first construction downloads and
+hash-verifies the pinned artifacts. The external model is in evaluation mode, has gradients
+disabled, and is not inserted into the acoustic model. For a single-process pipeline that reuses an
+already loaded provider, ``FrozenTextProvider.from_config(...)`` and ``frozen_text_provider=...``
+remain available explicitly.
+
+## 3. Prepare a multilingual cloning dataset
 
 ```python
 from nar_vae.dataset import prepare_from_hf_dataset
 
 prepare_from_hf_dataset(
-    dataset_name="SynDataLab-EN-Refs/echo-ref-speakers-4k-en",
-    dataset_revision="28bbd4e65dd6d5ec4da30e21e8999c33b20a902f",
+    dataset_name="owner/speech-corpus",
+    dataset_revision="FULL_40_CHARACTER_COMMIT_SHA",
     split="train",
-    output_dir="data/echo-ref-4k",
+    output_dir="data/prepared",
+    audio_column="audio",
+    text_column="text",
+    phonemes_column="phonemes",
+    language_column="language",
+    speaker_id_column="speaker_id",
+    utterance_id_column="utterance_id",
     dacvae_model="facebook/dacvae-watermarked",
     dacvae_revision="8680102d141858a21bd533543966a2eb2e569f92",
-    dacvae_filename="weights.pth",
     dacvae_sha256="573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4",
     dacvae_backend="bundled",
-    language="en",
+    frozen_text_config=model_config,
     device="cuda",
 )
 ```
 
-Run it on the server:
+Every prepared row binds the provider contract and stores IDs, frozen states, attention/alignment
+masks, token-language IDs, cache dtype/version, and contract SHA. Training preflight rejects mixed
+providers, IDs outside the provider vocabulary, changed cache versions, wrong feature widths or
+dtypes, invalid masks, non-finite values, and codec/frontend mismatches.
+
+Representation contract v3 also binds `codec_encoding_policy=posterior_sample_seeded_v1`.
+DACVAE's learned posterior remains unchanged and sampled; NAR-VAE derives a call-local seed from
+the exact mono float32 waveform after resampling and any reference truncation, together with the
+authenticated codec SHA-256. Re-preparing identical content therefore reproduces its latent on the
+same device/backend without consuming process-global RNG state. Posterior-mean encoding is not a
+compatible shortcut. Contract-v2 datasets must be prepared again rather than mixed into a v3 run.
+
+For code-switching, supply `language_spans_column`; every span must contain provider-native phones
+and its own language. A provider token may not cross a language boundary.
+
+For zero-shot voice cloning, use speakers with at least two genuinely different recordings. Keep
+training, validation, and test speakers disjoint. Preparation stores each utterance latent once.
+`DynamicReferenceDataset` selects another same-speaker utterance during training, verifies distinct
+utterance/audio identity, and takes a bounded deterministic crop. `speaker_id` is used only for
+pairing and split checks; it is never a model input.
+
+## 4. Configure pretraining
 
 ```bash
-python prepare_data.py
+cp nar_vae/configs/echodit_config.yaml echodit_config.yaml
+cp nar_vae/configs/pretrain_config.yaml train.yaml
 ```
 
-## 3. Create the configuration
-
-```bash
-cp nar_vae/configs/echodit_config.yaml train.yaml
-```
-
-Edit these values in `train.yaml`:
+Keep `train.yaml` beside its copied base or update its `extends` path. Edit the dataset, output, and
+the exact supported language pairs:
 
 ```yaml
-dacvae_model: facebook/dacvae-watermarked
-dacvae_revision: 8680102d141858a21bd533543966a2eb2e569f92
-dacvae_filename: weights.pth
-dacvae_sha256: 573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4
-dacvae_sample_rate: 44100
-dacvae_hop_length: 512
+TTS_dataset_local: ./data/prepared
+save_folder: ./checkpoints/pretrain
+model_preset: small
 
-model_preset: small  # nano, tiny, small, medium, large, or xlarge
-use_speaker_conditioning: false
-use_language_conditioning: false
-supported_languages: [en]
-supported_language_pairs: null
+text_conditioning_mode: frozen_features
+conditioning_feature_size: 768
+freeze_text_encoder: false  # trains the small adapter; the provider stays external/frozen
 
+generative_objective: vp_diffusion_v
+diffusion_schedule_shift: 1.0
+target_patch_size: 2
+speaker_num_summary_tokens: 8
+
+use_speaker_conditioning: true
+use_language_conditioning: true
+supported_languages: [en, tr]
+supported_language_pairs:
+  - [en, en]
+  - [tr, tr]
+  - [tr, en]
+
+use_duration_predictor: true
 use_mas_duration: true
-mas_duration_loss_weight: 0.1
-mas_alignment_loss_weight: 0.01
-
-TTS_dataset_local: ./data/echo-ref-4k
-save_folder: ./checkpoints/nar_vae_small_pretrain
 
 report_to: wandb
 wandb_project: nar-vae-pretraining
-wandb_run_name: echo-ref-4k-small
+wandb_run_name: small-multilingual-vp
 ```
 
-The Hub revision and SHA-256 pin the exact codec artifact. The sample rate, hop length, and latent
-width must also match the prepared dataset.
+Only declare languages and target/reference pairs present in the prepared data. The preflight
+coverage check rejects unsupported declarations. `diffusion_schedule_shift: 1.0` is the unshifted
+cosine-VP baseline and is stored in every checkpoint; changing it requires new training.
 
-## 4. Train
+The canonical `small` topology has about 44.85M trainable acoustic parameters. XPhoneBERT and the
+immutable codec are reported separately. `P2` target packing and eight reference summaries are
+checkpoint architecture, not settings that may be changed later at inference.
 
-Create `train_job.py`:
+## 5. Start training
+
+Save a guarded entry point as `train_job.py`:
 
 ```python
 from nar_vae.train import pretrain
@@ -123,53 +171,70 @@ if __name__ == "__main__":
 One GPU:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_job.py
+python train_job.py
 ```
 
-Multiple GPUs:
+DDP, one process per GPU:
 
 ```bash
 torchrun --standalone --nproc-per-node=8 train_job.py
 ```
 
-Checkpoints are written under `save_folder`. This mini dataset is useful for checking that the
-pipeline works; it is not enough to demonstrate production speech quality or low WER.
+Exact interruption recovery may use a checkpoint from the same run. Pretraining rejects external
+TTS weights. The frozen text states are data dependencies, not pretrained acoustic weights.
 
-## 5. Reference-audio inference
+## Cost controls and required comparisons
 
-After training a speaker-conditioned multilingual checkpoint on suitable multi-speaker data, use
-reference audio directly. The checkpoint must declare the requested target/reference language
-coverage:
+| Setting | Canonical choice | Gate |
+| --- | --- | --- |
+| Model preset | `small` | Compare `nano`, `tiny`, and `small` at equal data/steps. |
+| Target packing | `P2` | Keep `P1` as quality control; treat `P4` as aggressive. |
+| Reference summaries | 8 | Compare 4/8/16 and the legacy uncompressed path. |
+| Precision | BF16 | Keep FP32 numerical checks; use BF16 only on suitable hardware. |
+| Batching | Padded-attention cost budget | Tune the budget from measured memory and throughput. |
+| Activation checkpointing | Enabled | Trades compute for memory. |
+| Optimizer | AdamW | Muon/AdamW and fused AdamW are measured experiments. |
+| MAS | Exact batched GPU path | Monitor failed/degenerate alignments by language. |
+| Compilation | Off initially | Enable after shapes/buckets are stable and parity-tested. |
 
-```yaml
-use_speaker_conditioning: true
-use_language_conditioning: true
-supported_languages: [en, tr]
-supported_language_pairs:
-  - [en, en]
-  - [tr, tr]
-  - [tr, en]
-```
+At minimum, report GPU-hours, peak memory, examples and audio seconds per second, convergence,
+WER/CER per language, speaker similarity per target/reference pair, duration error, repetition and
+truncation, and blinded listening results. The `quality`, `balanced`, and `fast` sampler names are
+not substitutes for those measurements.
 
-Each training row needs a different-utterance `speaker_latents` reference and matching `language`
-and `speaker_language` metadata. Dataset preflight requires every declared pair before training.
+Run release evaluation outside the training loop on a speaker-disjoint, immutable split. The
+library's `cross_lingual_quality_report` combines a target-language ASR transcript and embeddings
+from a pinned external speaker verifier, but it deliberately has no universal thresholds:
 
 ```python
-from nar_vae import FlowMatchingTTSInference
+from nar_vae.quality import cross_lingual_quality_report
 
-tts = FlowMatchingTTSInference.from_preset(
-    "small",
-    flow_model_path="checkpoints/nar_vae_sft/final/flow_model/pytorch_model.bin",
-    dacvae_model="facebook/dacvae-watermarked",
-    device="cuda",
-)
-
-audio = tts.synthesize_with_config(
-    "Bu bir çok dilli ses klonlama örneğidir.",
-    tts.generation_profile("quality"),
-    reference_audio="reference_en.wav",
-    language="tr",
+report = cross_lingual_quality_report(
+    reference_text=target_transcript,
+    hypothesis_text=pinned_asr_transcript,
+    reference_speaker_embedding=reference_embedding,
+    synthesized_speaker_embedding=generated_embedding,
+    target_language="tr",
     reference_language="en",
+    asr_model=pinned_asr_identity,
+    speaker_verification_model=pinned_verifier_identity,
+    maximum_error_rate=predeclared_pair_wer_gate,
+    minimum_speaker_similarity=predeclared_pair_similarity_gate,
 )
-tts.save_audio(audio, "clone_tr.wav")
 ```
+
+Choose gates before evaluating a checkpoint and report each declared target/reference-language
+pair separately. The bundled waveform evaluator is English-only; multilingual release testing
+requires language-appropriate, revision-pinned ASR models.
+
+## SFT and post-training
+
+Population-level SFT uses `nar_vae/configs/finetune_config.yaml` and must match the parent objective,
+schedule, provider, codec, target packing, reference summaries, language registry, duration, and
+MAS topology exactly. It is not single-speaker adaptation and must preserve speaker-disjoint
+evaluation.
+
+The implemented GRPO stage is rectified-flow-native and rejects canonical VP checkpoints. A
+diffusion-native policy likelihood and replay contract must be derived and tested before GRPO can
+be used on this model. Teacher distillation is also deferred until a strong 32-evaluation VP
+checkpoint exists.

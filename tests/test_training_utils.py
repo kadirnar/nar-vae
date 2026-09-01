@@ -1,16 +1,23 @@
 """Tests for shared training helpers."""
 
 import unittest
+from dataclasses import replace
 
 import torch
 
+from nar_vae.dacvae_encoding import DACVAE_POSTERIOR_SAMPLING_POLICY
 from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_COLUMN,
     REPRESENTATION_CONTRACT_VERSION,
     TEXT_FRONTEND_NAME,
     TEXT_FRONTEND_VERSION,
 )
-from nar_vae.languages import LanguagePair
+from nar_vae.frozen_text_provider import (
+    FROZEN_TEXT_REPRESENTATION_NAME,
+    FROZEN_TEXT_REPRESENTATION_VERSION,
+    FrozenTextProviderSpec,
+)
+from nar_vae.languages import LanguagePair, language_id
 from nar_vae.training_utils import (
     freeze_layers,
     resolve_duration_training_options,
@@ -43,9 +50,57 @@ class FreezeLayersTest(unittest.TestCase):
             "codec_revision": None,
             "codec_filename": None,
             "codec_sha256": "f" * 64,
+            "codec_encoding_policy": DACVAE_POSTERIOR_SAMPLING_POLICY,
             "sample_rate": 44100,
             "hop_length": 512,
             "latent_width": 2,
+        }
+
+    @staticmethod
+    def frozen_text_spec() -> FrozenTextProviderSpec:
+        return FrozenTextProviderSpec(
+            text_conditioning_mode="frozen_features",
+            text_vocab_size=23,
+            pad_token=1,
+            conditioning_feature_size=4,
+            conditioning_feature_dtype="float16",
+            frozen_text_alignment="hf_non_special_tokens_v1",
+            frozen_text_cache_version=1,
+            frozen_text_config_sha256="a" * 64,
+            frozen_text_encoder_id="example/encoder",
+            frozen_text_encoder_revision="a" * 40,
+            frozen_text_frontend="phonemes",
+            frozen_text_hidden_layer=-1,
+            frozen_text_model_filename="model.safetensors",
+            frozen_text_model_sha256="b" * 64,
+            frozen_text_tokenizer_filename="tokenizer.json",
+            frozen_text_tokenizer_id="example/tokenizer",
+            frozen_text_tokenizer_revision="a" * 40,
+            frozen_text_tokenizer_sha256="c" * 64,
+        )
+
+    @classmethod
+    def frozen_row(cls) -> dict[str, object]:
+        spec = cls.frozen_text_spec()
+        representation = cls.representation_contract()
+        representation.update(
+            text_frontend_name=FROZEN_TEXT_REPRESENTATION_NAME,
+            text_frontend_version=FROZEN_TEXT_REPRESENTATION_VERSION,
+        )
+        english = language_id("en")
+        return {
+            "latents": torch.zeros(2, 4),
+            "conditioning_ids": [0, 5, 2],
+            "conditioning_features": torch.zeros(3, 4, dtype=torch.float16),
+            "conditioning_mask": [True, True, True],
+            "conditioning_feature_dtype": "float16",
+            "frozen_text_cache_version": 1,
+            "frozen_text_contract_sha256": spec.contract_sha256,
+            "language": "en",
+            "language_id": english,
+            "token_language_ids": [0, english, 0],
+            "alignment_mask": [False, True, False],
+            REPRESENTATION_CONTRACT_COLUMN: representation,
         }
 
     def test_freezes_requested_encoders_and_leading_dit_blocks(self):
@@ -232,6 +287,62 @@ class FreezeLayersTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid speaker_latents"):
             validate_tts_dataset(rows, latent_size=2, use_speaker_conditioning=True)
 
+    def test_frozen_preflight_authenticates_atomic_provider_cache_rows(self):
+        spec = self.frozen_text_spec()
+
+        def validate(row, *, selected_spec=spec, vocab=23, pad=1):
+            validate_tts_dataset(
+                [row],
+                latent_size=2,
+                use_speaker_conditioning=False,
+                text_conditioning_mode="frozen_features",
+                conditioning_feature_size=4,
+                frozen_text_provider_spec=selected_spec,
+                text_vocab_size=vocab,
+                text_pad_token=pad,
+                allow_legacy_representation=False,
+            )
+
+        validate(self.frozen_row())
+        corruptions = {
+            "contract": ("frozen_text_contract_sha256", "d" * 64, "contract"),
+            "version": ("frozen_text_cache_version", 2, "cache_version"),
+            "boolean_version": ("frozen_text_cache_version", True, "cache_version"),
+            "dtype": ("conditioning_feature_dtype", "float32", "feature_dtype"),
+            "token_bound": ("conditioning_ids", [0, 24, 2], "must be in"),
+            "pad": ("conditioning_ids", [0, 1, 2], "provider PAD"),
+            "language_bound": (
+                "token_language_ids",
+                [0, 10_000, 0],
+                "integer IDs",
+            ),
+            "alignable_language": (
+                "token_language_ids",
+                [0, 0, 0],
+                "null language",
+            ),
+            "undeclared_language": (
+                "token_language_ids",
+                [0, language_id("tr"), 0],
+                "undeclared languages",
+            ),
+            "numeric_mask": ("alignment_mask", [0, 1, 0], "rank-one boolean"),
+            "bos_alignment": ("alignment_mask", [True, True, False], "BOS/EOS"),
+        }
+        for name, (field, value, message) in corruptions.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
+                row = self.frozen_row()
+                row[field] = value
+                validate(row)
+
+        changed_vocab_spec = replace(spec, text_vocab_size=24)
+        row = self.frozen_row()
+        with self.assertRaisesRegex(ValueError, "hashed frozen provider contract"):
+            validate(row, selected_spec=changed_vocab_spec)
+        changed_pad_spec = replace(spec, pad_token=2)
+        with self.assertRaisesRegex(ValueError, "hashed frozen provider contract"):
+            validate(row, selected_spec=changed_pad_spec)
+
     def test_persisted_latent_frame_count_must_match_the_array(self):
         rows = [
             {
@@ -258,11 +369,15 @@ class FreezeLayersTest(unittest.TestCase):
             {
                 "latents": torch.zeros(2, 3),
                 "conditioning_ids": [1],
+                "token_language_ids": [language_id("en")],
+                "alignment_mask": [True],
                 REPRESENTATION_CONTRACT_COLUMN: self.representation_contract(),
             },
             {
                 "latents": torch.zeros(2, 4),
                 "conditioning_ids": [2],
+                "token_language_ids": [language_id("en")],
+                "alignment_mask": [True],
                 REPRESENTATION_CONTRACT_COLUMN: self.representation_contract(),
             },
         ]
@@ -277,7 +392,14 @@ class FreezeLayersTest(unittest.TestCase):
             expected_hop_length=512,
         )
 
-        legacy = [{"latents": torch.zeros(2, 3), "conditioning_ids": [1]}]
+        legacy = [
+            {
+                "latents": torch.zeros(2, 3),
+                "conditioning_ids": [1],
+                "token_language_ids": [language_id("en")],
+                "alignment_mask": [True],
+            }
+        ]
         with self.assertRaisesRegex(ValueError, "representation_contract"):
             validate_tts_dataset(
                 legacy,
@@ -297,11 +419,47 @@ class FreezeLayersTest(unittest.TestCase):
                 allow_legacy_representation=False,
             )
 
+    def test_training_rejects_missing_wrong_or_unknown_codec_encoding_policy(self):
+        base = {
+            "latents": torch.zeros(2, 3),
+            "conditioning_ids": [1],
+            "token_language_ids": [language_id("en")],
+            "alignment_mask": [True],
+        }
+        mutations = {
+            "missing": lambda contract: contract.pop("codec_encoding_policy"),
+            "wrong": lambda contract: contract.__setitem__(
+                "codec_encoding_policy",
+                "posterior_mean_v1",
+            ),
+            "unknown": lambda contract: contract.__setitem__("codec_seed", 1),
+        }
+
+        for name, mutate in mutations.items():
+            contract = self.representation_contract()
+            mutate(contract)
+            row = {**base, REPRESENTATION_CONTRACT_COLUMN: contract}
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "representation contract|codec_encoding_policy",
+                ),
+            ):
+                validate_tts_dataset(
+                    [row],
+                    latent_size=2,
+                    use_speaker_conditioning=False,
+                    allow_legacy_representation=False,
+                )
+
     def test_training_configuration_must_match_the_prepared_codec_contract(self):
         rows = [
             {
                 "latents": torch.zeros(2, 3),
                 "conditioning_ids": [1],
+                "token_language_ids": [language_id("en")],
+                "alignment_mask": [True],
                 REPRESENTATION_CONTRACT_COLUMN: self.representation_contract(),
             }
         ]
@@ -536,6 +694,52 @@ class FreezeLayersTest(unittest.TestCase):
                 supported_reference_languages=("en", "ja"),
                 require_language_coverage=True,
             )
+
+    def test_dynamic_reference_topology_prevents_epoch_sampling_false_negative(self):
+        class DynamicCoverageRows:
+            column_names = (
+                "latents",
+                "conditioning_ids",
+                "language",
+                "speaker_latents",
+                "speaker_language",
+            )
+
+            def __init__(self):
+                self.rows = [
+                    {
+                        "latents": torch.zeros(2, 3),
+                        "conditioning_ids": [1],
+                        "language": "es",
+                        "speaker_latents": torch.zeros(2, 4),
+                        # This epoch sampled English, but Japanese is also a
+                        # valid candidate for the same target topology.
+                        "speaker_language": "en",
+                    }
+                ]
+                self.available_language_pairs = (
+                    LanguagePair("es", "en"),
+                    LanguagePair("es", "ja"),
+                )
+
+            def reference_pair_coverage(self):
+                return self.available_language_pairs
+
+            def __len__(self):
+                return len(self.rows)
+
+            def __getitem__(self, index):
+                return self.rows[index]
+
+        validate_tts_dataset(
+            DynamicCoverageRows(),
+            latent_size=2,
+            use_speaker_conditioning=True,
+            use_language_conditioning=True,
+            supported_languages=("es",),
+            supported_language_pairs=(("es", "en"), ("es", "ja")),
+            require_language_coverage=True,
+        )
 
 
 if __name__ == "__main__":

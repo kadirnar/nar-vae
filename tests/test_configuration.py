@@ -11,8 +11,17 @@ class InferenceConfigurationTest(unittest.TestCase):
 
         self.assertFalse(hasattr(settings, "optimization"))
 
-        self.assertEqual(settings.profile("quality").solver, "heun")
-        self.assertEqual(settings.profile("fast").solver, "euler")
+        self.assertEqual(
+            {
+                name: (settings.profile(name).num_steps, settings.profile(name).solver)
+                for name in ("quality", "balanced", "fast")
+            },
+            {
+                "quality": (32, "ddim"),
+                "balanced": (16, "ddim"),
+                "fast": (8, "ddim"),
+            },
+        )
         self.assertEqual(settings.profile("fast").cache_mode, "none")
         self.assertGreater(
             settings.profile("quality").num_steps,
@@ -28,13 +37,14 @@ class InferenceConfigurationTest(unittest.TestCase):
             self.assertEqual(profile.cfg_scale_text, 0.0)
             self.assertEqual(profile.cfg_scale_speaker, 0.0)
 
-    def test_turbo_uses_cache_without_reducing_solver_steps(self):
+    def test_turbo_is_an_explicit_legacy_flow_cache_profile(self):
         settings = load_inference_settings()
         fast = settings.profile("fast")
         turbo = settings.profile("turbo")
 
-        self.assertEqual(turbo.num_steps, fast.num_steps)
-        self.assertEqual(turbo.solver, fast.solver)
+        self.assertEqual(turbo.num_steps, 16)
+        self.assertEqual(turbo.solver, "euler")
+        self.assertNotEqual((turbo.num_steps, turbo.solver), (fast.num_steps, fast.solver))
         self.assertEqual(turbo.cache_mode, "cache_dit")
         self.assertEqual((turbo.cfg_min_t, turbo.cfg_max_t), (0.0, 1.0))
 

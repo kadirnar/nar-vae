@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -26,8 +28,71 @@ from nar_vae.dacvae import (
     describe_dacvae_source,
 )
 from nar_vae.inference_realtime import RealtimeTTSInference
-from nar_vae.languages import DEFAULT_LANGUAGE, LanguagePair
+from nar_vae.languages import DEFAULT_LANGUAGE, LanguagePair, normalize_language
 from nar_vae.serving import StageTiming, non_claim_evidence, summarize_stage_timings
+from nar_vae.tokenization import TextSpan
+
+
+def text_conditioning_record(
+    phonemes: str | Sequence[str] | None,
+    language_spans: Sequence[TextSpan | Mapping[str, object]] | None,
+) -> dict[str, Any]:
+    """Return JSON-safe, lossless metadata for one benchmark text request."""
+
+    def serialize_phonemes(value: object) -> str | list[str] | None:
+        if value is None or isinstance(value, str):
+            return value
+        if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+            units = list(value)
+            if not all(isinstance(unit, str) for unit in units):
+                raise TypeError("phonemes must be a string or a sequence of strings.")
+            return units
+        raise TypeError("phonemes must be a string or a sequence of strings.")
+
+    serialized_spans = None
+    if language_spans is not None:
+        if isinstance(language_spans, (str, bytes)) or not isinstance(language_spans, Sequence):
+            raise TypeError("language_spans must be a sequence.")
+        serialized_spans = []
+        allowed_fields = {"text", "language", "normalized_text", "phonemes"}
+        for index, span in enumerate(language_spans):
+            if isinstance(span, TextSpan):
+                raw = span._asdict()
+            elif isinstance(span, Mapping):
+                raw = dict(span)
+            else:
+                raise TypeError(
+                    "language_spans must contain TextSpan values or mappings; "
+                    f"row {index} is {type(span).__name__}."
+                )
+            unknown = set(raw) - allowed_fields
+            if unknown:
+                raise ValueError(
+                    f"language_spans[{index}] contains unsupported fields: {sorted(unknown)}."
+                )
+            if "language" not in raw:
+                raise ValueError(f"language_spans[{index}] must declare its language.")
+            text = raw.get("text", "")
+            normalized_text = raw.get("normalized_text")
+            if not isinstance(text, str):
+                raise TypeError(f"language_spans[{index}].text must be a string.")
+            if normalized_text is not None and not isinstance(normalized_text, str):
+                raise TypeError(
+                    f"language_spans[{index}].normalized_text must be a string or null."
+                )
+            serialized_spans.append(
+                {
+                    "text": text,
+                    "language": normalize_language(raw["language"]),
+                    "normalized_text": normalized_text,
+                    "phonemes": serialize_phonemes(raw.get("phonemes")),
+                }
+            )
+
+    return {
+        "phonemes": serialize_phonemes(phonemes),
+        "language_spans": serialized_spans,
+    }
 
 
 def _run_once(
@@ -40,6 +105,8 @@ def _run_once(
     language_pair: LanguagePair,
     reference_audio: str | Path | torch.Tensor | None,
     reference_sample_rate: int | None,
+    phonemes: str | Sequence[str] | None = None,
+    language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -55,6 +122,8 @@ def _run_once(
         reference_sample_rate=reference_sample_rate,
         language=language_pair.target,
         reference_language=language_pair.reference,
+        phonemes=phonemes,
+        language_spans=language_spans,
     )
     if not torch.isfinite(audio).all():
         raise RuntimeError("Inference returned non-finite audio samples.")
@@ -72,6 +141,8 @@ def run_benchmark(
     reference_audio: str | Path | torch.Tensor | None = None,
     reference_sample_rate: int | None = None,
     reference_language: str | None = None,
+    phonemes: str | Sequence[str] | None = None,
+    language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
     profile: str = "fast",
     duration: float | None = None,
     num_steps: int | None = None,
@@ -121,6 +192,7 @@ def run_benchmark(
         reference_language,
         has_reference=reference_audio is not None,
     )
+    conditioning_record = text_conditioning_record(phonemes, language_spans)
     dacvae_description = describe_dacvae_source(dacvae_model)
     requested_dacvae_model = dacvae_description.identifier
     output_path = Path(output)
@@ -185,6 +257,8 @@ def run_benchmark(
             language_pair=language_pair,
             reference_audio=reference_audio,
             reference_sample_rate=reference_sample_rate,
+            phonemes=phonemes,
+            language_spans=language_spans,
         )
         warmups.append(
             {
@@ -205,6 +279,8 @@ def run_benchmark(
             language_pair=language_pair,
             reference_audio=reference_audio,
             reference_sample_rate=reference_sample_rate,
+            phonemes=phonemes,
+            language_spans=language_spans,
         )
         measurements.append(
             {
@@ -354,6 +430,7 @@ def run_benchmark(
                 "reference": language_pair.reference,
                 "cross_lingual": language_pair.is_cross_lingual,
             },
+            "text_conditioning": conditioning_record,
             "reference_audio": (
                 file_metadata(Path(reference_audio), label=str(reference_audio))
                 if isinstance(reference_audio, (str, Path))

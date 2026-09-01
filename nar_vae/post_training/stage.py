@@ -49,6 +49,7 @@ from nar_vae.post_training.grpo import (
     SupervisedLossFunction,
     VelocityAdapter,
 )
+from nar_vae.training_optimizers import build_muon_optimizer
 
 GRPO_RUN_MANIFEST_FILENAME = "grpo_run_manifest.json"
 GRPO_CHECKPOINT_MANIFEST_FILENAME = "grpo_checkpoint_manifest.json"
@@ -66,6 +67,8 @@ _CHECKPOINT_NAME = re.compile(r"checkpoint-([1-9][0-9]*)")
 _REPORTERS = {"wandb"}
 _PRECISIONS = {"fp32", "bf16"}
 _SCHEDULERS = {"constant", "linear", "cosine"}
+_OPTIMIZERS = {"adamw", "muon"}
+_MUON_LR_ADJUSTMENTS = {"original", "match_rms_adamw"}
 
 
 class GRPOStageError(RuntimeError):
@@ -207,11 +210,19 @@ class GRPOStageConfig:
     epochs: int = 1
     max_steps: int | None = None
     prompt_batch_size: int = 1
+    optimizer: Literal["adamw", "muon"] = "adamw"
     learning_rate: float = 1e-6
     weight_decay: float = 0.01
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
+    muon_learning_rate: float | None = None
+    muon_weight_decay: float | None = None
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5
+    muon_epsilon: float = 1e-7
+    muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] = "match_rms_adamw"
     warmup_steps: int = 0
     lr_scheduler_type: Literal["constant", "linear", "cosine"] = "cosine"
     save_steps: int = 100
@@ -288,6 +299,25 @@ class GRPOStageConfig:
         if learning_rate == 0:
             raise ValueError("learning_rate must be positive.")
         _finite_float(self.weight_decay, name="weight_decay", minimum=0)
+        if not isinstance(self.optimizer, str) or self.optimizer not in _OPTIMIZERS:
+            raise ValueError(f"optimizer must be one of {sorted(_OPTIMIZERS)}.")
+        if self.optimizer != "muon":
+            inactive_muon_options = []
+            for name, default in (
+                ("muon_learning_rate", None),
+                ("muon_weight_decay", None),
+                ("muon_momentum", 0.95),
+                ("muon_nesterov", True),
+                ("muon_ns_steps", 5),
+                ("muon_epsilon", 1e-7),
+                ("muon_adjust_lr_fn", "match_rms_adamw"),
+            ):
+                if getattr(self, name) != default:
+                    inactive_muon_options.append(name)
+            if inactive_muon_options:
+                raise ValueError(
+                    f"Muon-only fields require optimizer: muon: {sorted(inactive_muon_options)}."
+                )
         beta1 = _finite_float(self.adam_beta1, name="adam_beta1", minimum=0)
         beta2 = _finite_float(self.adam_beta2, name="adam_beta2", minimum=0)
         if beta1 >= 1 or beta2 >= 1:
@@ -295,6 +325,44 @@ class GRPOStageConfig:
         epsilon = _finite_float(self.adam_epsilon, name="adam_epsilon", minimum=0)
         if epsilon == 0:
             raise ValueError("adam_epsilon must be positive.")
+        if self.muon_learning_rate is not None:
+            muon_learning_rate = _finite_float(
+                self.muon_learning_rate,
+                name="muon_learning_rate",
+                minimum=0,
+            )
+            if muon_learning_rate == 0:
+                raise ValueError("muon_learning_rate must be positive.")
+        if self.muon_weight_decay is not None:
+            _finite_float(
+                self.muon_weight_decay,
+                name="muon_weight_decay",
+                minimum=0,
+            )
+        muon_momentum = _finite_float(
+            self.muon_momentum,
+            name="muon_momentum",
+            minimum=0,
+        )
+        if muon_momentum >= 1:
+            raise ValueError("muon_momentum must be in [0, 1).")
+        if not isinstance(self.muon_nesterov, bool):
+            raise ValueError("muon_nesterov must be a boolean.")
+        _integer(self.muon_ns_steps, name="muon_ns_steps", minimum=1)
+        if self.muon_ns_steps >= 100:
+            raise ValueError("muon_ns_steps must be an integer in [1, 100).")
+        muon_epsilon = _finite_float(
+            self.muon_epsilon,
+            name="muon_epsilon",
+            minimum=0,
+        )
+        if muon_epsilon == 0:
+            raise ValueError("muon_epsilon must be positive.")
+        if (
+            not isinstance(self.muon_adjust_lr_fn, str)
+            or self.muon_adjust_lr_fn not in _MUON_LR_ADJUSTMENTS
+        ):
+            raise ValueError("muon_adjust_lr_fn must be 'original' or 'match_rms_adamw'.")
         if self.lr_scheduler_type not in _SCHEDULERS:
             raise ValueError(f"lr_scheduler_type must be one of {sorted(_SCHEDULERS)}.")
         if self.mixed_precision not in _PRECISIONS:
@@ -1496,16 +1564,44 @@ def run_grpo_stage(
         torch.optim.Optimizer,
         torch.optim.lr_scheduler.LambdaLR,
     ]:
-        policy_trainable = [
-            parameter for parameter in policy.parameters() if parameter.requires_grad
-        ]
-        policy_optimizer = torch.optim.AdamW(
-            policy_trainable,
-            lr=config.learning_rate,
-            betas=(config.adam_beta1, config.adam_beta2),
-            eps=config.adam_epsilon,
-            weight_decay=config.weight_decay,
-        )
+        if config.optimizer == "muon":
+            policy_optimizer = build_muon_optimizer(
+                policy,
+                {
+                    "optimizer": "muon",
+                    "learning_rate": config.learning_rate,
+                    "weight_decay": config.weight_decay,
+                    "adam_beta1": config.adam_beta1,
+                    "adam_beta2": config.adam_beta2,
+                    "adam_epsilon": config.adam_epsilon,
+                    "muon_learning_rate": (
+                        config.learning_rate
+                        if config.muon_learning_rate is None
+                        else config.muon_learning_rate
+                    ),
+                    "muon_weight_decay": (
+                        config.weight_decay
+                        if config.muon_weight_decay is None
+                        else config.muon_weight_decay
+                    ),
+                    "muon_momentum": config.muon_momentum,
+                    "muon_nesterov": config.muon_nesterov,
+                    "muon_ns_steps": config.muon_ns_steps,
+                    "muon_epsilon": config.muon_epsilon,
+                    "muon_adjust_lr_fn": config.muon_adjust_lr_fn,
+                },
+            )
+        else:
+            policy_trainable = [
+                parameter for parameter in policy.parameters() if parameter.requires_grad
+            ]
+            policy_optimizer = torch.optim.AdamW(
+                policy_trainable,
+                lr=config.learning_rate,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_epsilon,
+                weight_decay=config.weight_decay,
+            )
         policy_scheduler = _scheduler(
             policy_optimizer,
             kind=config.lr_scheduler_type,
@@ -1691,6 +1787,17 @@ def run_grpo_stage(
                     state["next_batch_index"] = 0
                 if state["global_step"] % config.logging_steps == 0:
                     metrics["learning_rate"] = float(optimizer.param_groups[0]["lr"])
+                    if config.optimizer == "muon":
+                        metrics["optimizer/muon_enabled"] = 1.0
+                        for group in optimizer.param_groups:
+                            role = group.get("optimizer_role")
+                            if role == "muon":
+                                metrics["learning_rate/muon"] = float(group["lr"])
+                            elif role in {"adamw_decay", "adamw_no_decay"}:
+                                metrics.setdefault(
+                                    "learning_rate/aux_adamw",
+                                    float(group["lr"]),
+                                )
                     logging_error: Exception | None = None
                     try:
                         logger.log(metrics, step=state["global_step"])

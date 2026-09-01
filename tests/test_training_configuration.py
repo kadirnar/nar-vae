@@ -13,6 +13,7 @@ from nar_vae.configuration import (
     build_training_argument_overrides,
     load_training_lineage,
     resolve_frame_budget_batching,
+    resolve_muon_settings,
     resolve_same_run_resume,
     resolve_training_cfg_dropout,
     validate_parent_checkpoint,
@@ -218,6 +219,54 @@ class TrainingConfigurationTest(unittest.TestCase):
         self.assertTrue(options["gradient_checkpointing"])
         self.assertEqual(options["gradient_checkpointing_kwargs"], {"use_reentrant": False})
 
+    def test_muon_is_validated_but_hidden_from_transformers_optimizer_enum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._pretraining_config(Path(directory) / "run")
+            config.update(
+                optimizer="muon",
+                muon_learning_rate=2e-4,
+                muon_weight_decay=0.02,
+                muon_momentum=0.95,
+                muon_nesterov=True,
+                muon_ns_steps=5,
+                muon_epsilon=1e-7,
+                muon_adjust_lr_fn="match_rms_adamw",
+            )
+            options = build_training_argument_overrides(config)
+            settings = resolve_muon_settings(config)
+
+        self.assertEqual(options["optim"], "adamw_torch")
+        self.assertIsNotNone(settings)
+        self.assertEqual(settings.learning_rate, 2e-4)
+        self.assertEqual(settings.weight_decay, 0.02)
+        self.assertEqual(settings.momentum, 0.95)
+        self.assertTrue(settings.nesterov)
+        self.assertEqual(settings.ns_steps, 5)
+        self.assertEqual(settings.epsilon, 1e-7)
+        self.assertEqual(settings.adjust_lr_fn, "match_rms_adamw")
+
+    def test_muon_controls_fail_closed_and_cannot_be_silent_adamw_noops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._pretraining_config(Path(directory) / "run")
+            with self.assertRaisesRegex(ValueError, "Muon-only fields require optimizer: muon"):
+                build_training_argument_overrides(dict(base, muon_momentum=0.95))
+
+            muon = dict(base, optimizer="muon")
+            for field, value in (
+                ("muon_learning_rate", 0.0),
+                ("muon_weight_decay", -0.1),
+                ("muon_momentum", 1.0),
+                ("muon_momentum", float("nan")),
+                ("muon_nesterov", "true"),
+                ("muon_ns_steps", 0),
+                ("muon_ns_steps", True),
+                ("muon_epsilon", 0.0),
+                ("muon_adjust_lr_fn", "automatic"),
+            ):
+                invalid = dict(muon, **{field: value})
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    build_training_argument_overrides(invalid)
+
     def test_frame_budget_settings_validate_and_default_to_batch_size(self):
         settings = resolve_frame_budget_batching(
             {
@@ -235,6 +284,90 @@ class TrainingConfigurationTest(unittest.TestCase):
         self.assertFalse(settings.allow_legacy_frame_length_inference)
         self.assertFalse(resolve_frame_budget_batching({"max_frames_per_batch": 0}).enabled)
         self.assertFalse(resolve_frame_budget_batching({"max_frames_per_batch": None}).enabled)
+
+    def test_target_patch_size_is_validated_and_wired_to_both_training_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._pretraining_config(Path(directory) / "run")
+            for target_patch_size in (1, 2, 4):
+                with self.subTest(target_patch_size=target_patch_size):
+                    self.assertIsNone(
+                        validate_pretraining_config(dict(base, target_patch_size=target_patch_size))
+                    )
+            for target_patch_size in (0, -1, True, 1.5):
+                with (
+                    self.subTest(invalid=target_patch_size),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "target_patch_size",
+                    ),
+                ):
+                    validate_pretraining_config(dict(base, target_patch_size=target_patch_size))
+
+        for module_name in ("train.py", "finetune.py"):
+            source = (ROOT / "nar_vae" / module_name).read_text(encoding="utf-8")
+            module = ast.parse(source)
+            factory_calls = [
+                node
+                for node in ast.walk(module)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "create_flow_matching_echodit"
+            ]
+            self.assertEqual(len(factory_calls), 1, module_name)
+            keywords = {keyword.arg: keyword.value for keyword in factory_calls[0].keywords}
+            self.assertIn("target_patch_size", keywords, module_name)
+            self.assertEqual(
+                ast.unparse(keywords["target_patch_size"]),
+                "config.get('target_patch_size', 1)",
+            )
+
+    def test_speaker_summary_tokens_are_validated_and_wired_to_training_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._pretraining_config(Path(directory) / "run")
+            for summary_tokens in (0, 8):
+                configured = dict(
+                    base,
+                    use_speaker_conditioning=summary_tokens > 0,
+                    speaker_num_summary_tokens=summary_tokens,
+                )
+                with self.subTest(summary_tokens=summary_tokens):
+                    self.assertIsNone(validate_pretraining_config(configured))
+
+            for invalid_value in (-1, True, 1.5):
+                invalid = dict(
+                    base,
+                    use_speaker_conditioning=True,
+                    speaker_num_summary_tokens=invalid_value,
+                )
+                with self.subTest(invalid_value=invalid_value):
+                    with self.assertRaisesRegex(ValueError, "speaker_num_summary_tokens"):
+                        validate_pretraining_config(invalid)
+
+            with self.assertRaisesRegex(ValueError, "use_speaker_conditioning"):
+                validate_pretraining_config(
+                    dict(
+                        base,
+                        use_speaker_conditioning=False,
+                        speaker_num_summary_tokens=8,
+                    )
+                )
+
+        for module_name in ("train.py", "finetune.py"):
+            source = (ROOT / "nar_vae" / module_name).read_text(encoding="utf-8")
+            module = ast.parse(source)
+            factory_calls = [
+                node
+                for node in ast.walk(module)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "create_flow_matching_echodit"
+            ]
+            self.assertEqual(len(factory_calls), 1, module_name)
+            keywords = {keyword.arg: keyword.value for keyword in factory_calls[0].keywords}
+            self.assertEqual(
+                ast.unparse(keywords["speaker_num_summary_tokens"]),
+                "config.get('speaker_num_summary_tokens', 0)",
+            )
 
     def test_frame_budget_settings_fail_closed_on_invalid_values(self):
         invalid = (
@@ -256,6 +389,21 @@ class TrainingConfigurationTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires max_examples_per_batch"):
             resolve_frame_budget_batching({"max_frames_per_batch": 10})
+        for disabled_budget in (None, 0):
+            with (
+                self.subTest(disabled_budget=disabled_budget),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "padded_attention requires max_frames_per_batch > 0",
+                ),
+            ):
+                resolve_frame_budget_batching(
+                    {
+                        "batching_cost": "padded_attention",
+                        "max_attention_cost_per_batch": 1_000,
+                        "max_frames_per_batch": disabled_budget,
+                    }
+                )
 
     def test_packaged_training_configs_enable_persisted_frame_budgets(self):
         if yaml is None:
@@ -271,6 +419,7 @@ class TrainingConfigurationTest(unittest.TestCase):
                 self.assertFalse(settings.allow_legacy_frame_length_inference)
                 self.assertFalse(config["allow_legacy_representation"])
                 self.assertEqual(config["report_to"], "wandb")
+                self.assertEqual(config["speaker_num_summary_tokens"], 8)
 
         pretraining = _load_pretraining_yaml(ROOT / "nar_vae" / "configs" / "pretrain_config.yaml")
         validate_pretraining_config(pretraining)
@@ -505,7 +654,6 @@ class TrainingConfigurationTest(unittest.TestCase):
                 ("cfg_scale", 1.0),
                 ("initial_noise_scale", 1.0),
                 ("ratio", "1:1"),
-                ("text_QA_dataset", "owner/prompts"),
                 ("eval_steps", 500),
                 ("validation_solver", "heun"),
             ):
@@ -538,7 +686,6 @@ class TrainingConfigurationTest(unittest.TestCase):
             "ratio",
             "temporal_rescale_k",
             "temporal_rescale_sigma",
-            "text_QA_dataset",
             "use_echodit",
             "validation_cfg_scale",
             "validation_ode_steps",
@@ -621,7 +768,7 @@ class TrainingConfigurationTest(unittest.TestCase):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     validate_pretraining_config(invalid)
 
-    def test_packaged_yaml_does_not_advertise_unconsumed_token_controls(self):
+    def test_packaged_yaml_uses_provider_padding_without_legacy_control_knobs(self):
         if yaml is None:
             self.skipTest("PyYAML dependency is not installed")
         removed = {
@@ -639,7 +786,11 @@ class TrainingConfigurationTest(unittest.TestCase):
             with (ROOT / "nar_vae" / "configs" / filename).open(encoding="utf-8") as file:
                 config = yaml.safe_load(file)
             self.assertFalse(removed.intersection(config))
-            self.assertEqual(config["pad_token"], 100286)
+            if config.get("text_conditioning_mode") == "frozen_features":
+                self.assertEqual(config["pad_token"], 1)
+                self.assertEqual(config["text_vocab_size"], 1969)
+            else:
+                self.assertEqual(config["pad_token"], 0)
 
     def test_sft_requires_a_parent_or_same_run_resume_and_supported_mode(self):
         with tempfile.TemporaryDirectory() as directory:

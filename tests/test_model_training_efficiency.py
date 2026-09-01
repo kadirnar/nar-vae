@@ -156,7 +156,7 @@ class SharedConditioningEncodingTest(unittest.TestCase):
         (velocity.sum() + duration.sum()).backward()
         self.assertIsNotNone(model.duration_predictor.output_projection.weight.grad)
 
-    def test_cfg_dropout_reencodes_only_changed_rows(self):
+    def test_cfg_dropout_substitutes_learned_states_without_reencoding(self):
         model = tiny_model(duration=True, speaker=True, duration_speaker=True).train()
         model.cfg_dropout_text = 0.5
         model.cfg_dropout_speaker = 0.5
@@ -184,11 +184,8 @@ class SharedConditioningEncodingTest(unittest.TestCase):
                 return_duration_prediction=True,
             )
 
-        self.assertEqual([call.args[0].shape[0] for call in encode_text.call_args_list], [4, 1])
-        self.assertEqual(
-            [call.args[0].shape[0] for call in encode_speaker.call_args_list],
-            [4, 1],
-        )
+        self.assertEqual([call.args[0].shape[0] for call in encode_text.call_args_list], [4])
+        self.assertEqual([call.args[0].shape[0] for call in encode_speaker.call_args_list], [4])
 
 
 class CompactNARTopologyTest(unittest.TestCase):

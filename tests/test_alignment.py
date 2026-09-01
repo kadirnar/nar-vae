@@ -1,5 +1,6 @@
 """CPU tests for monotonic alignment and exact duration allocation."""
 
+import inspect
 import itertools
 import unittest
 
@@ -72,6 +73,39 @@ class MonotonicAlignmentSearchTest(unittest.TestCase):
         self.assertEqual(alignment[1, 2:].count_nonzero().item(), 0)
         self.assertEqual(alignment[1, :, 4:].count_nonzero().item(), 0)
 
+    def test_compacts_noncontiguous_speakable_tokens_and_scatters_the_path(self):
+        scores = torch.full((2, 5, 6), -20.0)
+        scores[0, [1, 1, 3, 4, 4, 4], torch.arange(6)] = 20.0
+        scores[1, [0, 2, 2, 2], torch.arange(4)] = 20.0
+        scores[0, [0, 2], :] = 1_000.0
+        scores[1, [1, 3, 4], :] = 1_000.0
+        token_mask = torch.tensor(
+            [
+                [False, True, False, True, True],
+                [True, False, True, False, False],
+            ]
+        )
+        frame_mask = torch.tensor(
+            [
+                [True, True, True, True, True, True],
+                [True, True, True, True, False, False],
+            ]
+        )
+
+        alignment = monotonic_alignment_search(scores, token_mask, frame_mask)
+        durations = durations_from_alignment(alignment, token_mask, frame_mask)
+
+        torch.testing.assert_close(
+            durations,
+            torch.tensor([[0, 2, 0, 1, 3], [1, 0, 3, 0, 0]]),
+        )
+        self.assertFalse(alignment.masked_select(~token_mask[:, :, None]).any())
+
+    def test_batched_backtracking_has_no_cpu_direction_copy(self):
+        source = inspect.getsource(monotonic_alignment_search)
+        self.assertNotIn(".cpu(", source)
+        self.assertNotIn("for batch_index", source)
+
     def test_rejects_infeasible_or_nonfinite_paths(self):
         with self.assertRaisesRegex(ValueError, "at least one frame per token"):
             monotonic_alignment_search(torch.zeros(3, 2))
@@ -83,7 +117,7 @@ class MonotonicAlignmentSearchTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NaN or positive-infinite"):
             monotonic_alignment_search(torch.tensor([[0.0, float("nan")]]))
 
-    def test_rejects_non_prefix_masks(self):
+    def test_rejects_non_prefix_frame_masks(self):
         with self.assertRaisesRegex(ValueError, "contiguous prefix"):
             monotonic_alignment_search(
                 torch.zeros(2, 3),

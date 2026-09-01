@@ -112,7 +112,7 @@ class MultilingualConditioningTest(unittest.TestCase):
         self.assertEqual(len(model.language_ids), 1)
         torch.testing.assert_close(model.language_ids[0], ids)
 
-    def test_cfg_drops_language_with_text_but_not_with_speaker(self):
+    def test_cfg_encodes_real_language_once_then_uses_explicit_null_text_state(self):
         class FakeDiT(torch.nn.Module):
             speaker_patch_size = 1
 
@@ -143,6 +143,8 @@ class MultilingualConditioningTest(unittest.TestCase):
         model.use_speaker_conditioning = True
         model.use_language_conditioning = True
         model.supported_languages = ("en", "es")
+        model.null_text_embed = torch.nn.Parameter(torch.zeros(1, 1, 1))
+        model.null_speaker_state = torch.nn.Parameter(torch.zeros(1, 1, 1))
         model.register_buffer("null_speaker_embed", torch.zeros(1, 2, 1))
         model.register_buffer(
             "supported_language_ids_metadata",
@@ -150,7 +152,7 @@ class MultilingualConditioningTest(unittest.TestCase):
         )
         model.dit = FakeDiT()
 
-        model.prepare_fused_cfg_conditioning(
+        prepared = model.prepare_fused_cfg_conditioning(
             torch.ones(1, 2, dtype=torch.long),
             speaker_latent=torch.ones(1, 2, 1),
             language_ids=torch.tensor([language_id("es")]),
@@ -159,7 +161,11 @@ class MultilingualConditioningTest(unittest.TestCase):
 
         torch.testing.assert_close(
             model.dit.language_ids,
-            torch.tensor([language_id("es"), 0, language_id("es")]),
+            torch.tensor([language_id("es")]),
+        )
+        torch.testing.assert_close(
+            prepared.variants[0].kv_cache_text[0][0].squeeze(-1),
+            torch.tensor([float(language_id("es")), 0.0, float(language_id("es"))]),
         )
         torch.testing.assert_close(
             model.dit.speakers.mean(dim=(1, 2)),

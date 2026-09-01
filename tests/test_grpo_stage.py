@@ -7,6 +7,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -26,7 +27,7 @@ from nar_vae.dataset.finetune_prepare import (
     _validate_unique_prompt_ids,
 )
 from nar_vae.distributed import DistributedContext
-from nar_vae.languages import LanguagePair
+from nar_vae.languages import LanguagePair, language_id
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
 from nar_vae.model_manifest import (
     MODEL_MANIFEST_FILENAME,
@@ -36,6 +37,7 @@ from nar_vae.model_manifest import (
     write_model_manifest,
 )
 from nar_vae.models.duration import MONOTONIC_ALIGNMENT_VERSION
+from nar_vae.objectives import RECTIFIED_FLOW_OBJECTIVE
 from nar_vae.post_training import (
     DEFAULT_GRPO_CONFIG_PATH,
     FlowGRPOConfig,
@@ -71,7 +73,8 @@ def model_config(codec_source: str = "./codec/weights.pth") -> dict:
         "dacvae_hop_length": 512,
         "dacvae_latent_dim": 128,
         "dacvae_sha256": "c" * 64,
-        "text_vocab_size": 100312,
+        "text_vocab_size": 530,
+        "target_patch_size": 1,
         "speaker_patch_size": 4,
         "norm_eps": 1e-6,
         "use_speaker_conditioning": False,
@@ -85,6 +88,32 @@ def model_config(codec_source: str = "./codec/weights.pth") -> dict:
         "use_mas_duration": True,
         "duration_alignment_hidden_size": 64,
     }
+
+
+def frozen_model_config(codec_source: str = "./codec/weights.pth") -> dict:
+    config = model_config(codec_source)
+    config.update(
+        text_conditioning_mode="frozen_features",
+        text_num_layers=0,
+        text_vocab_size=23,
+        pad_token=1,
+        conditioning_feature_size=4,
+        conditioning_feature_dtype="float16",
+        frozen_text_alignment="hf_non_special_tokens_v1",
+        frozen_text_cache_version=1,
+        frozen_text_config_sha256="a" * 64,
+        frozen_text_encoder_id="example/encoder",
+        frozen_text_encoder_revision="a" * 40,
+        frozen_text_frontend="phonemes",
+        frozen_text_hidden_layer=-1,
+        frozen_text_model_filename="model.safetensors",
+        frozen_text_model_sha256="b" * 64,
+        frozen_text_tokenizer_filename="tokenizer.json",
+        frozen_text_tokenizer_id="example/tokenizer",
+        frozen_text_tokenizer_revision="a" * 40,
+        frozen_text_tokenizer_sha256="c" * 64,
+    )
+    return config
 
 
 class ToyPromptDataset:
@@ -237,7 +266,8 @@ def stage_config(
     )
 
 
-def write_sft_parent(root: Path):
+def write_sft_parent(root: Path, *, export_config: dict | None = None):
+    export_config = model_config() if export_config is None else export_config
     pretrain = root / "pretrain"
     pretrain.mkdir()
     pretrain_weights = pretrain / "pytorch_model.bin"
@@ -251,7 +281,7 @@ def write_sft_parent(root: Path):
     )
     pretrain_manifest = write_model_manifest(
         pretrain,
-        model_config(),
+        export_config,
         stage="pretrain",
         checkpoint_files=(pretrain_weights.name,),
     )
@@ -269,7 +299,7 @@ def write_sft_parent(root: Path):
     )
     sft_manifest = write_model_manifest(
         sft,
-        model_config(),
+        export_config,
         stage="sft",
         checkpoint_files=(sft_weights.name,),
         parent_manifest=pretrain_manifest,
@@ -279,6 +309,9 @@ def write_sft_parent(root: Path):
 
 def matching_grpo_capability_contract():
     checkpoint = Mock()
+    checkpoint.validate_architecture.return_value = 4
+    checkpoint.infer_target_patch_size.return_value = 1
+    checkpoint.infer_speaker_num_summary_tokens.return_value = 0
     checkpoint.infer_speaker_conditioning.return_value = False
     checkpoint.language_capability.return_value = LanguageCheckpointInfo(enabled=False)
     checkpoint.reference_language_capability.return_value = ReferenceLanguageCheckpointInfo(
@@ -296,7 +329,11 @@ def matching_grpo_capability_contract():
         version=MONOTONIC_ALIGNMENT_VERSION,
     )
     manifest = SimpleNamespace(
-        architecture={"speaker_patch_size": 4},
+        architecture={
+            "speaker_patch_size": 4,
+            "speaker_num_summary_tokens": 0,
+            "target_patch_size": 1,
+        },
         capabilities={
             "speaker_conditioning": False,
             "language_conditioning": False,
@@ -344,11 +381,21 @@ class GRPOStageTest(unittest.TestCase):
                 model = nar_stage_module._new_model_from_manifest(manifest)
 
             self.assertIs(model, expected)
+            self.assertEqual(create_model.call_args.kwargs["speaker_num_summary_tokens"], 0)
+            self.assertEqual(
+                nar_stage_module.model_export_config_from_manifest(manifest)[
+                    "speaker_num_summary_tokens"
+                ],
+                0,
+            )
             self.assertIsNone(create_model.call_args.kwargs["supported_reference_languages"])
             self.assertIsNone(create_model.call_args.kwargs["supported_language_pairs"])
 
     def test_grpo_rejects_checkpoint_pair_metadata_that_disagrees_with_manifest(self):
         checkpoint = Mock()
+        checkpoint.validate_architecture.return_value = 4
+        checkpoint.infer_target_patch_size.return_value = 1
+        checkpoint.infer_speaker_num_summary_tokens.return_value = 0
         checkpoint.infer_speaker_conditioning.return_value = True
         checkpoint.infer_speaker_patch_size.return_value = 4
         checkpoint.language_capability.return_value = LanguageCheckpointInfo(
@@ -361,7 +408,11 @@ class GRPOStageTest(unittest.TestCase):
             supported_pairs=(LanguagePair("es", "en"),),
         )
         manifest = SimpleNamespace(
-            architecture={"speaker_patch_size": 4},
+            architecture={
+                "speaker_patch_size": 4,
+                "speaker_num_summary_tokens": 0,
+                "target_patch_size": 1,
+            },
             capabilities={
                 "speaker_conditioning": True,
                 "language_conditioning": True,
@@ -371,6 +422,13 @@ class GRPOStageTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ModelManifestError, "language pairs do not match"):
+            nar_stage_module._validate_grpo_checkpoint_capabilities(checkpoint, manifest)
+
+    def test_grpo_rejects_speaker_summary_topology_mismatch(self):
+        checkpoint, manifest = matching_grpo_capability_contract()
+        checkpoint.infer_speaker_num_summary_tokens.return_value = 8
+
+        with self.assertRaisesRegex(ModelManifestError, "summary-token topology"):
             nar_stage_module._validate_grpo_checkpoint_capabilities(checkpoint, manifest)
 
     def test_grpo_rejects_duration_capability_mismatches(self):
@@ -469,6 +527,75 @@ class GRPOStageTest(unittest.TestCase):
                     ("deserialize", parent.resolve()),
                 ],
             )
+
+    def test_frozen_grpo_collator_uses_authenticated_provider_pad(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, parent_manifest = write_sft_parent(
+                root,
+                export_config=frozen_model_config(),
+            )
+            config = stage_config(root, parent)
+
+            def reward(audio, batch):
+                del audio, batch
+                return {"quality": torch.zeros(1, config.group_size)}
+
+            bind_reward_evaluator_manifest(reward, config.reward_evaluators)
+            checkpoint = Mock()
+            checkpoint.generative_objective.return_value = RECTIFIED_FLOW_OBJECTIVE
+            checkpoint.load_into.side_effect = lambda model: None
+            with (
+                patch.object(
+                    nar_stage_module,
+                    "_new_model_from_manifest",
+                    side_effect=(ToyVelocity(), ToyVelocity()),
+                ),
+                patch.object(
+                    nar_stage_module.FlowCheckpoint,
+                    "load",
+                    return_value=checkpoint,
+                ),
+                patch.object(nar_stage_module, "_validate_grpo_checkpoint_capabilities"),
+                patch.object(nar_stage_module, "validate_loaded_codec"),
+            ):
+                runtime = nar_stage_module.build_nar_vae_grpo_runtime(
+                    config,
+                    parent_manifest=parent_manifest,
+                    reward=reward,
+                    device=torch.device("cpu"),
+                    codec=nn.Identity(),
+                )
+
+            english = language_id("en")
+            rows = []
+            for utterance, token_ids in (("a", [0, 5, 2]), ("b", [0, 6, 7, 2])):
+                rows.append(
+                    {
+                        "utterance_id": utterance,
+                        "latents": torch.zeros(128, 3),
+                        "conditioning_ids": token_ids,
+                        "conditioning_features": torch.zeros(
+                            len(token_ids), 4, dtype=torch.float16
+                        ),
+                        "conditioning_feature_dtype": "float16",
+                        "token_language_ids": [0, *([english] * (len(token_ids) - 2)), 0],
+                        "alignment_mask": [False, *([True] * (len(token_ids) - 2)), False],
+                        "language": "en",
+                    }
+                )
+            batch = runtime.collate_fn(rows)
+            self.assertEqual(batch["model_inputs"]["conditioning_ids"][0, -1].item(), 1)
+
+            with self.assertRaisesRegex(ValueError, "authenticated parent"):
+                nar_stage_module.build_nar_vae_grpo_runtime(
+                    config,
+                    parent_manifest=parent_manifest,
+                    reward=reward,
+                    device=torch.device("cpu"),
+                    codec=nn.Identity(),
+                    pad_token=0,
+                )
 
     def test_runtime_rejects_parent_or_sparse_ema_base_tampering_before_torch_load(self):
         for tamper_base in (False, True):
@@ -587,11 +714,14 @@ class GRPOStageTest(unittest.TestCase):
     def test_packaged_config_and_public_reward_binding(self):
         config_path = Path(DEFAULT_GRPO_CONFIG_PATH)
         self.assertTrue(config_path.is_file())
+        config_text = config_path.read_text(encoding="utf-8")
         self.assertIn(
             "final/flow_model/pytorch_model.bin",
-            config_path.read_text(encoding="utf-8"),
+            config_text,
         )
-        self.assertIn('report_to: "wandb"', config_path.read_text(encoding="utf-8"))
+        self.assertIn('optimizer: "adamw"', config_text)
+        self.assertIn('# optimizer: "muon"', config_text)
+        self.assertIn('report_to: "wandb"', config_text)
 
         def reward(audio, batch):
             del audio, batch
@@ -735,6 +865,48 @@ class GRPOStageTest(unittest.TestCase):
         self.assertNotIn("latents", batch["reward_rows"][0])
         self.assertEqual(batch["latent_lengths"].tolist(), [1, 2])
 
+    def test_collator_preserves_full_v2_text_metadata_and_separate_global_language(self):
+        collator = NARVAEGRPOCollator(
+            pad_token=0,
+            speaker_patch_size=1,
+            prompt_id_column="utterance_id",
+        )
+        english = language_id("en")
+        turkish = language_id("tr")
+        batch = collator(
+            [
+                {
+                    "utterance_id": "prompt-a",
+                    "latents": torch.zeros(1, 3),
+                    "conditioning_ids": [10, 11, 12, 13, 14],
+                    "token_language_ids": [0, english, turkish, english, 0],
+                    "alignment_mask": [False, True, True, True, False],
+                    "language": "en",
+                },
+                {
+                    "utterance_id": "prompt-b",
+                    "latents": torch.zeros(1, 4),
+                    "conditioning_ids": [20, 21, 22],
+                    "token_language_ids": [0, turkish, 0],
+                    "alignment_mask": [False, True, False],
+                    "language": "tr",
+                },
+            ]
+        )
+
+        inputs = batch["model_inputs"]
+        self.assertEqual(inputs["conditioning_ids"].shape, (2, 5))
+        self.assertEqual(inputs["token_language_ids"].shape, (2, 5))
+        self.assertEqual(inputs["alignment_mask"].shape, (2, 5))
+        self.assertEqual(inputs["language_ids"].shape, (2,))
+        torch.testing.assert_close(inputs["language_ids"], torch.tensor([english, turkish]))
+        torch.testing.assert_close(
+            inputs["token_language_ids"][0],
+            torch.tensor([0, english, turkish, english, 0]),
+        )
+        self.assertTrue((inputs["token_language_ids"][1, 3:] == 0).all())
+        self.assertFalse(inputs["alignment_mask"][1, 3:].any())
+
     def test_flow_only_trainability_and_mas_replay_use_fixed_durations(self):
         class DummyDiT(nn.Module):
             def __init__(self):
@@ -760,15 +932,30 @@ class GRPOStageTest(unittest.TestCase):
                 super().__init__()
                 self.weight = nn.Parameter(torch.tensor(1.0))
                 self.token_durations = None
+                self.last_call = None
 
             def forward(self, **kwargs):
                 self.token_durations = kwargs.get("token_durations")
+                self.last_call = kwargs
                 return kwargs["latents"] * self.weight
 
         model = CaptureModel()
-        durations = torch.tensor([[2, 3], [1, 4]])
+        english = language_id("en")
+        turkish = language_id("tr")
+        durations = torch.tensor([[0, 2, 0, 3, 0], [0, 1, 2, 0, 2]])
+        token_language_ids = torch.tensor(
+            [[0, english, 0, turkish, 0], [0, turkish, english, 0, english]]
+        )
+        alignment_mask = torch.tensor(
+            [[False, True, False, True, False], [False, True, True, False, True]]
+        )
+        global_language_ids = torch.tensor([english, turkish])
         conditioning = {
-            "conditioning_ids": torch.tensor([[1, 2], [3, 4]]),
+            "conditioning_ids": torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]]),
+            "conditioning_mask": torch.ones(2, 5, dtype=torch.bool),
+            "token_language_ids": token_language_ids,
+            "alignment_mask": alignment_mask,
+            "language_ids": global_language_ids,
             "token_durations": durations,
         }
         _velocity_adapter(
@@ -777,26 +964,187 @@ class GRPOStageTest(unittest.TestCase):
             torch.rand(2, 3),
             conditioning,
         )
-        self.assertEqual(model.token_durations.shape, (6, 2))
+        self.assertEqual(model.token_durations.shape, (6, 5))
         torch.testing.assert_close(model.token_durations[::3], durations)
+        self.assertEqual(model.last_call["language_ids"].shape, (6,))
+        self.assertEqual(model.last_call["token_language_ids"].shape, (6, 5))
+        self.assertEqual(model.last_call["alignment_mask"].shape, (6, 5))
+        torch.testing.assert_close(model.last_call["language_ids"][::3], global_language_ids)
+        torch.testing.assert_close(model.last_call["token_language_ids"][::3], token_language_ids)
+        torch.testing.assert_close(model.last_call["alignment_mask"][::3], alignment_mask)
 
         loss = FlowMatchingLoss(timestep_distribution="uniform")(
             model,
             torch.randn(2, 1, 5),
             conditioning["conditioning_ids"],
             token_durations=durations,
+            language_ids=global_language_ids,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
         )
         self.assertTrue(torch.isfinite(loss))
         torch.testing.assert_close(model.token_durations, durations)
+        torch.testing.assert_close(model.last_call["language_ids"], global_language_ids)
+        torch.testing.assert_close(model.last_call["token_language_ids"], token_language_ids)
+        torch.testing.assert_close(model.last_call["alignment_mask"], alignment_mask)
 
         padded = _pad_token_durations_to_batch_frames(
-            torch.tensor([[1, 2, 0], [1, 1, 2]]),
-            torch.tensor([[1, 1, 0], [1, 1, 1]]),
+            torch.tensor([[0, 1, 0, 2, 0], [0, 1, 1, 0, 2]]),
+            torch.tensor([[False, True, False, True, False], [False, True, True, False, True]]),
             torch.tensor([3, 4]),
             padded_frames=5,
         )
-        torch.testing.assert_close(padded, torch.tensor([[1, 4, 0], [1, 1, 3]]))
+        torch.testing.assert_close(
+            padded,
+            torch.tensor([[0, 1, 0, 4, 0], [0, 1, 1, 0, 3]]),
+        )
         torch.testing.assert_close(padded.sum(dim=1), torch.tensor([5, 5]))
+        with self.assertRaisesRegex(ValueError, "Non-alignable"):
+            _pad_token_durations_to_batch_frames(
+                torch.tensor([[1, 1, 0]]),
+                torch.tensor([[False, True, False]]),
+                torch.tensor([2]),
+                padded_frames=2,
+            )
+
+    def test_runtime_threads_v2_metadata_through_fixed_duration_and_replay(self):
+        class CapturingModel(nn.Module):
+            def __init__(self, duration_plan):
+                super().__init__()
+                self.weight = nn.Parameter(torch.tensor(1.0))
+                self.duration_plan = duration_plan
+                self.duration_call = None
+                self.forward_calls = []
+
+            def predict_token_duration_frames(self, conditioning_ids, **kwargs):
+                self.duration_call = (conditioning_ids, kwargs)
+                return self.duration_plan.to(conditioning_ids.device)
+
+            def forward(self, **kwargs):
+                self.forward_calls.append(kwargs)
+                return kwargs["latents"] * self.weight
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, parent_manifest = write_sft_parent(root)
+            config = replace(
+                stage_config(root, parent),
+                supervised_replay_weight=0.2,
+            )
+
+            def reward(audio, batch):
+                del audio, batch
+                return {"quality": torch.zeros(1, config.group_size)}
+
+            bind_reward_evaluator_manifest(reward, config.reward_evaluators)
+            duration_plan = torch.tensor(
+                [[0, 1, 0, 2, 0], [0, 2, 2, 0, 0]],
+                dtype=torch.long,
+            )
+            policy = CapturingModel(duration_plan)
+            reference = CapturingModel(duration_plan)
+            checkpoint = Mock()
+            checkpoint.generative_objective.return_value = RECTIFIED_FLOW_OBJECTIVE
+            checkpoint.load_into.side_effect = lambda model: None
+            with (
+                patch.object(
+                    nar_stage_module,
+                    "_new_model_from_manifest",
+                    side_effect=(policy, reference),
+                ),
+                patch.object(
+                    nar_stage_module.FlowCheckpoint,
+                    "load",
+                    return_value=checkpoint,
+                ),
+                patch.object(nar_stage_module, "_validate_grpo_checkpoint_capabilities"),
+                patch.object(nar_stage_module, "validate_loaded_codec"),
+            ):
+                runtime = nar_stage_module.build_nar_vae_grpo_runtime(
+                    config,
+                    parent_manifest=parent_manifest,
+                    reward=reward,
+                    device=torch.device("cpu"),
+                    codec=nn.Identity(),
+                )
+
+            english = language_id("en")
+            turkish = language_id("tr")
+            batch = runtime.collate_fn(
+                [
+                    {
+                        "utterance_id": "prompt-a",
+                        "latents": torch.zeros(1, 3),
+                        "conditioning_ids": [10, 11, 12, 13, 14],
+                        "token_language_ids": [0, english, 0, turkish, 0],
+                        "alignment_mask": [False, True, False, True, False],
+                        "language": "en",
+                    },
+                    {
+                        "utterance_id": "prompt-b",
+                        "latents": torch.zeros(1, 4),
+                        "conditioning_ids": [20, 21, 22, 23],
+                        "token_language_ids": [0, turkish, english, 0],
+                        "alignment_mask": [False, True, True, False],
+                        "language": "tr",
+                    },
+                ]
+            )
+            prepared = runtime.prepare_batch(
+                batch,
+                torch.device("cpu"),
+                config.group_size,
+                torch.Generator().manual_seed(7),
+            )
+
+            duration_ids, duration_kwargs = reference.duration_call
+            inputs = prepared.conditioning
+            torch.testing.assert_close(duration_ids, inputs["conditioning_ids"])
+            torch.testing.assert_close(
+                duration_kwargs["token_language_ids"],
+                inputs["token_language_ids"],
+            )
+            torch.testing.assert_close(
+                duration_kwargs["alignment_mask"],
+                inputs["alignment_mask"],
+            )
+            torch.testing.assert_close(duration_kwargs["language_ids"], inputs["language_ids"])
+            self.assertEqual(duration_kwargs["language_ids"].shape, (2,))
+            self.assertEqual(duration_kwargs["token_language_ids"].shape, (2, 5))
+            torch.testing.assert_close(
+                inputs["token_durations"],
+                torch.tensor([[0, 1, 0, 3, 0], [0, 2, 2, 0, 0]]),
+            )
+
+            runtime.velocity_adapter(
+                policy,
+                prepared.initial_state,
+                torch.rand(2, config.group_size),
+                prepared.conditioning,
+            )
+            rollout_call = policy.forward_calls[-1]
+            self.assertEqual(rollout_call["language_ids"].shape, (4,))
+            self.assertEqual(rollout_call["token_language_ids"].shape, (4, 5))
+            self.assertEqual(rollout_call["alignment_mask"].shape, (4, 5))
+            torch.testing.assert_close(
+                rollout_call["token_language_ids"][:: config.group_size],
+                inputs["token_language_ids"],
+            )
+            torch.testing.assert_close(
+                rollout_call["alignment_mask"][:: config.group_size],
+                inputs["alignment_mask"],
+            )
+
+            self.assertIsNotNone(runtime.supervised_loss)
+            replay_loss = runtime.supervised_loss(policy, prepared.trainer_batch)
+            self.assertTrue(torch.isfinite(replay_loss))
+            replay_call = policy.forward_calls[-1]
+            torch.testing.assert_close(
+                replay_call["token_language_ids"],
+                inputs["token_language_ids"],
+            )
+            torch.testing.assert_close(replay_call["alignment_mask"], inputs["alignment_mask"])
+            torch.testing.assert_close(replay_call["language_ids"], inputs["language_ids"])
 
     def test_content_bound_prompt_ids_are_stable_and_duplicates_fail(self):
         row = {
@@ -896,6 +1244,133 @@ class GRPOStageTest(unittest.TestCase):
                     },
                     report_to="none",
                 )
+
+    def test_config_strictly_validates_grpo_muon_options(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = stage_config(root, root / "parent.bin")
+            self.assertEqual(base.optimizer, "adamw")
+            self.assertIsNone(base.muon_learning_rate)
+            self.assertIsNone(base.muon_weight_decay)
+            self.assertEqual(base.muon_momentum, 0.95)
+            self.assertTrue(base.muon_nesterov)
+            self.assertEqual(base.muon_ns_steps, 5)
+            self.assertEqual(base.muon_epsilon, 1e-7)
+            self.assertEqual(base.muon_adjust_lr_fn, "match_rms_adamw")
+
+            configured = replace(
+                base,
+                optimizer="muon",
+                muon_learning_rate=2e-6,
+                muon_weight_decay=0.02,
+                muon_momentum=0.9,
+                muon_nesterov=False,
+                muon_ns_steps=4,
+                muon_epsilon=2e-7,
+                muon_adjust_lr_fn="original",
+            )
+            self.assertEqual(configured.optimizer, "muon")
+            self.assertEqual(configured.muon_learning_rate, 2e-6)
+            self.assertNotEqual(configured.sha256, base.sha256)
+            restored = GRPOStageConfig.from_mapping(configured.manifest_payload())
+            self.assertEqual(restored.sha256, configured.sha256)
+            with self.assertRaisesRegex(ValueError, "require optimizer: muon"):
+                replace(base, muon_momentum=0.9)
+
+            invalid_options = (
+                ("optimizer", "sgd", "optimizer"),
+                ("muon_learning_rate", 0.0, "muon_learning_rate"),
+                ("muon_learning_rate", float("inf"), "finite"),
+                ("muon_weight_decay", -0.01, "muon_weight_decay"),
+                ("muon_momentum", 1.0, "muon_momentum"),
+                ("muon_momentum", True, "finite"),
+                ("muon_nesterov", 1, "muon_nesterov"),
+                ("muon_ns_steps", 0, "muon_ns_steps"),
+                ("muon_ns_steps", 100, "muon_ns_steps"),
+                ("muon_ns_steps", True, "muon_ns_steps"),
+                ("muon_epsilon", 0.0, "muon_epsilon"),
+                ("muon_adjust_lr_fn", "none", "muon_adjust_lr_fn"),
+            )
+            for field_name, value, message in invalid_options:
+                validation_base = (
+                    base if field_name == "optimizer" else replace(base, optimizer="muon")
+                )
+                with (
+                    self.subTest(field=field_name, value=value),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    replace(validation_base, **{field_name: value})
+
+    def test_grpo_muon_builder_receives_explicit_options_and_single_scheduler_optimizer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "dataset").mkdir()
+            parent, parent_manifest = write_sft_parent(root)
+            reference = grpo_reference_identity(parent, parent_manifest)
+            runtime = toy_runtime(parent_manifest)
+            config = replace(
+                stage_config(root, parent),
+                optimizer="muon",
+                learning_rate=4e-5,
+                weight_decay=0.03,
+                adam_beta1=0.8,
+                adam_beta2=0.9,
+                adam_epsilon=2e-8,
+                muon_learning_rate=3e-5,
+                muon_weight_decay=0.02,
+                muon_momentum=0.9,
+                muon_nesterov=False,
+                muon_ns_steps=4,
+                muon_epsilon=2e-7,
+                muon_adjust_lr_fn="original",
+            )
+            captured = {}
+
+            def build_muon(model, mapping):
+                self.assertIs(model, runtime.policy)
+                captured.update(mapping)
+                return torch.optim.AdamW(
+                    [parameter for parameter in model.parameters() if parameter.requires_grad],
+                    lr=mapping["learning_rate"],
+                    weight_decay=mapping["weight_decay"],
+                )
+
+            with patch.object(
+                stage_module,
+                "build_muon_optimizer",
+                side_effect=build_muon,
+            ) as builder:
+                final = run_grpo_stage(
+                    config,
+                    runtime=runtime,
+                    dataset=ToyPromptDataset(),
+                    dataset_identity=dataset_identity(root / "dataset"),
+                    reference_identity=reference,
+                    context=DistributedContext(0, 0, 1, 1),
+                    device=torch.device("cpu"),
+                )
+
+            builder.assert_called_once()
+            self.assertTrue((final / "pytorch_model.bin").is_file())
+            self.assertTrue((root / "run" / "checkpoint-1" / "optimizer.pt").is_file())
+            self.assertEqual(
+                captured,
+                {
+                    "optimizer": "muon",
+                    "learning_rate": 4e-5,
+                    "weight_decay": 0.03,
+                    "adam_beta1": 0.8,
+                    "adam_beta2": 0.9,
+                    "adam_epsilon": 2e-8,
+                    "muon_learning_rate": 3e-5,
+                    "muon_weight_decay": 0.02,
+                    "muon_momentum": 0.9,
+                    "muon_nesterov": False,
+                    "muon_ns_steps": 4,
+                    "muon_epsilon": 2e-7,
+                    "muon_adjust_lr_fn": "original",
+                },
+            )
 
     def test_full_cpu_stage_saves_atomic_resume_state_and_loadable_export(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -28,7 +28,8 @@ class SpeakerEncoderTest(unittest.TestCase):
         encoded = encoder(latent) * 6.0
 
         expected = torch.tensor([[[1.0, 2.0, 10.0, 20.0], [3.0, 4.0, 30.0, 40.0]]])
-        torch.testing.assert_close(encoded, expected)
+        torch.testing.assert_close(encoded[:, :1], torch.zeros_like(encoded[:, :1]))
+        torch.testing.assert_close(encoded[:, 1:], expected)
 
     def test_frame_count_must_align_to_patch_size(self):
         encoder = SpeakerEncoder(
@@ -59,9 +60,11 @@ class SpeakerEncoderTest(unittest.TestCase):
         original = encoder(torch.tensor([[[1.0, 2.0]]]), mask)
         changed_masked_patch = encoder(torch.tensor([[[1000.0, 2.0]]]), mask)
 
-        torch.testing.assert_close(original[:, 1], changed_masked_patch[:, 1])
+        # State zero is the global timbre token; state two is the later valid patch.
+        torch.testing.assert_close(original[:, 0], changed_masked_patch[:, 0])
+        torch.testing.assert_close(original[:, 2], changed_masked_patch[:, 2])
 
-    def test_causal_and_padding_masks_are_composed_for_minimum_torch_support(self):
+    def test_bidirectional_padding_mask_includes_the_global_timbre_token(self):
         encoder = SpeakerEncoder(
             latent_size=1,
             patch_size=1,
@@ -111,10 +114,10 @@ class SpeakerEncoderTest(unittest.TestCase):
         self.assertFalse(is_causal)
         torch.testing.assert_close(
             composed_mask,
-            torch.tensor([[[[True, False, False], [True, True, False], [True, True, False]]]]),
+            torch.tensor([[[[True, True, True, False]]]]),
         )
 
-    def test_masked_causal_path_cannot_see_a_future_valid_patch(self):
+    def test_global_timbre_token_uses_future_valid_patches_bidirectionally(self):
         torch.manual_seed(5678)
         encoder = SpeakerEncoder(
             latent_size=1,
@@ -130,7 +133,7 @@ class SpeakerEncoderTest(unittest.TestCase):
         original = encoder(torch.tensor([[[1.0, 2.0, 0.0]]]), mask)
         changed_future = encoder(torch.tensor([[[1.0, 1000.0, 0.0]]]), mask)
 
-        torch.testing.assert_close(original[:, 0], changed_future[:, 0])
+        self.assertFalse(torch.allclose(original[:, 0], changed_future[:, 0]))
 
     def test_mask_shape_must_match_patch_count(self):
         encoder = SpeakerEncoder(
@@ -142,7 +145,7 @@ class SpeakerEncoderTest(unittest.TestCase):
             intermediate_size=4,
             norm_eps=1e-6,
         )
-        with self.assertRaisesRegex(ValueError, "Speaker mask must have shape"):
+        with self.assertRaisesRegex(ValueError, "Speaker mask must have patch shape"):
             encoder(torch.ones(1, 1, 2), torch.ones(1, 1, dtype=torch.bool))
 
 

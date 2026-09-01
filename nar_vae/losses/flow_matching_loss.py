@@ -9,6 +9,15 @@ import torch.nn.functional as F
 
 from nar_vae.models.alignment import durations_from_alignment
 from nar_vae.models.duration import DurationAlignmentOutput
+from nar_vae.objectives import (
+    DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+    RECTIFIED_FLOW_OBJECTIVE,
+    VP_DIFFUSION_OBJECTIVE,
+    normalize_generative_objective,
+    shifted_cosine_vp_coefficients,
+    unwrap_generation_contract_model,
+    validate_diffusion_schedule_shift,
+)
 
 _LEGACY_SIGMA_MIN = 1e-4
 
@@ -17,29 +26,94 @@ def _finite_real(value: object) -> bool:
     return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
+def _exposed_model_generation_contract(model: nn.Module) -> tuple[str, float] | None:
+    """Resolve the optional contract from the canonical training model."""
+    current = unwrap_generation_contract_model(model)
+    missing = object()
+    objective = getattr(current, "generative_objective", missing)
+    schedule_shift = getattr(current, "diffusion_schedule_shift", missing)
+    if objective is missing and schedule_shift is missing:
+        return None
+    if objective is missing or schedule_shift is missing:
+        raise ValueError(
+            "The training model exposes an incomplete generative objective/schedule contract."
+        )
+    normalized_objective = normalize_generative_objective(objective)
+    normalized_shift = validate_diffusion_schedule_shift(schedule_shift)
+    if (
+        normalized_objective == RECTIFIED_FLOW_OBJECTIVE
+        and normalized_shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT
+    ):
+        raise ValueError(
+            "A rectified-flow training model cannot declare a shifted diffusion schedule."
+        )
+    return normalized_objective, normalized_shift
+
+
 @dataclass(frozen=True)
 class AccumulationLossNormalization:
-    """Local valid-item totals for one gradient-accumulation window.
+    """Valid-item totals for one complete gradient-accumulation window.
 
-    Each rank builds these totals from every microbatch in the upcoming optimizer
-    step.  ``_global_valid_mean`` combines them across ranks, which makes ragged
-    frame-budget training equivalent to reducing each objective over the complete
-    effective global batch instead of averaging already-normalized microbatches.
+    The training DataLoader integration can reduce all four counters across ranks
+    in one packed collective before the window's forward passes.  In that case
+    ``globally_reduced`` is true and ``world_size`` records the DDP gradient-average
+    compensation.  Direct callers may retain rank-local counts for compatibility.
     """
 
     velocity_elements: torch.Tensor
     examples: torch.Tensor
     text_tokens: torch.Tensor
     alignment_frames: torch.Tensor
+    globally_reduced: bool = False
+    world_size: int = 1
 
 
 def _global_valid_mean(
     numerator: torch.Tensor,
     count: torch.Tensor,
     accumulation_count: torch.Tensor | None = None,
+    *,
+    accumulation_is_global: bool = False,
+    normalization_world_size: int | None = None,
 ) -> torch.Tensor:
     """Normalize ragged losses globally while preserving correct DDP gradient scaling."""
     distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+    if accumulation_count is not None and accumulation_is_global:
+        if numerator.numel() != 1 or count.numel() != 1 or accumulation_count.numel() != 1:
+            raise ValueError("Loss numerator and valid-item counts must be scalar.")
+        world_size = dist.get_world_size() if distributed else 1
+        if normalization_world_size is None:
+            normalization_world_size = world_size
+        if normalization_world_size != world_size:
+            raise ValueError(
+                "Accumulation normalization world size does not match the active process group."
+            )
+        local_count = count.to(device=numerator.device, dtype=torch.float32)
+        denominator = accumulation_count.to(device=numerator.device, dtype=torch.float32)
+        # These assertions enqueue device-side checks without forcing a host sync
+        # on every objective and microbatch. Dataset/collator validation owns shape
+        # errors; this guard retains prompt failure for nonfinite training state.
+        torch._assert_async(
+            torch.isfinite(numerator.detach()).all(),
+            "Loss numerator must be finite.",
+        )
+        torch._assert_async(
+            torch.isfinite(local_count).all()
+            & (local_count > 0).all()
+            & (local_count <= denominator).all(),
+            "Local valid-item count must be finite, positive, and no greater than the "
+            "window count.",
+        )
+        torch._assert_async(
+            torch.isfinite(denominator).all() & (denominator > 0).all(),
+            "Global accumulation count must be finite and positive.",
+        )
+        # DDP averages gradients. Multiplying each rank's local numerator by the
+        # world size yields the exact derivative of the global valid-item mean,
+        # without another forward-path collective. Detached global metrics are
+        # intentionally reduced only at logging boundaries by the Trainer.
+        return numerator * world_size / denominator
 
     count_error = False
     try:
@@ -219,14 +293,20 @@ def sample_stratified_logit_normal(
 
 class FlowMatchingLoss(nn.Module):
     """
-    Flow matching loss for continuous data.
+    Continuous-latent generative loss with versioned flow and diffusion paths.
 
-    Implements the conditional flow matching objective:
+    ``rectified_flow`` implements the legacy conditional flow-matching objective:
     - Sample timestep t ~ LogitNormal (stratified) or Uniform
     - Sample noise x_0 ~ N(0, I)
     - Interpolate: x_t = (1-t) * x_0 + t * x_1
     - Target velocity: v = x_1 - x_0
     - Loss: MSE(model(x_t, t, cond), v)
+
+    ``vp_diffusion_v`` is strict cosine variance-preserving diffusion with
+    v-prediction.  In the library's noise-to-data time direction:
+    - alpha(t) = sin(pi*t/2), sigma(t) = cos(pi*t/2)
+    - x_t = alpha(t) * x_1 + sigma(t) * epsilon
+    - v = sigma(t) * x_1 - alpha(t) * epsilon
 
     Args:
         sigma_min: Fixed legacy compatibility sentinel. The straight interpolation path does
@@ -246,6 +326,8 @@ class FlowMatchingLoss(nn.Module):
     def __init__(
         self,
         sigma_min: float = 1e-4,
+        generative_objective: str = RECTIFIED_FLOW_OBJECTIVE,
+        diffusion_schedule_shift: float = DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
         velocity_weighted: bool = False,
         timestep_distribution: str = "stratified_logit_normal",
         logit_normal_loc: float = 0.0,
@@ -257,6 +339,13 @@ class FlowMatchingLoss(nn.Module):
         mas_alignment_loss_weight: float = 0.0,
     ):
         super().__init__()
+        self.generative_objective = normalize_generative_objective(generative_objective)
+        self.diffusion_schedule_shift = validate_diffusion_schedule_shift(diffusion_schedule_shift)
+        if (
+            self.generative_objective == RECTIFIED_FLOW_OBJECTIVE
+            and self.diffusion_schedule_shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT
+        ):
+            raise ValueError("diffusion_schedule_shift is only meaningful for vp_diffusion_v.")
         if not isinstance(velocity_weighted, bool):
             raise ValueError("velocity_weighted must be a boolean")
         if timestep_distribution not in {
@@ -329,6 +418,9 @@ class FlowMatchingLoss(nn.Module):
         language_ids: torch.Tensor | None = None,  # [B] target-language IDs
         token_durations: torch.Tensor | None = None,  # [B, L] fixed MAS allocation
         accumulation_normalization: AccumulationLossNormalization | None = None,
+        token_language_ids: torch.Tensor | None = None,  # [B, L]
+        alignment_mask: torch.Tensor | None = None,  # [B, L] speakable tokens
+        conditioning_features: torch.Tensor | None = None,  # [B, L, F]
     ) -> torch.Tensor:
         """
         Compute flow matching loss.
@@ -338,19 +430,70 @@ class FlowMatchingLoss(nn.Module):
             latents: Target latents [B, D, T]
             conditioning_ids: Text conditioning [B, L]
             conditioning_mask: Mask for text [B, L]
+            token_language_ids: Optional per-token language IDs for code-switched text
+            alignment_mask: Possibly non-contiguous subset of text tokens allowed to own frames
+            conditioning_features: Optional cached frozen-backbone states aligned to the
+                conditioning token axis
             latent_mask: Mask for latents [B, T]
             speaker_latent: Speaker reference latents [B, D, T_speaker] (optional)
             speaker_mask: Valid speaker frames or patches (optional)
             language_ids: Stable target-language IDs (optional for legacy English)
             token_durations: Fixed inference-graph token allocation for velocity-only replay
             accumulation_normalization: Per-objective valid-item totals across all
-                microbatches in the current optimizer step on this rank.
+                microbatches in the current optimizer step, optionally reduced globally.
 
         Returns:
             Loss scalar
         """
+        model_contract = _exposed_model_generation_contract(model)
+        loss_contract = (self.generative_objective, self.diffusion_schedule_shift)
+        if model_contract is not None and model_contract != loss_contract:
+            raise ValueError(
+                "FlowMatchingLoss generative objective/schedule does not match the training "
+                f"model: loss={loss_contract!r}, model={model_contract!r}."
+            )
         B, D, T = latents.shape
         device = latents.device
+        if conditioning_ids.ndim != 2 or conditioning_ids.shape[0] != B:
+            raise ValueError("conditioning_ids must have shape [batch, token].")
+        expected_conditioning_shape = tuple(conditioning_ids.shape)
+        if conditioning_features is not None:
+            if (
+                conditioning_features.ndim != 3
+                or tuple(conditioning_features.shape[:2]) != expected_conditioning_shape
+            ):
+                raise ValueError(
+                    "conditioning_features must have shape [batch, conditioning_token, feature]."
+                )
+            if conditioning_features.shape[-1] <= 0:
+                raise ValueError("conditioning_features must have a positive feature width.")
+            if not torch.is_floating_point(conditioning_features):
+                raise TypeError("conditioning_features must use a floating-point dtype.")
+        if conditioning_mask is not None:
+            if tuple(conditioning_mask.shape) != expected_conditioning_shape:
+                raise ValueError("conditioning_mask must have the conditioning_ids shape.")
+            conditioning_mask = conditioning_mask.to(device=device, dtype=torch.bool)
+        if token_language_ids is not None:
+            if tuple(token_language_ids.shape) != expected_conditioning_shape:
+                raise ValueError("token_language_ids must have the conditioning_ids shape.")
+            token_language_ids = token_language_ids.to(device=device, dtype=torch.long)
+        if alignment_mask is not None:
+            if tuple(alignment_mask.shape) != expected_conditioning_shape:
+                raise ValueError("alignment_mask must have the conditioning_ids shape.")
+            alignment_mask = alignment_mask.to(device=device, dtype=torch.bool)
+            if conditioning_mask is not None and bool((alignment_mask & ~conditioning_mask).any()):
+                raise ValueError("alignment_mask cannot select padded conditioning tokens.")
+            if not bool(alignment_mask.any(dim=1).all()):
+                raise ValueError("Every alignment_mask row must select at least one token.")
+        effective_alignment_mask = (
+            alignment_mask
+            if alignment_mask is not None
+            else (
+                conditioning_mask
+                if conditioning_mask is not None
+                else torch.ones_like(conditioning_ids, dtype=torch.bool, device=device)
+            )
+        )
         if latent_mask is not None:
             expected_shape = (B, T)
             if tuple(latent_mask.shape) != expected_shape:
@@ -380,15 +523,27 @@ class FlowMatchingLoss(nn.Module):
         else:
             raise ValueError(f"Unknown timestep distribution: {self.timestep_distribution}")
 
-        # Sample source noise
+        # Sample source noise. The clean/noise notation remains explicit so the
+        # strict diffusion path cannot accidentally fall back to straight flow.
         x_0 = torch.randn_like(latents)
         x_1 = latents
 
-        # Interpolate (conditional flow matching)
-        x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
-
-        # Target velocity
-        v_target = x_1 - x_0
+        if self.generative_objective == RECTIFIED_FLOW_OBJECTIVE:
+            x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
+            v_target = x_1 - x_0
+        elif self.generative_objective == VP_DIFFUSION_OBJECTIVE:
+            alpha, sigma = shifted_cosine_vp_coefficients(
+                t,
+                self.diffusion_schedule_shift,
+            )
+            alpha = alpha[:, None, None].to(dtype=latents.dtype)
+            sigma = sigma[:, None, None].to(dtype=latents.dtype)
+            x_t = alpha * x_1 + sigma * x_0
+            # v-parameterization permits stable reconstruction of either clean
+            # data or noise without dividing by a vanishing schedule term.
+            v_target = sigma * x_1 - alpha * x_0
+        else:  # pragma: no cover - constructor normalization is exhaustive
+            raise AssertionError(f"Unhandled generative objective: {self.generative_objective}.")
 
         # Model prediction (use keyword arguments)
         model_kwargs = {
@@ -401,6 +556,12 @@ class FlowMatchingLoss(nn.Module):
             "language_ids": language_ids,
             "use_cfg_dropout": True,
         }
+        if token_language_ids is not None:
+            model_kwargs["token_language_ids"] = token_language_ids
+        if alignment_mask is not None:
+            model_kwargs["alignment_mask"] = alignment_mask
+        if conditioning_features is not None:
+            model_kwargs["conditioning_features"] = conditioning_features
         if latent_mask is not None:
             model_kwargs["latent_mask"] = latent_mask
         use_mas_duration = self.mas_duration_loss_weight > 0
@@ -448,12 +609,40 @@ class FlowMatchingLoss(nn.Module):
             if not isinstance(model_output, torch.Tensor):
                 raise RuntimeError("Legacy flow loss expects a tensor velocity prediction.")
             v_pred = model_output
+        if not isinstance(v_pred, torch.Tensor):
+            raise RuntimeError("Flow model must return a tensor velocity prediction.")
+        if tuple(v_pred.shape) != tuple(v_target.shape):
+            raise ValueError(
+                "Velocity prediction must have the target latent shape "
+                f"{tuple(v_target.shape)}; got {tuple(v_pred.shape)}."
+            )
 
         if accumulation_normalization is not None and not isinstance(
             accumulation_normalization,
             AccumulationLossNormalization,
         ):
             raise TypeError("accumulation_normalization must be an AccumulationLossNormalization.")
+
+        def valid_mean(
+            numerator: torch.Tensor,
+            count: torch.Tensor,
+            normalization_count: torch.Tensor | None,
+        ) -> torch.Tensor:
+            return _global_valid_mean(
+                numerator,
+                count,
+                normalization_count,
+                accumulation_is_global=(
+                    accumulation_normalization.globally_reduced
+                    if accumulation_normalization is not None
+                    else False
+                ),
+                normalization_world_size=(
+                    accumulation_normalization.world_size
+                    if accumulation_normalization is not None
+                    else None
+                ),
+            )
 
         # Compute MSE loss
         loss = F.mse_loss(v_pred, v_target, reduction="none")
@@ -472,7 +661,7 @@ class FlowMatchingLoss(nn.Module):
             # Expand mask to match latent dimensions [B, T] -> [B, D, T]
             mask = latent_mask[:, None, :].expand_as(loss)
             loss = loss * mask
-            loss = _global_valid_mean(
+            loss = valid_mean(
                 loss.sum(),
                 mask.sum(),
                 None
@@ -480,7 +669,7 @@ class FlowMatchingLoss(nn.Module):
                 else accumulation_normalization.velocity_elements,
             )
         else:
-            loss = _global_valid_mean(
+            loss = valid_mean(
                 loss.sum(),
                 torch.tensor(loss.numel(), device=device),
                 None
@@ -509,7 +698,7 @@ class FlowMatchingLoss(nn.Module):
                     delta=self.duration_huber_delta,
                     reduction="none",
                 )
-                duration_loss = _global_valid_mean(
+                duration_loss = valid_mean(
                     total_errors.sum(),
                     torch.tensor(B, device=device),
                     None
@@ -521,11 +710,7 @@ class FlowMatchingLoss(nn.Module):
         if use_mas_duration:
             if not isinstance(duration_prediction, DurationAlignmentOutput):
                 raise RuntimeError("MAS objective requires a versioned DurationAlignmentOutput.")
-            token_mask = (
-                conditioning_mask.to(device=device, dtype=torch.bool)
-                if conditioning_mask is not None
-                else torch.ones_like(conditioning_ids, dtype=torch.bool)
-            )
+            token_mask = effective_alignment_mask
             frame_mask = (
                 latent_mask
                 if latent_mask is not None
@@ -563,14 +748,14 @@ class FlowMatchingLoss(nn.Module):
                 delta=self.duration_huber_delta,
                 reduction="none",
             )
-            token_duration_loss = _global_valid_mean(
+            token_duration_loss = valid_mean(
                 token_errors.masked_select(token_mask).sum(),
                 token_mask.sum(),
                 None
                 if accumulation_normalization is None
                 else accumulation_normalization.text_tokens,
             )
-            alignment_loss = _global_valid_mean(
+            alignment_loss = valid_mean(
                 -duration_prediction.log_likelihoods.masked_select(alignment).sum(),
                 alignment.sum(),
                 None

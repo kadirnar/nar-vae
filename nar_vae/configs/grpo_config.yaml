@@ -1,9 +1,11 @@
 # NAR-VAE flow-native GRPO post-training configuration.
 #
-# This stage accepts only a local NAR-VAE SFT checkpoint whose model and training
-# manifests retain the original scratch-pretraining parent. It never imports a
-# third-party pretrained TTS model. Reward evaluators are injected through the
-# Python API and their exact identities must be recorded below.
+# This stage accepts only a legacy rectified-flow NAR-VAE SFT checkpoint whose
+# model and training manifests retain the original scratch-pretraining parent.
+# Canonical vp_diffusion_v checkpoints are rejected until a diffusion-native
+# policy objective is implemented. It never imports a third-party pretrained TTS
+# model. Reward evaluators are injected through the Python API and their exact
+# identities must be recorded below.
 
 training_stage: "grpo"
 parent_checkpoint: "./checkpoints/nar_vae_small_sft/final/flow_model/pytorch_model.bin"
@@ -33,11 +35,24 @@ advantage_epsilon: 1.0e-6
 log_ratio_clip: 20.0
 event_reduction: "mean"
 
+optimizer: "adamw"
 learning_rate: 1.0e-6
 weight_decay: 0.01
 adam_beta1: 0.9
 adam_beta2: 0.999
 adam_epsilon: 1.0e-8
+
+# Optional hybrid Muon + AdamW example. Muon owns eligible hidden 2-D weights;
+# AdamW continues to own embeddings, heads, norms, biases, and other parameters.
+# optimizer: "muon"
+# muon_learning_rate: 1.0e-6  # Omit to reuse learning_rate.
+# muon_weight_decay: 0.01     # Omit to reuse weight_decay.
+# muon_momentum: 0.95
+# muon_nesterov: true
+# muon_ns_steps: 5
+# muon_epsilon: 1.0e-7
+# muon_adjust_lr_fn: "match_rms_adamw"  # or "original".
+
 warmup_steps: 0
 lr_scheduler_type: "cosine"  # constant, linear, or cosine.
 

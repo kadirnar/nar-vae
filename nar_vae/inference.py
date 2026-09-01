@@ -1,9 +1,10 @@
 import math
 import time
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
-import tiktoken
 import torch
 import torch.nn.functional as F
 import torchaudio
@@ -20,8 +21,14 @@ from nar_vae.configuration import (
     validate_cache_dit_options,
 )
 from nar_vae.dacvae import HubDACVAESource, load_dacvae, normalize_dacvae_source
+from nar_vae.dacvae_encoding import (
+    derive_dacvae_posterior_seed,
+    encode_dacvae_posterior_seeded,
+)
+from nar_vae.frozen_text_provider import FrozenTextProvider, FrozenTextProviderSpec
 from nar_vae.languages import (
     DEFAULT_LANGUAGE,
+    LANGUAGE_COUNT,
     CrossLingualUnsupportedError,
     LanguagePair,
     MultilingualUnsupportedError,
@@ -36,12 +43,94 @@ from nar_vae.model_manifest import (
     validate_manifest_weight,
 )
 from nar_vae.model_presets import get_model_preset
+from nar_vae.models.duration import ECHODIT_ARCHITECTURE_VERSION
 from nar_vae.models.flow_matching import create_flow_matching_echodit
+from nar_vae.objectives import (
+    DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+    RECTIFIED_FLOW_OBJECTIVE,
+    VP_DIFFUSION_OBJECTIVE,
+    normalize_generative_objective,
+    validate_diffusion_schedule_shift,
+)
 from nar_vae.solvers.ode_solver import ODESolver
-from nar_vae.tokenization import PAD_TOKEN, TOTAL_VOCAB_SIZE, encode_tts_text
+from nar_vae.tokenization import (
+    PAD_TOKEN,
+    TOKENIZER_NAME,
+    TOTAL_VOCAB_SIZE,
+    TextSpan,
+    encode_tts_conditioning,
+)
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 AudioReference = str | Path | torch.Tensor
+
+_ACOUSTIC_DTYPE_ALIASES = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+}
+
+
+def _normalize_acoustic_dtype(value: str | torch.dtype) -> torch.dtype:
+    """Resolve the two inference precisions validated by the public runtime."""
+    if value is torch.float32 or value is torch.bfloat16:
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        try:
+            return _ACOUSTIC_DTYPE_ALIASES[normalized]
+        except KeyError as exc:
+            raise ValueError(
+                "acoustic_dtype must be 'float32'/'fp32' or 'bfloat16'/'bf16'."
+            ) from exc
+    raise ValueError("acoustic_dtype must be a supported dtype name or torch.dtype.")
+
+
+def _cast_acoustic_parameters(model: torch.nn.Module, dtype: torch.dtype) -> None:
+    """Cast learned floating state without applying a dtype transform to buffers."""
+    dtype = _normalize_acoustic_dtype(dtype)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if torch.is_floating_point(parameter):
+                parameter.data = parameter.detach().to(
+                    device=parameter.device,
+                    dtype=dtype,
+                )
+
+
+def _runtime_generation_contract(runtime: object) -> tuple[str, float]:
+    """Resolve objective metadata for compatible custom/test runtimes.
+
+    Authenticated runtimes always set these values from their checkpoint manifest in
+    ``__init__``.  Lightweight integrations that construct the runtime protocol via
+    ``__new__`` may instead expose them on the acoustic model; complete absence is the
+    unambiguous legacy rectified-flow contract.
+    """
+    model = getattr(runtime, "flow_model", None)
+    objective = getattr(runtime, "generative_objective", None)
+    if objective is None:
+        objective = getattr(model, "generative_objective", RECTIFIED_FLOW_OBJECTIVE)
+    schedule_shift = getattr(runtime, "diffusion_schedule_shift", None)
+    if schedule_shift is None:
+        schedule_shift = getattr(
+            model,
+            "diffusion_schedule_shift",
+            DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+        )
+    return (
+        normalize_generative_objective(objective),
+        validate_diffusion_schedule_shift(schedule_shift),
+    )
+
+
+@dataclass(frozen=True)
+class _PreparedText:
+    conditioning_ids: torch.Tensor
+    conditioning_mask: torch.Tensor | None
+    conditioning_features: torch.Tensor | None
+    token_language_ids: torch.Tensor
+    alignment_mask: torch.Tensor
 
 
 class VoiceCloningUnsupportedError(RuntimeError):
@@ -54,13 +143,16 @@ class LearnedDurationUnsupportedError(RuntimeError):
 
 class FlowMatchingTTSInference:
     """
-    Inference pipeline for EchoDiT Flow Matching TTS.
+    Inference pipeline for versioned NAR-VAE TTS checkpoints.
 
-    Generates speech audio from text using:
-    1. Standalone tokenizer (text → token IDs) - tiktoken, no LLM
-    2. EchoDiT (built-in text encoder processes token IDs → embeddings)
-    3. ODE solver (generates latents from noise)
-    4. DACVAE decoder (latents → audio)
+    The canonical path uses:
+    1. Reviewed provider-native phones and the pinned frozen multilingual provider
+    2. A small learned adapter plus language/reference conditioning
+    3. Strict VP diffusion sampled with analytic DDIM or an authenticated ODE trajectory
+    4. The unchanged DACVAE decoder (continuous latents → audio)
+
+    The compact-token frontend and built-in text Transformer remain available only for
+    explicitly identified legacy scratch-token checkpoints.
 
     Args:
         flow_model_path: Path to trained EchoDiT checkpoint
@@ -68,19 +160,23 @@ class FlowMatchingTTSInference:
         dacvae_backend: DACVAE implementation ("bundled", "fast", or "auto")
         device: Device to run on (default: "cuda")
         latent_size: DACVAE latent dimension (default: 128)
-        model_size: EchoDiT hidden size (default: 1024 for 1B model)
-        num_layers: Number of EchoDiT layers (default: 24 for 1B model)
-        num_heads: Number of attention heads (default: 16 for 1B model)
-        intermediate_size: MLP intermediate size (default: 4096 for 1B model)
+        model_size: EchoDiT hidden size (default: 1024 for the xlarge topology)
+        num_layers: Number of EchoDiT layers (default: 24 for xlarge)
+        num_heads: Number of attention heads (default: 16 for xlarge)
+        intermediate_size: MLP intermediate size (default: 4096 for xlarge)
         text_vocab_size: Vocabulary size (default: inferred from checkpoint)
         text_num_layers: Text encoder layers (default: 6)
+        target_patch_size: Target-latent packing factor (default: inferred from checkpoint)
         speaker_patch_size: Speaker encoder patch size (inferred for clone-capable checkpoints)
         speaker_model_size: Speaker encoder hidden size (default: 512)
         speaker_num_layers: Speaker encoder layers (default: 4)
         speaker_num_heads: Speaker encoder attention heads (default: 8)
         speaker_intermediate_size: Speaker encoder MLP size (default: 2048)
+        speaker_num_summary_tokens: Fixed reference token count (default: inferred)
         use_speaker_conditioning: Build speaker-conditioning state (default: inferred)
         use_duration_predictor: Use learned duration only when checkpoint metadata validates it
+        acoustic_dtype: Acoustic EchoDiT precision: float32/fp32 or bfloat16/bf16. The immutable
+            DACVAE and all acoustic-model buffers retain their authenticated dtypes.
     """
 
     def __init__(
@@ -89,14 +185,15 @@ class FlowMatchingTTSInference:
         dacvae_model: str | Path | HubDACVAESource | None = None,
         dacvae_backend: str = "bundled",
         device: str = "cuda",
-        # EchoDiT model config (must match training) - 1B model defaults
+        # EchoDiT model config (must match training) - xlarge topology defaults
         latent_size: int = 128,
         model_size: int = 1024,
         num_layers: int = 24,
         num_heads: int = 16,
         intermediate_size: int = 4096,
         text_vocab_size: int | None = None,
-        text_num_layers: int = 6,
+        text_num_layers: int | None = None,
+        target_patch_size: int | None = None,
         # Speaker encoder config (must match training)
         speaker_patch_size: int | None = None,  # Inferred for speaker checkpoints
         speaker_model_size: int = 512,
@@ -115,7 +212,11 @@ class FlowMatchingTTSInference:
         adaln_rank: int = 128,
         norm_eps: float = 1e-6,
         use_duration_predictor: bool | None = None,
+        frozen_text_provider: object | None = None,
+        speaker_num_summary_tokens: int | None = None,
+        acoustic_dtype: str | torch.dtype = "float32",
     ):
+        self.acoustic_dtype = _normalize_acoustic_dtype(acoustic_dtype)
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.latent_size = latent_size
         self.max_reference_seconds = max_reference_seconds
@@ -151,10 +252,61 @@ class FlowMatchingTTSInference:
             prefer_ema=prefer_ema,
             preload_validator=validate_before_deserialization,
         )
+        checkpoint.validate_architecture()
+        checkpoint_objective = checkpoint.generative_objective()
+        checkpoint_schedule_shift = checkpoint.diffusion_schedule_shift()
+        checkpoint_text_conditioning = checkpoint.text_conditioning()
+        self.generative_objective = checkpoint_objective
+        self.diffusion_schedule_shift = checkpoint_schedule_shift
+        self.text_conditioning_mode = checkpoint_text_conditioning.mode
+        checkpoint_target_patch_size = checkpoint.infer_target_patch_size()
+        if target_patch_size is None:
+            target_patch_size = checkpoint_target_patch_size
+        elif target_patch_size != checkpoint_target_patch_size:
+            raise ValueError(
+                "Requested target_patch_size does not match checkpoint metadata: "
+                f"{target_patch_size} != {checkpoint_target_patch_size}."
+            )
         self.checkpoint_provenance = checkpoint.provenance
         if text_vocab_size is None:
-            text_vocab_size = checkpoint.infer_text_vocab_size(TOTAL_VOCAB_SIZE)
+            manifest_vocab_size = (
+                int(preloaded_manifest.architecture["text_vocab_size"])
+                if preloaded_manifest is not None
+                else TOTAL_VOCAB_SIZE
+            )
+            text_vocab_size = checkpoint.infer_text_vocab_size(manifest_vocab_size)
+        if checkpoint_text_conditioning.mode == "frozen_features":
+            if text_num_layers is None:
+                text_num_layers = 0
+            elif text_num_layers != 0:
+                raise ValueError(
+                    "Frozen-feature checkpoints require text_num_layers=0 at inference."
+                )
+            conditioning_feature_size = checkpoint_text_conditioning.feature_size
+        else:
+            if text_num_layers is None:
+                text_num_layers = 6
+            conditioning_feature_size = None
         checkpoint_supports_voice_cloning = checkpoint.infer_speaker_conditioning(False)
+        inferred_summary_tokens = checkpoint.infer_speaker_num_summary_tokens()
+        if not isinstance(inferred_summary_tokens, int) or isinstance(
+            inferred_summary_tokens, bool
+        ):
+            # Compatibility for protocol mocks/custom loaders. The authenticated
+            # manifest comparison below remains authoritative for real runtimes.
+            inferred_summary_tokens = (
+                int(preloaded_manifest.architecture.get("speaker_num_summary_tokens", 0))
+                if preloaded_manifest is not None
+                else 0
+            )
+        if speaker_num_summary_tokens is None:
+            speaker_num_summary_tokens = inferred_summary_tokens
+        elif speaker_num_summary_tokens != inferred_summary_tokens:
+            raise VoiceCloningUnsupportedError(
+                "Requested speaker_num_summary_tokens does not match checkpoint metadata: "
+                f"{speaker_num_summary_tokens} != {inferred_summary_tokens}."
+            )
+        self.speaker_num_summary_tokens = speaker_num_summary_tokens
         requested_speaker_patch_size = speaker_patch_size
         if checkpoint_supports_voice_cloning:
             inferred_patch_size = checkpoint.infer_speaker_patch_size(4)
@@ -276,6 +428,7 @@ class FlowMatchingTTSInference:
             codec_source = normalize_dacvae_source(dacvae_model)
         self.dacvae_source = codec_source
         inference_architecture = {
+            "architecture_version": ECHODIT_ARCHITECTURE_VERSION,
             "latent_size": latent_size,
             "model_size": model_size,
             "num_layers": num_layers,
@@ -293,6 +446,8 @@ class FlowMatchingTTSInference:
             "adaln_rank": adaln_rank,
             "text_vocab_size": text_vocab_size,
             "speaker_patch_size": speaker_patch_size,
+            "speaker_num_summary_tokens": speaker_num_summary_tokens,
+            "target_patch_size": target_patch_size,
             "use_speaker_conditioning": bool(use_speaker_conditioning),
             "use_mas_duration": checkpoint_alignment.enabled,
             "norm_eps": float(norm_eps),
@@ -312,6 +467,18 @@ class FlowMatchingTTSInference:
             "monotonic_alignment": checkpoint_alignment.enabled,
             "duration_alignment_hidden_size": checkpoint_alignment.hidden_size,
         }
+        checkpoint_generation = {
+            "objective": checkpoint_objective,
+            "diffusion_schedule_shift": checkpoint_schedule_shift,
+        }
+        checkpoint_text_manifest = dict(self.model_manifest.text_conditioning)
+        checkpoint_text_manifest.update(
+            {
+                "mode": checkpoint_text_conditioning.mode,
+                "feature_size": checkpoint_text_conditioning.feature_size,
+                "adapter_version": checkpoint_text_conditioning.adapter_version,
+            }
+        )
         validate_inference_manifest(
             self.model_manifest,
             checkpoint_path=checkpoint.path,
@@ -324,19 +491,69 @@ class FlowMatchingTTSInference:
             ),
             architecture=inference_architecture,
             capabilities=checkpoint_capabilities,
+            generation=checkpoint_generation,
+            text_conditioning=checkpoint_text_manifest,
             codec_source=codec_source,
             codec_backend=dacvae_backend,
         )
 
-        # Load standalone tokenizer (tiktoken - NOT from any LLM)
-        print("Loading standalone tokenizer: tiktoken cl100k_base")
-        print("(No LLM model involved - just text → token ID conversion)")
-        self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        if self.text_conditioning_mode == "frozen_features":
+            expected_provider_spec = FrozenTextProviderSpec.from_manifest(self.model_manifest)
+            if frozen_text_provider is None:
+                frozen_text_provider = FrozenTextProvider.from_manifest(
+                    self.model_manifest,
+                    device=self.device,
+                )
+            actual_provider_spec = getattr(frozen_text_provider, "spec", None)
+            if actual_provider_spec != expected_provider_spec:
+                raise ValueError(
+                    "Injected frozen_text_provider does not match the authenticated model "
+                    "manifest text-conditioning contract."
+                )
+            validate_provider = getattr(
+                frozen_text_provider,
+                "validate_acoustic_contract",
+                None,
+            )
+            if not callable(validate_provider) or not callable(
+                getattr(frozen_text_provider, "encode", None)
+            ):
+                raise TypeError(
+                    "frozen_text_provider must expose encode() and validate_acoustic_contract()."
+                )
+            validate_provider(self.model_manifest)
+            self.frozen_text_provider = frozen_text_provider
+            self.text_pad_token = int(frozen_text_provider.pad_token_id)
+        else:
+            if frozen_text_provider is not None:
+                raise ValueError(
+                    "frozen_text_provider cannot be supplied to a scratch-token checkpoint."
+                )
+            self.frozen_text_provider = None
+            self.text_pad_token = PAD_TOKEN
+        print(
+            "Loading text frontend: "
+            + (
+                str(self.model_manifest.text_conditioning["encoder_id"])
+                if self.text_conditioning_mode == "frozen_features"
+                else TOKENIZER_NAME
+            )
+        )
 
         # Create EchoDiT model with built-in text encoder
         print("\nCreating EchoDiT model...")
-        print(f"EchoDiT has a built-in {text_num_layers}-layer text encoder")
-        print(f"Speaker encoder: patch_size={speaker_patch_size}")
+        print(
+            "EchoDiT text path: "
+            + (
+                f"frozen {conditioning_feature_size}-D features with a trainable adapter"
+                if self.text_conditioning_mode == "frozen_features"
+                else f"built-in {text_num_layers}-layer text encoder"
+            )
+        )
+        print(
+            "Speaker encoder: "
+            f"patch_size={speaker_patch_size}, summary_tokens={speaker_num_summary_tokens}"
+        )
         self.flow_model = create_flow_matching_echodit(
             latent_size=latent_size,
             model_size=model_size,
@@ -344,12 +561,16 @@ class FlowMatchingTTSInference:
             num_heads=num_heads,
             intermediate_size=intermediate_size,  # Use explicit parameter
             text_vocab_size=text_vocab_size,
+            text_conditioning_mode=self.text_conditioning_mode,
+            conditioning_feature_size=conditioning_feature_size,
             text_model_size=text_model_size,
             text_num_layers=text_num_layers,
             text_num_heads=text_num_heads,
             text_intermediate_size=text_intermediate_size,
             # Speaker encoder config
             speaker_patch_size=speaker_patch_size,
+            speaker_num_summary_tokens=speaker_num_summary_tokens,
+            target_patch_size=target_patch_size,
             speaker_model_size=speaker_model_size,
             speaker_num_layers=speaker_num_layers,
             speaker_num_heads=speaker_num_heads,
@@ -369,6 +590,8 @@ class FlowMatchingTTSInference:
             duration_predictor_use_speaker=checkpoint_duration.uses_speaker,
             use_mas_duration=checkpoint_alignment.enabled,
             duration_alignment_hidden_size=checkpoint_alignment.hidden_size or 64,
+            generative_objective=checkpoint_objective,
+            diffusion_schedule_shift=checkpoint_schedule_shift,
         )
 
         # Load checkpoint
@@ -376,6 +599,10 @@ class FlowMatchingTTSInference:
         checkpoint.load_into(self.flow_model)
         del checkpoint
 
+        # Cast authenticated CPU weights before the device transfer. This avoids
+        # staging a full FP32 acoustic model on the accelerator and never routes
+        # complex/FP64/non-persistent buffers through a dtype conversion.
+        _cast_acoustic_parameters(self.flow_model, self.acoustic_dtype)
         self.flow_model.to(self.device)
         self.flow_model.eval()
 
@@ -401,8 +628,9 @@ class FlowMatchingTTSInference:
         print(f"\n✓ Inference pipeline ready on {self.device}")
         print(f"  Sample rate: {self.sample_rate} Hz")
         print(f"  Frame rate: {self.frame_rate:.1f} frames/sec")
-        print("  Model: EchoDiT (built-in text encoder, no external LLM)")
-        print("  Tokenizer: tiktoken cl100k_base (standalone)")
+        print(f"  Acoustic dtype: {self.acoustic_dtype}")
+        print(f"  Objective: {self.generative_objective}")
+        print(f"  Text conditioning: {self.text_conditioning_mode}")
         print(f"  Voice cloning: {'available' if self.supports_voice_cloning else 'unavailable'}")
         print(f"  Languages: {', '.join(self.supported_languages)}")
         print(
@@ -418,8 +646,12 @@ class FlowMatchingTTSInference:
         conflicts = {
             name: (kwargs[name], expected)
             for name, expected in architecture.items()
-            if name in kwargs and kwargs[name] != expected
+            if name in kwargs
+            and kwargs[name] != expected
+            and not (name == "text_num_layers" and kwargs[name] == 0)
         }
+        if kwargs.get("text_num_layers") == 0:
+            architecture["text_num_layers"] = 0
         if conflicts:
             details = ", ".join(
                 f"{name}={actual!r} (preset {expected!r})"
@@ -434,16 +666,91 @@ class FlowMatchingTTSInference:
         """Return one of the packaged, validated inference profiles."""
         return self.settings.profile(name)
 
-    def _prepare_conditioning(self, text: str, language: str | None = None) -> torch.Tensor:
-        if not text or not text.strip():
-            raise ValueError("text must contain at least one non-whitespace character.")
-        token_ids = encode_tts_text(
+    def _prepare_conditioning(
+        self,
+        text: str,
+        language: str | None = None,
+        *,
+        normalized_text: str | None = None,
+        phonemes: str | Sequence[str] | None = None,
+        language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
+    ) -> _PreparedText:
+        if not isinstance(text, str):
+            raise TypeError("text must be a string.")
+        if not text.strip() and phonemes is None and not language_spans:
+            raise ValueError("text, phonemes, or language_spans must contain speech content.")
+        if getattr(self, "text_conditioning_mode", "scratch_tokens") == "frozen_features":
+            provider = getattr(self, "frozen_text_provider", None)
+            if provider is None:
+                raise RuntimeError(
+                    "Frozen-feature inference has no authenticated frozen text provider."
+                )
+            prepared = provider.encode(
+                text.strip(),
+                language=language,
+                normalized_text=normalized_text,
+                phonemes=phonemes,
+                language_spans=language_spans,
+            )
+            if prepared.contract_sha256 != provider.spec.contract_sha256:
+                raise RuntimeError(
+                    "Frozen text provider returned conditioning from a different contract."
+                )
+            self._validate_token_language_capability(prepared.token_language_ids)
+            return _PreparedText(
+                conditioning_ids=prepared.conditioning_ids.to(self.device)[None, :],
+                conditioning_mask=prepared.conditioning_mask.to(self.device)[None, :],
+                conditioning_features=prepared.conditioning_features.to(
+                    device=self.device,
+                    dtype=self._acoustic_state_dtype(),
+                )[None, :, :],
+                token_language_ids=prepared.token_language_ids.to(self.device)[None, :],
+                alignment_mask=prepared.alignment_mask.to(self.device)[None, :],
+            )
+        prepared = encode_tts_conditioning(
             text.strip(),
-            self.tokenizer,
             vocab_size=getattr(self, "text_vocab_size", None),
             language=language,
+            normalized_text=normalized_text,
+            phonemes=phonemes,
+            language_spans=language_spans,
         )
-        return torch.tensor([token_ids], dtype=torch.long, device=self.device)
+        self._validate_token_language_capability(prepared.token_language_ids)
+        return _PreparedText(
+            conditioning_ids=torch.tensor(
+                [prepared.conditioning_ids], dtype=torch.long, device=self.device
+            ),
+            conditioning_mask=None,
+            conditioning_features=None,
+            token_language_ids=torch.tensor(
+                [prepared.token_language_ids], dtype=torch.long, device=self.device
+            ),
+            alignment_mask=torch.tensor(
+                [prepared.alignment_mask], dtype=torch.bool, device=self.device
+            ),
+        )
+
+    def _validate_token_language_capability(self, values) -> None:
+        """Reject code-switch spans outside the authenticated checkpoint capability."""
+        token_languages = torch.as_tensor(values)
+        if token_languages.ndim != 1 or token_languages.dtype not in {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }:
+            raise ValueError("token_language_ids must be a rank-one integer axis.")
+        if bool((token_languages < 0).any()) or bool((token_languages > LANGUAGE_COUNT).any()):
+            raise ValueError(f"token_language_ids must be within [0, {LANGUAGE_COUNT}].")
+        supported = getattr(self, "supported_languages", (DEFAULT_LANGUAGE,))
+        allowed = {language_id(code) for code in supported}
+        observed = {int(value) for value in token_languages.tolist() if int(value) != 0}
+        if not observed.issubset(allowed):
+            raise MultilingualUnsupportedError(
+                "Conditioning contains code-switch token languages outside the checkpoint's "
+                f"supported_languages capability: {sorted(observed - allowed)}."
+            )
 
     def _resolve_language_pair(
         self,
@@ -502,6 +809,10 @@ class FlowMatchingTTSInference:
         conditioning_ids: torch.Tensor,
         language_ids: torch.Tensor | None,
         speaker_latent: torch.Tensor | None,
+        conditioning_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
         predicted_frames: torch.Tensor | None = None,
     ) -> tuple[float, int]:
         """Resolve seconds and DACVAE frames without granting capability to legacy weights."""
@@ -511,10 +822,19 @@ class FlowMatchingTTSInference:
 
         predicted = predicted_frames
         if predicted is None:
+            feature_kwargs = (
+                {"conditioning_features": conditioning_features}
+                if conditioning_features is not None
+                else {}
+            )
             predicted = self.flow_model.predict_duration_frames(
                 conditioning_ids,
+                attention_mask=conditioning_mask,
                 speaker_latent=speaker_latent,
                 language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
+                **feature_kwargs,
             )
         if predicted.numel() != 1:
             raise RuntimeError("Single-utterance duration prediction must return one frame count.")
@@ -543,6 +863,9 @@ class FlowMatchingTTSInference:
         num_frames: int,
         conditioning_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
         speaker_latent: torch.Tensor | None = None,
         expected_token_durations: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
@@ -550,18 +873,27 @@ class FlowMatchingTTSInference:
         if not getattr(self, "uses_mas_duration", False):
             return None
         if expected_token_durations is None:
+            feature_kwargs = (
+                {"conditioning_features": conditioning_features}
+                if conditioning_features is not None
+                else {}
+            )
             token_durations = self.flow_model.predict_token_duration_frames(
                 conditioning_ids,
                 attention_mask=conditioning_mask,
                 speaker_latent=speaker_latent,
                 language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
                 total_frames=num_frames,
+                **feature_kwargs,
             )
         else:
             token_durations = self.flow_model.allocate_token_duration_frames(
                 expected_token_durations,
                 conditioning_mask,
                 total_frames=num_frames,
+                alignment_mask=alignment_mask,
             )
         if tuple(token_durations.shape) != tuple(conditioning_ids.shape):
             raise RuntimeError(
@@ -575,6 +907,9 @@ class FlowMatchingTTSInference:
         *,
         conditioning_mask: torch.Tensor | None,
         language_ids: torch.Tensor | None,
+        token_language_ids: torch.Tensor | None,
+        alignment_mask: torch.Tensor | None,
+        conditioning_features: torch.Tensor | None,
         speaker_latent: torch.Tensor | None,
         cfg_scale: float,
         cfg_mode: str,
@@ -603,12 +938,18 @@ class FlowMatchingTTSInference:
             cfg_scale_text=cfg_scale_text,
             cfg_scale_speaker=cfg_scale_speaker,
         )
+        encode_kwargs = {}
+        if conditioning_features is not None:
+            encode_kwargs["conditioning_features"] = conditioning_features
         encoded = encode(
             conditioning_ids,
             conditioning_mask,
             speaker_latent,
             cfg_mode=cfg_mode if guidance_active else None,
             language_ids=language_ids,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            **encode_kwargs,
         )
         if not needs_prediction:
             return encoded, None, None
@@ -626,6 +967,47 @@ class FlowMatchingTTSInference:
         return self.flow_model.finalize_inference_conditioning(
             encoded,
             token_durations=token_durations,
+        )
+
+    def _acoustic_state_dtype(self) -> torch.dtype:
+        flow_model = getattr(self, "flow_model", None)
+        parameters = getattr(flow_model, "parameters", None)
+        if not callable(parameters):
+            # Preserve the historical FP32 protocol for lightweight runtimes
+            # that inject inference helpers without constructing EchoDiT.
+            return torch.float32
+        parameter = next(parameters(), None)
+        if parameter is None:
+            return torch.float32
+        if not torch.is_floating_point(parameter) or parameter.dtype not in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        }:
+            raise RuntimeError(
+                "The acoustic model must expose a float16, bfloat16, float32, or float64 "
+                "state parameter."
+            )
+        return parameter.dtype
+
+    def _decode_generated_latents(self, generated_latents: torch.Tensor) -> torch.Tensor:
+        """Move acoustic solver state to the immutable codec's parameter dtype."""
+        codec = getattr(self, "dacvae", None)
+        if codec is None:
+            # Lightweight protocol/test runtimes may inject only a decode callable.
+            return self._decode(generated_latents)
+        codec_parameters = getattr(codec, "parameters", None)
+        if not callable(codec_parameters):
+            return self._decode(generated_latents)
+        codec_parameter = next(codec_parameters(), None)
+        if codec_parameter is None or not torch.is_floating_point(codec_parameter):
+            raise RuntimeError("DACVAE must expose a floating parameter for latent decoding.")
+        return self._decode(
+            generated_latents.to(
+                device=codec_parameter.device,
+                dtype=codec_parameter.dtype,
+            )
         )
 
     def _align_speaker_latent(self, speaker_latent: torch.Tensor) -> torch.Tensor:
@@ -653,9 +1035,9 @@ class FlowMatchingTTSInference:
                 speaker_latent,
                 (0, self.speaker_patch_size - remainder),
             )
-        return speaker_latent.to(self.device, dtype=torch.float32)
+        return speaker_latent.to(self.device, dtype=self._acoustic_state_dtype())
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode_reference_audio(
         self,
         reference_audio: AudioReference,
@@ -716,7 +1098,15 @@ class FlowMatchingTTSInference:
         if waveform.shape[-1] < self.hop_length:
             waveform = F.pad(waveform, (0, self.hop_length - waveform.shape[-1]))
 
-        speaker_latent = self.dacvae.encode(waveform.unsqueeze(0).to(self.device))
+        seed = derive_dacvae_posterior_seed(
+            waveform,
+            codec_sha256=self.model_manifest.representation["codec_sha256"],
+        )
+        speaker_latent = encode_dacvae_posterior_seeded(
+            self.dacvae,
+            waveform.unsqueeze(0).to(self.device),
+            seed=seed,
+        )
         return self._align_speaker_latent(speaker_latent)
 
     def _resolve_speaker_latent(
@@ -762,13 +1152,13 @@ class FlowMatchingTTSInference:
             return 1.0 + cfg_scale_text, "joint", None, None
         return cfg_scale, cfg_mode, cfg_scale_text, cfg_scale_speaker
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def synthesize(
         self,
         text: str,
         # ODE solver settings; select them from checkpoint-specific evaluation.
         num_steps: int = 64,
-        solver: str = "heun",
+        solver: str | None = None,
         # Neutral conditional inference; guidance requires checkpoint-specific calibration.
         cfg_scale: float = 1.0,
         cfg_mode: str = "joint",
@@ -791,6 +1181,9 @@ class FlowMatchingTTSInference:
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,
+        normalized_text: str | None = None,
+        phonemes: str | Sequence[str] | None = None,
+        language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
     ) -> torch.Tensor:
         """
         Synthesize speech from text.
@@ -819,6 +1212,9 @@ class FlowMatchingTTSInference:
             language: Target text/speech language (defaults to English)
             reference_language: Source language spoken in the reference audio;
                 defaults to ``language`` for backward-compatible same-language cloning
+            normalized_text: Optional externally reviewed normalization of ``text``
+            phonemes: Optional reviewed IPA/phone sequence used instead of orthography
+            language_spans: Optional explicitly language-tagged spans for code switching
 
         Returns:
             Audio waveform tensor [samples]
@@ -829,12 +1225,26 @@ class FlowMatchingTTSInference:
         # Duration/MAS prediction uses the acoustic model before ODE sampling,
         # so reject a runtime poisoned by failed Cache-DiT cleanup immediately.
         assert_cache_dit_healthy(self.flow_model)
+        generative_objective, diffusion_schedule_shift = _runtime_generation_contract(self)
+        if solver is None:
+            solver = "ddim" if generative_objective == VP_DIFFUSION_OBJECTIVE else "heun"
         language_pair = self._resolve_language_pair(
             language,
             reference_language,
             has_reference=reference_audio is not None or speaker_latent is not None,
         )
-        conditioning_ids = self._prepare_conditioning(text, language_pair.target)
+        prepared_text = self._prepare_conditioning(
+            text,
+            language_pair.target,
+            normalized_text=normalized_text,
+            phonemes=phonemes,
+            language_spans=language_spans,
+        )
+        conditioning_ids = prepared_text.conditioning_ids
+        conditioning_mask = prepared_text.conditioning_mask
+        conditioning_features = prepared_text.conditioning_features
+        token_language_ids = prepared_text.token_language_ids
+        alignment_mask = prepared_text.alignment_mask
         language_ids = self._language_ids(language_pair)
         speaker_latent = self._resolve_speaker_latent(
             reference_audio=reference_audio,
@@ -852,8 +1262,11 @@ class FlowMatchingTTSInference:
         encoded_conditioning, predicted_frames, expected_token_durations = (
             self._encode_trajectory_conditioning(
                 conditioning_ids,
-                conditioning_mask=None,
+                conditioning_mask=conditioning_mask,
                 language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
+                conditioning_features=conditioning_features,
                 speaker_latent=speaker_latent,
                 cfg_scale=cfg_scale,
                 cfg_mode=cfg_mode,
@@ -871,12 +1284,20 @@ class FlowMatchingTTSInference:
             conditioning_ids,
             language_ids,
             speaker_latent,
-            predicted_frames,
+            conditioning_mask=conditioning_mask,
+            conditioning_features=conditioning_features,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            predicted_frames=predicted_frames,
         )
         token_durations = self._resolve_token_durations(
             conditioning_ids,
             num_frames=num_frames,
+            conditioning_mask=conditioning_mask,
             language_ids=language_ids,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            conditioning_features=conditioning_features,
             speaker_latent=speaker_latent,
             expected_token_durations=expected_token_durations,
         )
@@ -935,15 +1356,20 @@ class FlowMatchingTTSInference:
                 # Latent rescaling
                 target_latent_std=target_latent_std,
                 # Other
-                conditioning_mask=None,
+                conditioning_mask=conditioning_mask,
+                conditioning_features=conditioning_features,
                 speaker_latent=speaker_latent,
                 language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
                 token_durations=token_durations,
                 prepared_conditioning=prepared_conditioning,
                 prepared_cfg_conditioning=prepared_cfg_conditioning,
                 fuse_cfg_branches=cache_mode == "cache_dit",
                 show_progress=show_progress,
                 device=self.device,
+                generative_objective=generative_objective,
+                diffusion_schedule_shift=diffusion_schedule_shift,
             )
         self.last_cache_stats = (
             cache_session.stats if isinstance(cache_session, CacheDiTSession) else CacheDiTStats()
@@ -951,7 +1377,7 @@ class FlowMatchingTTSInference:
 
         # Decode with DACVAE
         print("Decoding audio with DACVAE...")
-        audio = self._decode(generated_latents)  # [1, 1, samples]
+        audio = self._decode_generated_latents(generated_latents)  # [1, 1, samples]
 
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -975,6 +1401,9 @@ class FlowMatchingTTSInference:
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,
+        normalized_text: str | None = None,
+        phonemes: str | Sequence[str] | None = None,
+        language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
     ) -> torch.Tensor:
         """Synthesize using one named or custom typed generation profile."""
         return self.synthesize(
@@ -999,17 +1428,22 @@ class FlowMatchingTTSInference:
             speaker_latent=speaker_latent,
             language=language,
             reference_language=reference_language,
+            normalized_text=normalized_text,
+            phonemes=phonemes,
+            language_spans=language_spans,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def synthesize_batch(
         self,
         texts: list[str],
         num_steps: int = 32,
         cfg_scale: float = 1.0,
-        solver: str = "euler",
+        solver: str | None = None,
         max_duration: float | None = None,
         languages: str | list[str] | tuple[str, ...] | None = None,
+        phonemes: Sequence[str | Sequence[str] | None] | None = None,
+        language_spans: (Sequence[Sequence[TextSpan | Mapping[str, object]] | None] | None) = None,
     ) -> list[torch.Tensor]:
         """
         Synthesize multiple texts in batch.
@@ -1028,6 +1462,13 @@ class FlowMatchingTTSInference:
         """
         self.last_cache_stats = CacheDiTStats()
         assert_cache_dit_healthy(self.flow_model)
+        if not isinstance(texts, list) or not texts:
+            raise ValueError("texts must be a non-empty list of strings.")
+        if not all(isinstance(text, str) for text in texts):
+            raise TypeError("texts must contain only strings.")
+        generative_objective, diffusion_schedule_shift = _runtime_generation_contract(self)
+        if solver is None:
+            solver = "ddim" if generative_objective == VP_DIFFUSION_OBJECTIVE else "euler"
         minimum_duration = self.settings.duration.minimum_seconds
         configured_maximum = self.settings.duration.maximum_seconds
         selected_maximum = configured_maximum if max_duration is None else max_duration
@@ -1052,25 +1493,65 @@ class FlowMatchingTTSInference:
             selected_languages = list(languages)
             if len(selected_languages) != len(texts):
                 raise ValueError("languages must contain one entry per text.")
+        if phonemes is None:
+            selected_phonemes: list[str | Sequence[str] | None] = [None] * len(texts)
+        else:
+            if isinstance(phonemes, (str, bytes)):
+                raise TypeError("phonemes must contain one phone sequence per text.")
+            selected_phonemes = list(phonemes)
+            if len(selected_phonemes) != len(texts):
+                raise ValueError("phonemes must contain one entry per text.")
+        if language_spans is None:
+            selected_spans: list[Sequence[TextSpan | Mapping[str, object]] | None] = [None] * len(
+                texts
+            )
+        else:
+            if isinstance(language_spans, (str, bytes)):
+                raise TypeError("language_spans must contain one span sequence per text.")
+            selected_spans = list(language_spans)
+            if len(selected_spans) != len(texts):
+                raise ValueError("language_spans must contain one entry per text.")
 
         # Resolve and validate every request before allocating generation state.
         # Requests are grouped by exact latent length, so each ODE call is a real
         # tensor batch without allowing padded target noise to affect valid audio.
         prepared_requests = []
-        for index, (text, language) in enumerate(zip(texts, selected_languages)):
+        for index, (text, language, request_phonemes, request_spans) in enumerate(
+            zip(texts, selected_languages, selected_phonemes, selected_spans)
+        ):
             language_pair = self._resolve_language_pair(
                 language,
                 None,
                 has_reference=False,
             )
-            conditioning_ids = self._prepare_conditioning(text, language_pair.target)
+            if (
+                getattr(self, "text_conditioning_mode", "scratch_tokens") == "frozen_features"
+                and getattr(self.frozen_text_provider.spec, "frozen_text_frontend", None)
+                == "phonemes"
+                and request_phonemes is None
+                and not request_spans
+            ):
+                raise ValueError(
+                    f"Frozen phoneme request {index} requires canonical phonemes or "
+                    "phoneme-bearing language_spans; raw text fallback is forbidden."
+                )
+            prepared_text = self._prepare_conditioning(
+                text,
+                language_pair.target,
+                phonemes=request_phonemes,
+                language_spans=request_spans,
+            )
             language_ids = self._language_ids(language_pair)
             resolved_duration, num_frames = self._resolve_duration_shape(
                 text,
                 None,
-                conditioning_ids,
+                prepared_text.conditioning_ids,
                 language_ids,
                 None,
+                conditioning_mask=prepared_text.conditioning_mask,
+                conditioning_features=prepared_text.conditioning_features,
+                token_language_ids=prepared_text.token_language_ids,
+                alignment_mask=prepared_text.alignment_mask,
             )
             if resolved_duration > selected_maximum:
                 raise ValueError(
@@ -1078,11 +1559,11 @@ class FlowMatchingTTSInference:
                     f"maximum of {selected_maximum:g}s. Increase max_duration within the "
                     "configured limit or split the text; batching never truncates audio."
                 )
-            prepared_requests.append((index, conditioning_ids, language_ids, num_frames))
+            prepared_requests.append((index, prepared_text, language_ids, num_frames))
 
         requests_by_frames: dict[
             int,
-            list[tuple[int, torch.Tensor, torch.Tensor | None, int]],
+            list[tuple[int, _PreparedText, torch.Tensor | None, int]],
         ] = {}
         for request in prepared_requests:
             requests_by_frames.setdefault(request[3], []).append(request)
@@ -1099,11 +1580,20 @@ class FlowMatchingTTSInference:
 
         for num_frames, requests in requests_by_frames.items():
             batch_size = len(requests)
-            max_text_tokens = max(request[1].shape[1] for request in requests)
-            has_text_padding = any(request[1].shape[1] != max_text_tokens for request in requests)
+            max_text_tokens = max(request[1].conditioning_ids.shape[1] for request in requests)
+            has_text_padding = any(
+                request[1].conditioning_ids.shape[1] != max_text_tokens for request in requests
+            )
+            feature_presence = [
+                request[1].conditioning_features is not None for request in requests
+            ]
+            if any(feature_presence) and not all(feature_presence):
+                raise RuntimeError(
+                    "A batch cannot mix scratch-token and frozen-feature conditioning."
+                )
             batched_conditioning = torch.full(
                 (batch_size, max_text_tokens),
-                PAD_TOKEN,
+                getattr(self, "text_pad_token", PAD_TOKEN),
                 dtype=torch.long,
                 device=self.device,
             )
@@ -1115,13 +1605,42 @@ class FlowMatchingTTSInference:
                     device=self.device,
                 )
                 if has_text_padding
+                or any(request[1].conditioning_mask is not None for request in requests)
                 else None
             )
-            for batch_index, (_, conditioning_ids, _, _) in enumerate(requests):
+            conditioning_features_batch = None
+            if all(feature_presence):
+                first_features = requests[0][1].conditioning_features
+                assert first_features is not None
+                conditioning_features_batch = torch.zeros(
+                    batch_size,
+                    max_text_tokens,
+                    first_features.shape[-1],
+                    dtype=first_features.dtype,
+                    device=self.device,
+                )
+            token_language_batch = torch.zeros_like(batched_conditioning)
+            alignment_batch = torch.zeros_like(batched_conditioning, dtype=torch.bool)
+            for batch_index, (_, prepared_text, _, _) in enumerate(requests):
+                conditioning_ids = prepared_text.conditioning_ids
                 token_count = conditioning_ids.shape[1]
                 batched_conditioning[batch_index, :token_count] = conditioning_ids[0]
+                token_language_batch[batch_index, :token_count] = prepared_text.token_language_ids[
+                    0
+                ]
+                alignment_batch[batch_index, :token_count] = prepared_text.alignment_mask[0]
                 if conditioning_mask is not None:
-                    conditioning_mask[batch_index, :token_count] = True
+                    if prepared_text.conditioning_mask is None:
+                        conditioning_mask[batch_index, :token_count] = True
+                    else:
+                        conditioning_mask[batch_index, :token_count] = (
+                            prepared_text.conditioning_mask[0]
+                        )
+                if conditioning_features_batch is not None:
+                    assert prepared_text.conditioning_features is not None
+                    conditioning_features_batch[batch_index, :token_count] = (
+                        prepared_text.conditioning_features[0]
+                    )
 
             language_batch = None
             if requests and requests[0][2] is not None:
@@ -1137,6 +1656,9 @@ class FlowMatchingTTSInference:
                 num_frames=num_frames,
                 conditioning_mask=conditioning_mask,
                 language_ids=language_batch,
+                token_language_ids=token_language_batch,
+                alignment_mask=alignment_batch,
+                conditioning_features=conditioning_features_batch,
             )
 
             generated_latents = ODESolver.sample(
@@ -1156,13 +1678,18 @@ class FlowMatchingTTSInference:
                 temporal_rescale_sigma=2.5,
                 target_latent_std=None,
                 conditioning_mask=conditioning_mask,
+                conditioning_features=conditioning_features_batch,
                 language_ids=language_batch,
+                token_language_ids=token_language_batch,
+                alignment_mask=alignment_batch,
                 token_durations=token_durations,
                 fuse_cfg_branches=False,
                 show_progress=False,
                 device=self.device,
+                generative_objective=generative_objective,
+                diffusion_schedule_shift=diffusion_schedule_shift,
             )
-            decoded = self._decode(generated_latents)
+            decoded = self._decode_generated_latents(generated_latents)
             if decoded.ndim == 0 or decoded.shape[0] != batch_size:
                 raise RuntimeError(
                     "DACVAE batch decode must preserve the generated batch dimension."
@@ -1194,7 +1721,7 @@ class FlowMatchingTTSInference:
         output_path: str,
         num_steps: int = 64,
         cfg_scale: float = 1.0,
-        solver: str = "heun",
+        solver: str | None = None,
         duration: float | None = None,
         # Neutral conditional inference; guidance requires checkpoint-specific calibration.
         cfg_mode: str = "joint",
@@ -1212,6 +1739,9 @@ class FlowMatchingTTSInference:
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,
+        normalized_text: str | None = None,
+        phonemes: str | Sequence[str] | None = None,
+        language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
     ):
         audio = self.synthesize(
             text=text,
@@ -1235,5 +1765,8 @@ class FlowMatchingTTSInference:
             speaker_latent=speaker_latent,
             language=language,
             reference_language=reference_language,
+            normalized_text=normalized_text,
+            phonemes=phonemes,
+            language_spans=language_spans,
         )
         self.save_audio(audio, output_path)

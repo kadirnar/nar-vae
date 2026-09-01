@@ -3,9 +3,10 @@ import json
 import os
 import shutil
 import warnings
+from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
-import tiktoken
 import torch
 import torch.distributed as dist
 import torchaudio
@@ -13,6 +14,11 @@ from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
 from tqdm import tqdm
 
 from nar_vae.dacvae import HubDACVAESource, load_dacvae, normalize_dacvae_source
+from nar_vae.dacvae_encoding import (
+    DACVAEEncodingError,
+    derive_dacvae_posterior_seed,
+    encode_dacvae_posterior_seeded,
+)
 from nar_vae.dataset.identity import write_prepared_dataset_manifest
 from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_COLUMN,
@@ -25,18 +31,28 @@ from nar_vae.dataset.sources import (
     DEFAULT_DATASET_DOWNLOAD_WORKERS,
     resolve_dataset_source,
 )
-from nar_vae.dataset.speaker_references import (
-    build_speaker_index,
-    collect_reference_audio_with_language,
-    select_reference_indices,
-)
 from nar_vae.distributed import (
     cleanup_distributed as cleanup_process_group,
 )
 from nar_vae.distributed import initialize_distributed, shard_indices
+from nar_vae.frozen_text_provider import (
+    FROZEN_TEXT_REPRESENTATION_NAME,
+    FROZEN_TEXT_REPRESENTATION_VERSION,
+    FrozenTextConditioning,
+    FrozenTextProvider,
+    resolve_frozen_text_provider,
+)
 from nar_vae.languages import DEFAULT_LANGUAGE, normalize_language
-from nar_vae.tokenization import encode_tts_text
+from nar_vae.tokenization import TextConditioning, encode_tts_conditioning, encode_tts_text
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
+
+from .utterance_store import (
+    AUDIO_SHA256_COLUMN,
+    CONDITIONING_NUM_TOKENS_COLUMN,
+    SPEAKER_NUM_FRAMES_COLUMN,
+    attach_utterance_metadata,
+    canonical_audio_sha256,
+)
 
 # Suppress audio decoding warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
@@ -102,6 +118,7 @@ class DataPreparer:
         dacvae_revision: str | None = None,
         dacvae_filename: str | None = None,
         dacvae_sha256: str | None = None,
+        frozen_text_provider: FrozenTextProvider | None = None,
     ):
         self.device = device
         if max_reference_seconds <= 0:
@@ -126,15 +143,20 @@ class DataPreparer:
         self.representation_contract = build_representation_contract(
             self.dacvae,
             codec_source=codec_source,
+            **(
+                {
+                    "text_frontend_name": FROZEN_TEXT_REPRESENTATION_NAME,
+                    "text_frontend_version": FROZEN_TEXT_REPRESENTATION_VERSION,
+                }
+                if frozen_text_provider is not None
+                else {}
+            ),
         )
 
         self.sample_rate = self.dacvae.sample_rate  # 48000
         self.max_reference_samples = int(max_reference_seconds * self.sample_rate)
         self.language = normalize_language(language)
-
-        # Setup tiktoken tokenizer
-        print("Setting up tiktoken tokenizer...")
-        self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.frozen_text_provider = frozen_text_provider
 
     @torch.no_grad()
     def extract_latents(self, audio: np.ndarray, sr: int) -> np.ndarray:
@@ -152,17 +174,56 @@ class DataPreparer:
         if sr != self.sample_rate:
             waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
 
+        seed = derive_dacvae_posterior_seed(
+            waveform,
+            codec_sha256=self.representation_contract.codec_sha256,
+        )
         # Add batch dimension and move to device
         waveform = waveform.unsqueeze(0).to(self.device)  # [1, 1, T]
 
         # Encode with DACVAE
-        latents = self.dacvae.encode(waveform)  # [1, D, T_latent]
+        latents = encode_dacvae_posterior_seeded(
+            self.dacvae,
+            waveform,
+            seed=seed,
+        )  # [1, D, T_latent]
 
         return latents.squeeze(0).cpu().numpy()  # [D, T_latent]
 
     def tokenize_text(self, text: str, language: str | None = None) -> list:
         """Tokenize text and add special tokens for TTS."""
-        return encode_tts_text(text, self.tokenizer, language=language or self.language)
+        if getattr(self, "frozen_text_provider", None) is not None:
+            raise RuntimeError(
+                "Frozen-feature preparation must use encode_text_conditioning(), not the "
+                "compact scratch tokenizer."
+            )
+        return encode_tts_text(text, language=language or self.language)
+
+    def encode_text_conditioning(
+        self,
+        text: str,
+        *,
+        language: str | None = None,
+        normalized_text: str | None = None,
+        phonemes: str | list[str] | None = None,
+        language_spans: list[dict] | None = None,
+    ) -> TextConditioning | FrozenTextConditioning:
+        provider = getattr(self, "frozen_text_provider", None)
+        if provider is not None:
+            return provider.encode(
+                text,
+                normalized_text=normalized_text,
+                phonemes=phonemes,
+                language=language or self.language,
+                language_spans=language_spans,
+            )
+        return encode_tts_conditioning(
+            text,
+            normalized_text=normalized_text,
+            phonemes=phonemes,
+            language=language or self.language,
+            language_spans=language_spans,
+        )
 
     @torch.no_grad()
     def extract_speaker_latents(
@@ -194,8 +255,18 @@ class DataPreparer:
                 break
         if not waveforms:
             return None
-        waveform = torch.cat(waveforms, dim=-1).unsqueeze(0).to(self.device)
-        return self.dacvae.encode(waveform).squeeze(0).cpu().numpy()
+        waveform = torch.cat(waveforms, dim=-1)
+        seed = derive_dacvae_posterior_seed(
+            waveform,
+            codec_sha256=self.representation_contract.codec_sha256,
+        )
+        waveform = waveform.unsqueeze(0).to(self.device)
+        return (
+            encode_dacvae_posterior_seeded(self.dacvae, waveform, seed=seed)
+            .squeeze(0)
+            .cpu()
+            .numpy()
+        )
 
     def process_example(
         self,
@@ -204,10 +275,32 @@ class DataPreparer:
         audio_column: str = "audio",
         language: str | None = None,
         speaker_language: str | None = None,
+        dataset_namespace: str = "dataset",
+        speaker_id=None,
+        utterance_id=None,
+        normalized_text: str | None = None,
+        phonemes: str | list[str] | None = None,
+        language_spans: list[dict] | None = None,
     ) -> dict:
         """Process a single example."""
         target_language = normalize_language(language or self.language)
-        reference_language = normalize_language(speaker_language or target_language)
+        provider = getattr(self, "frozen_text_provider", None)
+        if (
+            provider is not None
+            and provider.spec.frozen_text_frontend == "phonemes"
+            and phonemes is None
+            and not language_spans
+        ):
+            raise ValueError(
+                "Frozen phoneme preparation requires canonical phonemes or "
+                "phoneme-bearing language_spans for every row."
+            )
+        del speaker_language
+        if speaker_references is not None:
+            raise ValueError(
+                "Static speaker references are not part of prepared-row v2; use "
+                "DynamicReferenceDataset over cached utterance latents."
+            )
         try:
             # Get audio
             audio_data = example.get(audio_column, {})
@@ -226,32 +319,65 @@ class DataPreparer:
                 or example.get("transcript", "")
                 or example.get("sentence", "")
             )
-            if not text:
+            if not text and normalized_text is None and phonemes is None and language_spans is None:
                 return None
 
             # Extract latents
             latents = self.extract_latents(audio, sr)
 
             # Tokenize text
-            conditioning_ids = self.tokenize_text(text, target_language)
+            conditioning = self.encode_text_conditioning(
+                text,
+                language=target_language,
+                normalized_text=normalized_text,
+                phonemes=phonemes,
+                language_spans=language_spans,
+            )
+            audio_hash = canonical_audio_sha256(audio, sr)
 
             result = {
                 "latents": latents,
                 LATENT_NUM_FRAMES_COLUMN: infer_latent_num_frames(latents),
-                "conditioning_ids": conditioning_ids,
+                "conditioning_ids": (
+                    conditioning.conditioning_ids.tolist()
+                    if isinstance(conditioning.conditioning_ids, torch.Tensor)
+                    else conditioning.conditioning_ids
+                ),
+                "token_language_ids": (
+                    conditioning.token_language_ids.tolist()
+                    if isinstance(conditioning.token_language_ids, torch.Tensor)
+                    else conditioning.token_language_ids
+                ),
+                "alignment_mask": (
+                    conditioning.alignment_mask.tolist()
+                    if isinstance(conditioning.alignment_mask, torch.Tensor)
+                    else conditioning.alignment_mask
+                ),
+                CONDITIONING_NUM_TOKENS_COLUMN: len(conditioning.conditioning_ids),
+                SPEAKER_NUM_FRAMES_COLUMN: infer_latent_num_frames(latents),
+                AUDIO_SHA256_COLUMN: audio_hash,
                 "text": text,
                 "language": target_language,
             }
-            if speaker_references is not None:
-                speaker_latents = self.extract_speaker_latents(speaker_references)
-                if speaker_latents is None:
-                    return None
-                result["speaker_latents"] = speaker_latents
-                result["speaker_language"] = reference_language
+            if isinstance(conditioning, FrozenTextConditioning):
+                result.update(conditioning.to_cache_row())
+            if speaker_id is not None:
+                attach_utterance_metadata(
+                    result,
+                    dataset_namespace=dataset_namespace,
+                    speaker_id=speaker_id,
+                    utterance_id=utterance_id,
+                    audio_sha256=audio_hash,
+                    text=text,
+                )
+            else:
+                result[GRPO_PROMPT_ID_COLUMN] = _content_bound_utterance_id(result)
             return attach_representation_contract(result, self.representation_contract)
-        except RepresentationContractError:
+        except (RepresentationContractError, DACVAEEncodingError):
             raise
         except Exception as e:
+            if provider is not None:
+                raise
             print(f"Error processing example: {e}")
             return None
 
@@ -272,11 +398,17 @@ def prepare_finetune_dataset(
     language: str = DEFAULT_LANGUAGE,
     language_column: str | None = None,
     utterance_id_column: str | None = None,
+    normalized_text_column: str | None = None,
+    phonemes_column: str | None = None,
+    language_spans_column: str | None = None,
+    dataset_namespace: str | None = None,
     dataset_revision: str | None = None,
     dataset_download_workers: int = DEFAULT_DATASET_DOWNLOAD_WORKERS,
     dacvae_revision: str | None = None,
     dacvae_filename: str | None = None,
     dacvae_sha256: str | None = None,
+    frozen_text_provider: FrozenTextProvider | None = None,
+    frozen_text_config: Mapping[str, Any] | None = None,
 ) -> None:
     """Prepare a Hugging Face dataset for EchoDiT fine-tuning.
 
@@ -294,6 +426,11 @@ def prepare_finetune_dataset(
     local_rank, world_size, is_distributed = setup_distributed()
     rank = dist.get_rank() if is_distributed else 0
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+    frozen_text_provider = resolve_frozen_text_provider(
+        provider=frozen_text_provider,
+        config=frozen_text_config,
+        device=device,
+    )
 
     is_main = rank == 0
 
@@ -320,6 +457,27 @@ def prepare_finetune_dataset(
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
 
+    del max_reference_utterances, reference_seed
+    dataset_namespace = dataset_namespace or dataset_name
+    for optional_column in (
+        speaker_id_column,
+        normalized_text_column,
+        phonemes_column,
+        language_spans_column,
+    ):
+        if optional_column is not None and optional_column not in ds.column_names:
+            raise ValueError(f"Dataset column not found: {optional_column!r}")
+    if (
+        frozen_text_provider is not None
+        and frozen_text_provider.spec.frozen_text_frontend == "phonemes"
+        and phonemes_column is None
+        and language_spans_column is None
+    ):
+        raise ValueError(
+            "Frozen phoneme dataset preparation requires phonemes_column or "
+            "language_spans_column; raw transcript fallback is forbidden."
+        )
+
     if utterance_id_column is not None:
         if utterance_id_column not in ds.column_names:
             raise ValueError(f"Utterance ID column not found: {utterance_id_column!r}")
@@ -342,22 +500,17 @@ def prepare_finetune_dataset(
         dacvae_revision=dacvae_revision,
         dacvae_filename=dacvae_filename,
         dacvae_sha256=dacvae_sha256,
-    )
-
-    speaker_index = (
-        build_speaker_index(ds, speaker_id_column) if speaker_id_column is not None else None
+        frozen_text_provider=frozen_text_provider,
     )
 
     # Split dataset for distributed processing
     if is_distributed:
         indices = list(shard_indices(len(ds), rank=rank, world_size=world_size))
         ds_shard = ds.select(indices)
-        shard_to_original = {local: original for local, original in enumerate(indices)}
         if is_main:
             print(f"Processing {len(ds_shard)} samples on each GPU")
     else:
         ds_shard = ds
-        shard_to_original = {index: index for index in range(len(ds))}
 
     # Process examples
     processed_examples = []
@@ -368,49 +521,41 @@ def prepare_finetune_dataset(
     for i in iterator:
         try:
             example = ds_shard[i]
-            original_index = shard_to_original[i]
-            speaker_references = None
             target_language = normalize_language(
                 example.get(language_column, language) if language_column else language
             )
-            speaker_language = None
-            if speaker_index is not None:
-                reference_indices = select_reference_indices(
-                    speaker_index,
-                    speaker_id=example.get(speaker_id_column),
-                    target_index=original_index,
-                    maximum_utterances=max_reference_utterances,
-                    seed=reference_seed,
-                )
-                speaker_references, speaker_language = collect_reference_audio_with_language(
-                    ds,
-                    reference_indices,
-                    audio_column=audio_column,
-                    language_column=language_column,
-                    fallback_language=target_language,
-                )
-                if not speaker_references:
-                    skipped_count += 1
-                    continue
             result = preparer.process_example(
                 example,
-                speaker_references,
                 audio_column=audio_column,
                 language=target_language,
-                speaker_language=speaker_language,
+                dataset_namespace=dataset_namespace,
+                speaker_id=(
+                    example.get(speaker_id_column) if speaker_id_column is not None else None
+                ),
+                utterance_id=(
+                    example.get(utterance_id_column) if utterance_id_column is not None else None
+                ),
+                normalized_text=(
+                    example.get(normalized_text_column)
+                    if normalized_text_column is not None
+                    else None
+                ),
+                phonemes=(example.get(phonemes_column) if phonemes_column is not None else None),
+                language_spans=(
+                    example.get(language_spans_column)
+                    if language_spans_column is not None
+                    else None
+                ),
             )
             if result is not None:
-                result[GRPO_PROMPT_ID_COLUMN] = (
-                    example[utterance_id_column]
-                    if utterance_id_column is not None
-                    else _content_bound_utterance_id(result)
-                )
                 processed_examples.append(result)
             else:
                 skipped_count += 1
-        except RepresentationContractError:
+        except (RepresentationContractError, DACVAEEncodingError):
             raise
         except Exception as e:
+            if frozen_text_provider is not None:
+                raise RuntimeError(f"Frozen text preparation failed for dataset row {i}.") from e
             # Skip corrupted/unreadable audio files
             skipped_count += 1
             if skipped_count <= 10:  # Only print first 10 errors

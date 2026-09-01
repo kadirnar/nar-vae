@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
 
+from nar_vae.benchmark import text_conditioning_record
 from nar_vae.benchmarking import (
     environment,
     file_metadata,
@@ -22,9 +24,10 @@ from nar_vae.dacvae import (
     describe_dacvae_source,
 )
 from nar_vae.inference_realtime import RealtimeTTSInference
-from nar_vae.languages import DEFAULT_LANGUAGE, normalize_language
+from nar_vae.languages import DEFAULT_LANGUAGE, LanguagePair
 from nar_vae.quality import audio_metrics, evaluate_audio_file
 from nar_vae.serving import StageTiming, non_claim_evidence, summarize_stage_timings
+from nar_vae.tokenization import TextSpan
 
 
 def _markdown_table(result: dict) -> str:
@@ -68,6 +71,11 @@ def compare_solvers(
     device: str = "cuda",
     text: str = "The quick brown fox jumps over the lazy dog.",
     language: str = DEFAULT_LANGUAGE,
+    reference_audio: str | Path | torch.Tensor | None = None,
+    reference_sample_rate: int | None = None,
+    reference_language: str | None = None,
+    phonemes: str | Sequence[str] | None = None,
+    language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
     profile: str = "fast",
     num_steps: int | None = None,
     nfe_budget: int | None = None,
@@ -127,7 +135,12 @@ def compare_solvers(
     requested_checkpoint = (
         checkpoint.repo_id if isinstance(checkpoint, HubCheckpointSource) else str(checkpoint)
     )
-    language = normalize_language(language)
+    language_pair = LanguagePair.resolve(
+        language,
+        reference_language,
+        has_reference=reference_audio is not None,
+    )
+    conditioning_record = text_conditioning_record(phonemes, language_spans)
     dacvae_description = describe_dacvae_source(dacvae_model)
     requested_dacvae_model = dacvae_description.identifier
     output_path = Path(output)
@@ -156,7 +169,7 @@ def compare_solvers(
         cfg_mode=base_config.cfg_mode,
         cfg_scale_text=base_config.cfg_scale_text,
         cfg_scale_speaker=base_config.cfg_scale_speaker,
-        speaker_latent=None,
+        speaker_latent=torch.empty(1) if reference_audio is not None else None,
     )
     audio_directory.mkdir(parents=True, exist_ok=True)
     solver_results = {}
@@ -181,7 +194,12 @@ def compare_solvers(
                 config=config,
                 duration=duration,
                 return_timing=True,
-                language=language,
+                reference_audio=reference_audio,
+                reference_sample_rate=reference_sample_rate,
+                language=language_pair.target,
+                reference_language=language_pair.reference,
+                phonemes=phonemes,
+                language_spans=language_spans,
             )
             row = {"run": index + 1, **timings}
             row["stages"] = StageTiming.from_complete_waveform_timings(timings).to_dict()
@@ -216,7 +234,7 @@ def compare_solvers(
                 text,
                 device=device,
                 maximum_wer=maximum_wer,
-                language=language,
+                language=language_pair.target,
             )
             if evaluate_asr
             else None
@@ -332,12 +350,24 @@ def compare_solvers(
         },
         "configuration": {
             "text": text,
-            "language": language,
+            "language": language_pair.target,
             "language_pair": {
-                "target": language,
-                "reference": None,
-                "cross_lingual": False,
+                "target": language_pair.target,
+                "reference": language_pair.reference,
+                "cross_lingual": language_pair.is_cross_lingual,
             },
+            "reference_audio": (
+                file_metadata(Path(reference_audio), label=str(reference_audio))
+                if isinstance(reference_audio, (str, Path))
+                else {
+                    "kind": "tensor",
+                    "shape": list(reference_audio.shape),
+                    "sample_rate": reference_sample_rate,
+                }
+                if isinstance(reference_audio, torch.Tensor)
+                else None
+            ),
+            "text_conditioning": conditioning_record,
             "profile": profile,
             "num_steps": base_config.num_steps if nfe_budget is None else None,
             "nfe_budget": nfe_budget,

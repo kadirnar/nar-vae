@@ -11,8 +11,14 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
+from datasets import Dataset, load_from_disk
 
 from nar_vae.dacvae import HubDACVAESource
+from nar_vae.dacvae_encoding import (
+    DACVAE_POSTERIOR_SAMPLING_POLICY,
+    DACVAEEncodingError,
+    derive_dacvae_posterior_seed,
+)
 from nar_vae.dataset import prepare_from_hf_dataset
 from nar_vae.dataset.finetune_prepare import DataPreparer, prepare_finetune_dataset
 from nar_vae.dataset.prepare import DatasetPreparer, prepare_dataset
@@ -29,6 +35,14 @@ from nar_vae.dataset.representation import (
     build_representation_contract,
 )
 from nar_vae.dataset.sources import resolve_dataset_source
+from nar_vae.frozen_text_provider import (
+    FROZEN_TEXT_REPRESENTATION_NAME,
+    FROZEN_TEXT_REPRESENTATION_VERSION,
+    FrozenTextConditioning,
+    FrozenTextProviderSpec,
+)
+from nar_vae.languages import language_id
+from nar_vae.training_utils import validate_tts_dataset
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 DATASET_REVISION_A = "a" * 40
@@ -96,16 +110,19 @@ class DatasetPreparationDefaultsTest(unittest.TestCase):
                 DatasetPreparer,
                 "extract_speaker_latents",
                 {"sample_rate": 10, "max_speaker_ref_samples": 12},
+                "nar_vae.dataset.prepare.encode_dacvae_posterior_seeded",
             ),
             (
                 DataPreparer,
                 "extract_speaker_latents",
                 {"sample_rate": 10, "max_reference_samples": 12},
+                "nar_vae.dataset.finetune_prepare.encode_dacvae_posterior_seeded",
             ),
             (
                 FileDatasetPreparer,
                 "encode_speaker_audio",
                 {"target_sample_rate": 10, "max_reference_duration": 1.2},
+                "nar_vae.dataset.prepare_dataset.encode_dacvae_posterior_seeded",
             ),
         )
         references = [
@@ -113,26 +130,150 @@ class DatasetPreparationDefaultsTest(unittest.TestCase):
             (np.ones(10, dtype=np.float32), 10),
         ]
 
-        for preparer_class, method_name, attributes in cases:
+        for preparer_class, method_name, attributes, encode_target in cases:
             with self.subTest(preparer=preparer_class.__name__):
                 preparer = preparer_class.__new__(preparer_class)
                 preparer.device = "cpu"
                 for name, value in attributes.items():
                     setattr(preparer, name, value)
-                preparer.dacvae = SimpleNamespace(
-                    encode=MagicMock(
-                        side_effect=lambda waveform: torch.zeros(
-                            (1, 4, waveform.shape[-1]),
-                            dtype=torch.float32,
-                        )
-                    )
+                preparer.representation_contract = SimpleNamespace(
+                    codec_sha256=CODEC_SHA256,
                 )
+                preparer.dacvae = SimpleNamespace(encode=MagicMock())
 
-                result = getattr(preparer, method_name)(references)
+                with patch(
+                    encode_target,
+                    side_effect=lambda codec, waveform, *, seed: torch.zeros(
+                        (1, 4, waveform.shape[-1]),
+                        dtype=torch.float32,
+                    ),
+                ) as seeded_encode:
+                    result = getattr(preparer, method_name)(references)
 
-                encoded = preparer.dacvae.encode.call_args.args[0]
+                encoded = seeded_encode.call_args.args[1]
                 self.assertEqual(tuple(encoded.shape), (1, 1, 12))
+                self.assertEqual(
+                    seeded_encode.call_args.kwargs["seed"],
+                    derive_dacvae_posterior_seed(
+                        torch.ones(1, 12),
+                        codec_sha256=CODEC_SHA256,
+                    ),
+                )
                 self.assertEqual(result.shape, (4, 12))
+                preparer.dacvae.encode.assert_not_called()
+
+    def test_every_target_preparer_seeds_the_final_mono_waveform(self):
+        cases = (
+            (
+                DatasetPreparer,
+                "extract_latents",
+                {"sample_rate": 10},
+                "nar_vae.dataset.prepare.encode_dacvae_posterior_seeded",
+            ),
+            (
+                DataPreparer,
+                "extract_latents",
+                {"sample_rate": 10},
+                "nar_vae.dataset.finetune_prepare.encode_dacvae_posterior_seeded",
+            ),
+            (
+                FileDatasetPreparer,
+                "encode_audio_array",
+                {"target_sample_rate": 10, "min_duration": 0.1, "max_duration": 2.0},
+                "nar_vae.dataset.prepare_dataset.encode_dacvae_posterior_seeded",
+            ),
+        )
+        stereo = np.stack(
+            (
+                np.ones(6, dtype=np.float32),
+                np.full(6, 3.0, dtype=np.float32),
+            )
+        )
+        expected_waveform = torch.full((1, 6), 2.0)
+
+        for preparer_class, method_name, attributes, encode_target in cases:
+            with self.subTest(preparer=preparer_class.__name__):
+                preparer = preparer_class.__new__(preparer_class)
+                preparer.device = "cpu"
+                preparer.representation_contract = SimpleNamespace(
+                    codec_sha256=CODEC_SHA256,
+                )
+                for name, value in attributes.items():
+                    setattr(preparer, name, value)
+                preparer.dacvae = SimpleNamespace(encode=MagicMock())
+
+                with patch(
+                    encode_target,
+                    side_effect=lambda codec, waveform, *, seed: torch.zeros(
+                        (1, 4, waveform.shape[-1]),
+                        dtype=torch.float32,
+                    ),
+                ) as seeded_encode:
+                    result = getattr(preparer, method_name)(stereo, 10)
+
+                torch.testing.assert_close(seeded_encode.call_args.args[1][0], expected_waveform)
+                self.assertEqual(
+                    seeded_encode.call_args.kwargs["seed"],
+                    derive_dacvae_posterior_seed(
+                        expected_waveform,
+                        codec_sha256=CODEC_SHA256,
+                    ),
+                )
+                self.assertEqual(result.shape, (4, 6))
+                preparer.dacvae.encode.assert_not_called()
+
+    def test_file_preparer_does_not_swallow_seeded_encoding_contract_failures(self):
+        preparer = FileDatasetPreparer.__new__(FileDatasetPreparer)
+        preparer.device = "cpu"
+        preparer.target_sample_rate = 10
+        preparer.min_duration = 0.1
+        preparer.max_duration = 2.0
+        preparer.representation_contract = SimpleNamespace(codec_sha256=CODEC_SHA256)
+        preparer.dacvae = SimpleNamespace()
+
+        with (
+            patch(
+                "nar_vae.dataset.prepare_dataset.encode_dacvae_posterior_seeded",
+                side_effect=DACVAEEncodingError("incompatible codec surface"),
+            ),
+            self.assertRaisesRegex(DACVAEEncodingError, "incompatible codec surface"),
+        ):
+            preparer.encode_audio_array(np.ones(6, dtype=np.float32), 10)
+
+    def test_row_preparers_do_not_silently_skip_seeded_encoding_contract_failures(self):
+        standard = DatasetPreparer.__new__(DatasetPreparer)
+        standard.language = "en"
+        standard.sample_rate = 10
+        standard.frozen_text_provider = None
+        standard.extract_latents = MagicMock(
+            side_effect=DACVAEEncodingError("incompatible codec surface")
+        )
+
+        finetune = DataPreparer.__new__(DataPreparer)
+        finetune.language = "en"
+        finetune.sample_rate = 10
+        finetune.frozen_text_provider = None
+        finetune.extract_latents = MagicMock(
+            side_effect=DACVAEEncodingError("incompatible codec surface")
+        )
+
+        for preparer, process, sample in (
+            (
+                standard,
+                standard.process_sample,
+                {"audio": {"array": [1.0], "sampling_rate": 10}, "text": "hello"},
+            ),
+            (
+                finetune,
+                finetune.process_example,
+                {"audio": {"array": [1.0], "sampling_rate": 10}, "text": "hello"},
+            ),
+        ):
+            with (
+                self.subTest(preparer=type(preparer).__name__),
+                self.assertRaisesRegex(DACVAEEncodingError, "incompatible codec surface"),
+            ):
+                process(sample)
 
 
 class DatasetSourceContractTest(unittest.TestCase):
@@ -218,6 +359,7 @@ class RepresentationContractTest(unittest.TestCase):
                 "codec_revision": None,
                 "codec_filename": None,
                 "codec_sha256": "f" * 64,
+                "codec_encoding_policy": DACVAE_POSTERIOR_SAMPLING_POLICY,
                 "sample_rate": 48000,
                 "hop_length": 1920,
                 "latent_width": 4,
@@ -304,6 +446,78 @@ class RepresentationContractTest(unittest.TestCase):
         )
         self.assertEqual(row[REPRESENTATION_CONTRACT_COLUMN], self.contract.to_dict())
 
+    def test_frozen_prep_arrow_roundtrip_passes_exact_training_preflight(self):
+        spec = FrozenTextProviderSpec(
+            text_conditioning_mode="frozen_features",
+            text_vocab_size=23,
+            pad_token=1,
+            conditioning_feature_size=4,
+            conditioning_feature_dtype="float16",
+            frozen_text_alignment="hf_non_special_tokens_v1",
+            frozen_text_cache_version=1,
+            frozen_text_config_sha256="a" * 64,
+            frozen_text_encoder_id="example/encoder",
+            frozen_text_encoder_revision="a" * 40,
+            frozen_text_frontend="phonemes",
+            frozen_text_hidden_layer=-1,
+            frozen_text_model_filename="model.safetensors",
+            frozen_text_model_sha256="b" * 64,
+            frozen_text_tokenizer_filename="tokenizer.json",
+            frozen_text_tokenizer_id="example/tokenizer",
+            frozen_text_tokenizer_revision="a" * 40,
+            frozen_text_tokenizer_sha256="c" * 64,
+        )
+        english = language_id("en")
+        conditioning = FrozenTextConditioning(
+            conditioning_ids=torch.tensor([0, 5, 2]),
+            conditioning_features=torch.arange(12, dtype=torch.float16).reshape(3, 4),
+            conditioning_mask=torch.ones(3, dtype=torch.bool),
+            token_language_ids=torch.tensor([0, english, 0]),
+            alignment_mask=torch.tensor([False, True, False]),
+            rendered_text="h",
+            target_language_id=english,
+            cache_version=1,
+            contract_sha256=spec.contract_sha256,
+        )
+        provider = SimpleNamespace(
+            spec=spec,
+            encode=MagicMock(return_value=conditioning),
+        )
+        preparer = DatasetPreparer.__new__(DatasetPreparer)
+        preparer.language = "en"
+        preparer.sample_rate = 48000
+        preparer.frozen_text_provider = provider
+        preparer.representation_contract = build_representation_contract(
+            fake_codec(),
+            codec_source="codec/source-v1",
+            text_frontend_name=FROZEN_TEXT_REPRESENTATION_NAME,
+            text_frontend_version=FROZEN_TEXT_REPRESENTATION_VERSION,
+        )
+        preparer.extract_latents = lambda audio, sr: np.zeros((4, 3), dtype=np.float32)
+        row = preparer.process_sample(
+            {"audio": {"array": [0.0], "sampling_rate": 48000}, "text": "hello"},
+            phonemes=["h"],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            Dataset.from_list([row]).save_to_disk(directory)
+            loaded = load_from_disk(directory)
+            validate_tts_dataset(
+                loaded,
+                latent_size=4,
+                use_speaker_conditioning=False,
+                text_conditioning_mode="frozen_features",
+                conditioning_feature_size=4,
+                frozen_text_provider_spec=spec,
+                text_vocab_size=23,
+                text_pad_token=1,
+                allow_legacy_representation=False,
+            )
+            self.assertEqual(
+                loaded.features["conditioning_features"].feature.feature.dtype,
+                "float16",
+            )
+
     def test_every_preparer_loads_the_codec_frozen(self):
         cases = (
             ("nar_vae.dataset.prepare.load_dacvae", DatasetPreparer),
@@ -362,6 +576,59 @@ class RepresentationContractTest(unittest.TestCase):
 
 
 class DatasetLoadingThreadingTest(unittest.TestCase):
+    def test_frozen_config_constructs_provider_after_local_rank_device_selection(self):
+        raw = empty_dataset()
+        prepared = saved_dataset()
+        events = []
+        provider = SimpleNamespace(
+            spec=SimpleNamespace(
+                frozen_text_frontend="raw_text",
+                frozen_text_tokenizer_id="example/tokenizer",
+                contract_sha256="a" * 64,
+            ),
+            vocab_size=23,
+            pad_token_id=1,
+        )
+
+        def setup():
+            events.append("distributed")
+            return 2, 1, False
+
+        def resolve(**kwargs):
+            events.append(("provider", kwargs["device"]))
+            return provider
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("nar_vae.dataset.prepare.setup_distributed", side_effect=setup),
+                patch("nar_vae.dataset.prepare.torch.cuda.is_available", return_value=True),
+                patch(
+                    "nar_vae.dataset.prepare.resolve_frozen_text_provider",
+                    side_effect=resolve,
+                ),
+                patch("nar_vae.dataset.prepare.snapshot_download"),
+                patch("nar_vae.dataset.prepare.load_dataset", return_value=raw),
+                patch(
+                    "nar_vae.dataset.prepare.DatasetPreparer",
+                    return_value=SimpleNamespace(sample_rate=48000),
+                ),
+                patch("nar_vae.dataset.prepare.Dataset.from_list", return_value=prepared),
+                patch("nar_vae.dataset.prepare.write_prepared_dataset_manifest"),
+                patch("nar_vae.dataset.prepare.cleanup_distributed"),
+            ):
+                prepare_dataset(
+                    "speech/example",
+                    str(Path(directory) / "prepared"),
+                    "train",
+                    "codec/source-v1",
+                    0,
+                    "",
+                    dataset_revision=DATASET_REVISION_A,
+                    frozen_text_config={"text_conditioning_mode": "frozen_features"},
+                )
+
+        self.assertEqual(events, ["distributed", ("provider", "cuda:2")])
+
     def test_standard_remote_source_threads_revision_and_worker_bound(self):
         raw = empty_dataset()
         prepared = saved_dataset()

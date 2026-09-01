@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections import OrderedDict
@@ -24,6 +25,17 @@ from nar_vae.models.duration import (
     ECHODIT_ARCHITECTURE_VERSION,
     MONOTONIC_ALIGNMENT_VERSION,
 )
+from nar_vae.objectives import (
+    DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+    DIFFUSION_SCHEDULE_SHIFT_METADATA_KEY,
+    GENERATIVE_OBJECTIVE_METADATA_KEY,
+    RECTIFIED_FLOW_OBJECTIVE,
+    VP_DIFFUSION_OBJECTIVE,
+    normalize_generative_objective,
+    objective_from_metadata,
+    unwrap_generation_contract_model,
+    validate_diffusion_schedule_shift,
+)
 from nar_vae.voice import (
     CROSS_LINGUAL_CAPABILITY_VERSION,
     SPEAKER_CONDITIONING_VERSION,
@@ -32,13 +44,36 @@ from nar_vae.voice import (
 
 SPEAKER_STATE_KEYS = {
     "null_speaker_embed",
+    "null_speaker_state",
     "speaker_conditioning_version",
     "speaker_patch_layout_version",
     "speaker_patch_size_metadata",
+    "speaker_resampler_version",
+    "speaker_num_summary_tokens_metadata",
+}
+SPEAKER_RESAMPLER_VERSION = 1
+SPEAKER_RESAMPLER_PARAMETER_PREFIX = "dit.speaker_resampler."
+_SPEAKER_RESAMPLER_PARAMETER_NAMES = {
+    "query_tokens",
+    "input_norm.weight",
+    "input_norm.bias",
+    "q_proj.weight",
+    "kv_proj.weight",
+    "out_proj.weight",
+    "mlp_norm.weight",
+    "mlp_norm.bias",
+    "mlp.0.weight",
+    "mlp.0.bias",
+    "mlp.2.weight",
+    "mlp.2.bias",
+    "output_norm.weight",
+    "output_norm.bias",
 }
 LANGUAGE_EMBEDDING_KEY = "dit.text_encoder.language_embedding.weight"
+GLOBAL_LANGUAGE_EMBEDDING_KEY = "dit.global_language_embedding.weight"
 LANGUAGE_STATE_KEYS = {
     LANGUAGE_EMBEDDING_KEY,
+    GLOBAL_LANGUAGE_EMBEDDING_KEY,
     "language_conditioning_version",
     "language_registry_version",
     "language_count_metadata",
@@ -51,12 +86,14 @@ CROSS_LINGUAL_STATE_KEYS = {
     "supported_language_pair_ids_metadata",
 }
 DURATION_METADATA_KEYS = {
-    "echodit_architecture_version",
     "duration_predictor_version",
     "duration_predictor_hidden_size_metadata",
     "duration_predictor_num_layers_metadata",
     "duration_predictor_uses_speaker_metadata",
 }
+ARCHITECTURE_METADATA_KEY = "echodit_architecture_version"
+TARGET_PATCH_SIZE_METADATA_KEY = "target_patch_size_metadata"
+_DURATION_REQUIRED_METADATA_KEYS = DURATION_METADATA_KEYS | {ARCHITECTURE_METADATA_KEY}
 DURATION_PARAMETER_PREFIX = "duration_predictor."
 MONOTONIC_ALIGNMENT_METADATA_KEYS = {
     "duration_alignment_version",
@@ -64,6 +101,31 @@ MONOTONIC_ALIGNMENT_METADATA_KEYS = {
 }
 MONOTONIC_ALIGNMENT_PARAMETER_PREFIX = "duration_alignment."
 MONOTONIC_FRAME_PROJECTION_KEY = "dit.frame_text_proj.weight"
+TEXT_CONDITIONING_METADATA_KEYS = {
+    "text_conditioning_version",
+    "text_conditioning_mode_metadata",
+    "text_conditioning_feature_size_metadata",
+    "text_conditioning_adapter_version_metadata",
+}
+FROZEN_TEXT_PROJECTION_KEY = "dit.text_encoder.feature_projection.weight"
+_IMMUTABLE_CHECKPOINT_METADATA_KEYS = (
+    {
+        ARCHITECTURE_METADATA_KEY,
+        TARGET_PATCH_SIZE_METADATA_KEY,
+        GENERATIVE_OBJECTIVE_METADATA_KEY,
+        DIFFUSION_SCHEDULE_SHIFT_METADATA_KEY,
+        "speaker_conditioning_version",
+        "speaker_patch_layout_version",
+        "speaker_patch_size_metadata",
+        "speaker_resampler_version",
+        "speaker_num_summary_tokens_metadata",
+    }
+    | (LANGUAGE_STATE_KEYS - {LANGUAGE_EMBEDDING_KEY, GLOBAL_LANGUAGE_EMBEDDING_KEY})
+    | CROSS_LINGUAL_STATE_KEYS
+    | DURATION_METADATA_KEYS
+    | MONOTONIC_ALIGNMENT_METADATA_KEYS
+    | TEXT_CONDITIONING_METADATA_KEYS
+)
 _HUB_COMMIT_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
 
@@ -81,6 +143,18 @@ class LegacyCrossLingualCheckpointError(RuntimeError):
 
 class LegacyDurationCheckpointError(RuntimeError):
     """Raised when duration weights lack a complete, supported architecture contract."""
+
+
+class LegacyArchitectureCheckpointError(RuntimeError):
+    """Raised when weights do not declare the exact supported NAR-VAE topology."""
+
+
+class GenerativeObjectiveCheckpointError(RuntimeError):
+    """Raised when objective metadata is present but unsupported or malformed."""
+
+
+class LegacyTextConditioningCheckpointError(RuntimeError):
+    """Raised when frozen text-adapter tensors lack a complete topology contract."""
 
 
 class LegacyMonotonicAlignmentCheckpointError(RuntimeError):
@@ -190,6 +264,30 @@ class MonotonicAlignmentCheckpointInfo:
     version: int = 0
 
 
+@dataclass(frozen=True)
+class TextConditioningCheckpointInfo:
+    """Validated text-state topology stored in one acoustic checkpoint."""
+
+    mode: str
+    feature_size: int = 0
+    adapter_version: int = 0
+
+
+def _text_state_width(
+    state_dict: Mapping[str, torch.Tensor],
+    error_type: type[RuntimeError],
+) -> int:
+    scratch = state_dict.get("dit.text_encoder.text_embedding.weight")
+    frozen = state_dict.get(FROZEN_TEXT_PROJECTION_KEY)
+    if scratch is not None and frozen is not None:
+        raise error_type("Checkpoint contains both scratch-token and frozen-feature text states.")
+    if isinstance(scratch, torch.Tensor) and scratch.ndim == 2:
+        return int(scratch.shape[1])
+    if isinstance(frozen, torch.Tensor) and frozen.ndim == 2:
+        return int(frozen.shape[0])
+    raise error_type("Checkpoint does not contain a supported rank-2 text-state projection.")
+
+
 def _scalar_metadata(
     state_dict: Mapping[str, torch.Tensor],
     key: str,
@@ -218,6 +316,53 @@ def _duration_state_keys(state_dict: Mapping[str, torch.Tensor]) -> set[str]:
     }
 
 
+def _speaker_state_keys(state_dict: Mapping[str, torch.Tensor]) -> set[str]:
+    """Return every tensor that exists only in a speaker-conditioned topology."""
+    return SPEAKER_STATE_KEYS.intersection(state_dict) | {
+        key
+        for key in state_dict
+        if key.startswith("dit.speaker_encoder.")
+        or key.startswith(SPEAKER_RESAMPLER_PARAMETER_PREFIX)
+        or key.startswith("dit.speaker_norm.")
+        or (key.startswith("dit.blocks.") and ".attention.wk_speaker." in key)
+        or (key.startswith("dit.blocks.") and ".attention.wv_speaker." in key)
+    }
+
+
+def _validate_partial_ema_immutable_state(
+    model: torch.nn.Module,
+    base_state_dict: Mapping[str, torch.Tensor],
+    ema_state_dict: Mapping[str, torch.Tensor],
+) -> None:
+    """Reject an EMA overlay that changes base-authenticated topology state."""
+    model_buffer_keys = {name for name, _ in model.named_buffers()}
+    protected_keys = {
+        key
+        for key in ema_state_dict
+        if key in _IMMUTABLE_CHECKPOINT_METADATA_KEYS
+        or key in model_buffer_keys
+        or key.rsplit(".", 1)[-1].endswith(("_metadata", "_version"))
+    }
+    mismatched = []
+    for key in sorted(protected_keys):
+        base_value = base_state_dict.get(key)
+        ema_value = ema_state_dict[key]
+        if (
+            not isinstance(base_value, torch.Tensor)
+            or not isinstance(ema_value, torch.Tensor)
+            or base_value.shape != ema_value.shape
+            or base_value.dtype != ema_value.dtype
+            or not torch.equal(base_value.detach().cpu(), ema_value.detach().cpu())
+        ):
+            mismatched.append(key)
+    if mismatched:
+        raise RuntimeError(
+            "Partial EMA checkpoint cannot override immutable metadata or model buffers; "
+            "values differ from the authenticated base for: "
+            f"{mismatched}."
+        )
+
+
 def _monotonic_alignment_state_keys(state_dict: Mapping[str, torch.Tensor]) -> set[str]:
     keys = MONOTONIC_ALIGNMENT_METADATA_KEYS | {
         key for key in state_dict if key.startswith(MONOTONIC_ALIGNMENT_PARAMETER_PREFIX)
@@ -240,7 +385,7 @@ def inspect_duration_capability(
             )
         return DurationCheckpointInfo(enabled=False)
 
-    missing_metadata = DURATION_METADATA_KEYS - set(state_dict)
+    missing_metadata = _DURATION_REQUIRED_METADATA_KEYS - set(state_dict)
     if missing_metadata:
         raise LegacyDurationCheckpointError(
             "Learned-duration weights require complete EchoDiT v2 metadata. "
@@ -291,16 +436,12 @@ def inspect_duration_capability(
 
     text_projection = state_dict.get("duration_predictor.text_projection.weight")
     output_projection = state_dict.get("duration_predictor.output_projection.weight")
-    text_embedding = state_dict.get("dit.text_encoder.text_embedding.weight")
+    text_width = _text_state_width(state_dict, LegacyDurationCheckpointError)
     if not isinstance(text_projection, torch.Tensor) or text_projection.ndim != 2:
         raise LegacyDurationCheckpointError("Duration text projection must be rank 2.")
     if not isinstance(output_projection, torch.Tensor) or output_projection.ndim != 2:
         raise LegacyDurationCheckpointError("Duration output projection must be rank 2.")
-    if not isinstance(text_embedding, torch.Tensor) or text_embedding.ndim != 2:
-        raise LegacyDurationCheckpointError(
-            "Duration checkpoints must include the EchoDiT text embedding."
-        )
-    if tuple(text_projection.shape) != (hidden_size, text_embedding.shape[1]):
+    if tuple(text_projection.shape) != (hidden_size, text_width):
         raise LegacyDurationCheckpointError(
             "Duration text projection does not match its stored hidden/text dimensions."
         )
@@ -351,6 +492,204 @@ def inspect_duration_capability(
         hidden_size=hidden_size,
         num_layers=num_layers,
         uses_speaker=uses_speaker,
+    )
+
+
+def inspect_architecture_version(state_dict: Mapping[str, torch.Tensor]) -> int:
+    """Require the topology version carried by every current NAR-VAE checkpoint."""
+    if ARCHITECTURE_METADATA_KEY not in state_dict:
+        raise LegacyArchitectureCheckpointError(
+            "Checkpoint weights do not contain versioned NAR-VAE architecture metadata."
+        )
+    version = _scalar_metadata(
+        state_dict,
+        ARCHITECTURE_METADATA_KEY,
+        LegacyArchitectureCheckpointError,
+    )
+    if version != ECHODIT_ARCHITECTURE_VERSION:
+        raise LegacyArchitectureCheckpointError(
+            f"Unsupported NAR-VAE architecture version: {version}."
+        )
+    if TARGET_PATCH_SIZE_METADATA_KEY not in state_dict:
+        raise LegacyArchitectureCheckpointError(
+            "Checkpoint weights do not declare the target-latent patch size."
+        )
+    patch_size = _scalar_metadata(
+        state_dict,
+        TARGET_PATCH_SIZE_METADATA_KEY,
+        LegacyArchitectureCheckpointError,
+    )
+    if patch_size <= 0:
+        raise LegacyArchitectureCheckpointError(
+            "Checkpoint target-latent patch size must be positive."
+        )
+    return version
+
+
+def inspect_target_patch_size(state_dict: Mapping[str, torch.Tensor]) -> int:
+    """Return the exact temporal packing factor after validating the v4 contract."""
+    inspect_architecture_version(state_dict)
+    return _scalar_metadata(
+        state_dict,
+        TARGET_PATCH_SIZE_METADATA_KEY,
+        LegacyArchitectureCheckpointError,
+    )
+
+
+def inspect_generative_objective(state_dict: Mapping[str, torch.Tensor]) -> str:
+    """Return strict diffusion metadata or the unambiguous legacy flow default."""
+    try:
+        objective = objective_from_metadata(state_dict.get(GENERATIVE_OBJECTIVE_METADATA_KEY))
+        has_shift = DIFFUSION_SCHEDULE_SHIFT_METADATA_KEY in state_dict
+        if objective == RECTIFIED_FLOW_OBJECTIVE and has_shift:
+            raise ValueError(
+                "A rectified-flow checkpoint cannot carry diffusion schedule metadata."
+            )
+        if objective == VP_DIFFUSION_OBJECTIVE and not has_shift:
+            raise ValueError("A VP-diffusion checkpoint must carry its exact schedule shift.")
+        if has_shift:
+            inspect_diffusion_schedule_shift(state_dict)
+        return objective
+    except (TypeError, ValueError) as exc:
+        raise GenerativeObjectiveCheckpointError(str(exc)) from exc
+
+
+def inspect_diffusion_schedule_shift(state_dict: Mapping[str, torch.Tensor]) -> float:
+    """Return the authenticated VP schedule, or the legacy no-shift sentinel."""
+    try:
+        objective = objective_from_metadata(state_dict.get(GENERATIVE_OBJECTIVE_METADATA_KEY))
+        value = state_dict.get(DIFFUSION_SCHEDULE_SHIFT_METADATA_KEY)
+        if objective == RECTIFIED_FLOW_OBJECTIVE:
+            if value is not None:
+                raise ValueError(
+                    "A rectified-flow checkpoint cannot carry diffusion schedule metadata."
+                )
+            return DEFAULT_DIFFUSION_SCHEDULE_SHIFT
+        if value is None or not isinstance(value, torch.Tensor) or value.numel() != 1:
+            raise ValueError(
+                "A VP-diffusion checkpoint must carry a scalar diffusion schedule shift."
+            )
+        raw = float(value.detach().cpu().item())
+        if not math.isfinite(raw):
+            raise ValueError("diffusion schedule shift must be finite")
+        return validate_diffusion_schedule_shift(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise GenerativeObjectiveCheckpointError(str(exc)) from exc
+
+
+def _model_generation_contract(model: torch.nn.Module) -> tuple[str, float]:
+    """Read and internally validate the objective contract of a target model."""
+    try:
+        model = unwrap_generation_contract_model(model)
+    except (TypeError, ValueError) as exc:
+        raise GenerativeObjectiveCheckpointError(str(exc)) from exc
+    state_dict = model.state_dict()
+    objective = inspect_generative_objective(state_dict)
+    schedule_shift = inspect_diffusion_schedule_shift(state_dict)
+
+    attribute_objective = getattr(model, "generative_objective", None)
+    attribute_shift = getattr(model, "diffusion_schedule_shift", None)
+    if (attribute_objective is None) != (attribute_shift is None):
+        raise GenerativeObjectiveCheckpointError(
+            "The target model exposes an incomplete generative objective/schedule contract."
+        )
+    if attribute_objective is not None:
+        try:
+            normalized_attribute_objective = normalize_generative_objective(attribute_objective)
+            normalized_attribute_shift = validate_diffusion_schedule_shift(attribute_shift)
+        except (TypeError, ValueError) as exc:
+            raise GenerativeObjectiveCheckpointError(str(exc)) from exc
+        if (
+            normalized_attribute_objective != objective
+            or normalized_attribute_shift != schedule_shift
+        ):
+            raise GenerativeObjectiveCheckpointError(
+                "The target model's objective attributes disagree with its checkpoint "
+                "metadata buffers."
+            )
+    return objective, schedule_shift
+
+
+def _validate_generation_contract_before_load(
+    model: torch.nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+) -> None:
+    """Reject objective/schedule drift before checkpoint loading mutates a model."""
+    model_contract = _model_generation_contract(model)
+    checkpoint_contract = (
+        inspect_generative_objective(state_dict),
+        inspect_diffusion_schedule_shift(state_dict),
+    )
+    if model_contract != checkpoint_contract:
+        raise GenerativeObjectiveCheckpointError(
+            "Checkpoint generative objective/schedule does not match the target model: "
+            f"checkpoint={checkpoint_contract!r}, model={model_contract!r}."
+        )
+
+
+def inspect_text_conditioning(
+    state_dict: Mapping[str, torch.Tensor],
+) -> TextConditioningCheckpointInfo:
+    """Return legacy scratch tokens or validate the frozen-feature adapter contract."""
+    present = TEXT_CONDITIONING_METADATA_KEYS.intersection(state_dict)
+    frozen_projection = state_dict.get(FROZEN_TEXT_PROJECTION_KEY)
+    if not present:
+        if frozen_projection is not None:
+            raise LegacyTextConditioningCheckpointError(
+                "Frozen text-feature weights require complete versioned metadata."
+            )
+        scratch = state_dict.get("dit.text_encoder.text_embedding.weight")
+        if not isinstance(scratch, torch.Tensor) or scratch.ndim != 2:
+            raise LegacyTextConditioningCheckpointError(
+                "Legacy scratch-token checkpoints require a rank-2 text embedding."
+            )
+        return TextConditioningCheckpointInfo(mode="scratch_tokens")
+
+    missing = TEXT_CONDITIONING_METADATA_KEYS - set(state_dict)
+    if missing:
+        raise LegacyTextConditioningCheckpointError(
+            f"Frozen text-conditioning metadata is incomplete: {sorted(missing)}."
+        )
+    version = _scalar_metadata(
+        state_dict,
+        "text_conditioning_version",
+        LegacyTextConditioningCheckpointError,
+    )
+    mode_code = _scalar_metadata(
+        state_dict,
+        "text_conditioning_mode_metadata",
+        LegacyTextConditioningCheckpointError,
+    )
+    feature_size = _scalar_metadata(
+        state_dict,
+        "text_conditioning_feature_size_metadata",
+        LegacyTextConditioningCheckpointError,
+    )
+    adapter_version = _scalar_metadata(
+        state_dict,
+        "text_conditioning_adapter_version_metadata",
+        LegacyTextConditioningCheckpointError,
+    )
+    if (version, mode_code, adapter_version) != (1, 1, 1) or feature_size <= 0:
+        raise LegacyTextConditioningCheckpointError(
+            "Unsupported frozen text-conditioning version, mode, feature size, or adapter."
+        )
+    if not isinstance(frozen_projection, torch.Tensor) or frozen_projection.ndim != 2:
+        raise LegacyTextConditioningCheckpointError(
+            "Frozen conditioning requires a rank-2 feature projection."
+        )
+    if int(frozen_projection.shape[1]) != feature_size:
+        raise LegacyTextConditioningCheckpointError(
+            "Frozen feature metadata does not match the adapter input width."
+        )
+    if "dit.text_encoder.text_embedding.weight" in state_dict:
+        raise LegacyTextConditioningCheckpointError(
+            "Frozen conditioning cannot contain a scratch-token embedding."
+        )
+    return TextConditioningCheckpointInfo(
+        mode="frozen_features",
+        feature_size=feature_size,
+        adapter_version=adapter_version,
     )
 
 
@@ -417,7 +756,7 @@ def inspect_monotonic_alignment_capability(
             f"unexpected: {sorted(parameter_keys - expected_keys)}."
         )
 
-    text_embedding = state_dict.get("dit.text_encoder.text_embedding.weight")
+    text_width = _text_state_width(state_dict, LegacyMonotonicAlignmentCheckpointError)
     input_projection = state_dict.get("dit.in_proj.weight")
     statistics_weight = state_dict["duration_alignment.text_statistics.weight"]
     statistics_bias = state_dict["duration_alignment.text_statistics.bias"]
@@ -427,17 +766,13 @@ def inspect_monotonic_alignment_capability(
         raise LegacyMonotonicAlignmentCheckpointError(
             "Monotonic-alignment and frame-regulator state must contain tensors."
         )
-    if not isinstance(text_embedding, torch.Tensor) or text_embedding.ndim != 2:
-        raise LegacyMonotonicAlignmentCheckpointError(
-            "MAS checkpoints must include the EchoDiT text embedding."
-        )
     if not isinstance(input_projection, torch.Tensor) or input_projection.ndim != 2:
         raise LegacyMonotonicAlignmentCheckpointError(
             "MAS checkpoints must include the EchoDiT latent input projection."
         )
     if frame_projection.ndim != 2 or tuple(frame_projection.shape) != (
         input_projection.shape[0],
-        text_embedding.shape[1],
+        text_width,
     ):
         raise LegacyMonotonicAlignmentCheckpointError(
             "MAS frame-regulator projection does not match the model/text dimensions."
@@ -447,7 +782,7 @@ def inspect_monotonic_alignment_capability(
             "Monotonic-alignment hidden size cannot exceed the latent width."
         )
     expected_shapes = (
-        (hidden_size * 2, text_embedding.shape[1]),
+        (hidden_size * 2, text_width),
         (hidden_size * 2,),
         (hidden_size, input_projection.shape[1]),
     )
@@ -549,6 +884,9 @@ def inspect_language_conditioning(
         )
     if not isinstance(embedding, torch.Tensor) or embedding.ndim != 2:
         raise LegacyLanguageCheckpointError("Language embedding must be a rank-2 tensor.")
+    global_embedding = state_dict[GLOBAL_LANGUAGE_EMBEDDING_KEY]
+    if not isinstance(global_embedding, torch.Tensor) or global_embedding.ndim != 2:
+        raise LegacyLanguageCheckpointError("Global language embedding must be a rank-2 tensor.")
 
     conditioning_version = _scalar_metadata(
         state_dict,
@@ -573,19 +911,30 @@ def inspect_language_conditioning(
         raise LegacyLanguageCheckpointError(
             f"Unsupported language registry version: {registry_version}."
         )
-    if language_count != LANGUAGE_COUNT or embedding.shape[0] != LANGUAGE_COUNT + 1:
+    if (
+        language_count != LANGUAGE_COUNT
+        or embedding.shape[0] != LANGUAGE_COUNT + 1
+        or global_embedding.shape[0] != LANGUAGE_COUNT + 1
+    ):
         raise LegacyLanguageCheckpointError(
             "Checkpoint language count does not match this library's stable registry."
         )
 
-    text_embedding = state_dict.get("dit.text_encoder.text_embedding.weight")
-    if not isinstance(text_embedding, torch.Tensor) or text_embedding.ndim != 2:
-        raise LegacyLanguageCheckpointError(
-            "Language-conditioned checkpoints must include a rank-2 text embedding."
-        )
-    if embedding.shape[1] != text_embedding.shape[1]:
+    text_width = _text_state_width(state_dict, LegacyLanguageCheckpointError)
+    if embedding.shape[1] != text_width:
         raise LegacyLanguageCheckpointError(
             "Language and text embedding widths do not match in this checkpoint."
+        )
+    conditioning_projection = state_dict.get("dit.cond_module.0.weight")
+    if not isinstance(conditioning_projection, torch.Tensor) or conditioning_projection.ndim != 2:
+        raise LegacyLanguageCheckpointError(
+            "Language-conditioned checkpoints must include the rank-2 timestep "
+            "conditioning projection."
+        )
+    if global_embedding.shape[1] != conditioning_projection.shape[1]:
+        raise LegacyLanguageCheckpointError(
+            "Global language embedding width does not match the timestep conditioning "
+            "width in this checkpoint."
         )
 
     supported_ids = _language_id_metadata(
@@ -698,6 +1047,7 @@ def infer_speaker_conditioning_from_state_dict(
     fallback: bool,
 ) -> bool:
     """Infer and validate versioned speaker capability from checkpoint tensors."""
+    inspect_speaker_num_summary_tokens(state_dict)
     if "null_speaker_embed" in state_dict:
         conditioning_version = state_dict.get("speaker_conditioning_version")
         patch_layout_version = state_dict.get("speaker_patch_layout_version")
@@ -764,6 +1114,82 @@ def infer_speaker_conditioning_from_state_dict(
     if any(key.startswith("dit.speaker_encoder.") for key in state_dict):
         return False
     return fallback
+
+
+def inspect_speaker_num_summary_tokens(state_dict: Mapping[str, torch.Tensor]) -> int:
+    """Return the exact fixed-reference topology, with absence meaning legacy zero.
+
+    Version-one metadata and parameters are additive. A checkpoint must contain
+    the complete pair and exact parameter namespace, or neither; this prevents a
+    partially saved resampler from being mistaken for the legacy speaker path.
+    """
+    metadata_keys = {
+        "speaker_resampler_version",
+        "speaker_num_summary_tokens_metadata",
+    }
+    present_metadata = metadata_keys.intersection(state_dict)
+    parameter_names = {
+        key.removeprefix(SPEAKER_RESAMPLER_PARAMETER_PREFIX)
+        for key in state_dict
+        if key.startswith(SPEAKER_RESAMPLER_PARAMETER_PREFIX)
+    }
+    if not present_metadata and not parameter_names:
+        return 0
+    if present_metadata != metadata_keys:
+        raise LegacySpeakerCheckpointError(
+            "Speaker-resampler metadata is incomplete; version and token count are required."
+        )
+    if parameter_names != _SPEAKER_RESAMPLER_PARAMETER_NAMES:
+        missing = sorted(_SPEAKER_RESAMPLER_PARAMETER_NAMES - parameter_names)
+        unknown = sorted(parameter_names - _SPEAKER_RESAMPLER_PARAMETER_NAMES)
+        raise LegacySpeakerCheckpointError(
+            "Speaker-resampler parameters do not match version one: "
+            f"missing={missing}, unknown={unknown}."
+        )
+    if "null_speaker_embed" not in state_dict:
+        raise LegacySpeakerCheckpointError(
+            "Speaker-resampler state requires a speaker-conditioned checkpoint."
+        )
+
+    version = _scalar_metadata(
+        state_dict,
+        "speaker_resampler_version",
+        LegacySpeakerCheckpointError,
+    )
+    if version != SPEAKER_RESAMPLER_VERSION:
+        raise LegacySpeakerCheckpointError(f"Unsupported speaker resampler version: {version}.")
+    token_count = _scalar_metadata(
+        state_dict,
+        "speaker_num_summary_tokens_metadata",
+        LegacySpeakerCheckpointError,
+    )
+    if token_count <= 0:
+        raise LegacySpeakerCheckpointError(
+            "Speaker summary-token metadata must be a positive integer."
+        )
+
+    queries = state_dict[f"{SPEAKER_RESAMPLER_PARAMETER_PREFIX}query_tokens"]
+    speaker_projection = state_dict.get("dit.speaker_encoder.in_proj.weight")
+    null_state = state_dict.get("null_speaker_state")
+    if not isinstance(queries, torch.Tensor) or queries.ndim != 2:
+        raise LegacySpeakerCheckpointError("Speaker-resampler queries must be rank two.")
+    if queries.shape[0] != token_count:
+        raise LegacySpeakerCheckpointError(
+            "Speaker summary-token metadata does not match learned query count."
+        )
+    hidden_size = queries.shape[1]
+    if (
+        not isinstance(speaker_projection, torch.Tensor)
+        or speaker_projection.ndim != 2
+        or speaker_projection.shape[0] != hidden_size
+        or not isinstance(null_state, torch.Tensor)
+        or null_state.ndim != 3
+        or null_state.shape[-1] != hidden_size
+    ):
+        raise LegacySpeakerCheckpointError(
+            "Speaker-resampler width does not match speaker encoder/null state."
+        )
+    return token_count
 
 
 def _path_relative_to(path: Path, root: Path) -> str:
@@ -988,6 +1414,7 @@ def load_pretrained_checkpoint(
         )
         for key, value in state_dict.items()
     )
+    _validate_generation_contract_before_load(model, normalized_state)
     checkpoint_reference_languages = inspect_reference_language_capability(normalized_state)
     checkpoint_duration = inspect_duration_capability(normalized_state)
     checkpoint_alignment = inspect_monotonic_alignment_capability(normalized_state)
@@ -995,6 +1422,7 @@ def load_pretrained_checkpoint(
     model_keys = set(model.state_dict())
     model_uses_speaker = "null_speaker_embed" in model_keys
     if model_uses_speaker:
+        model_summary_tokens = inspect_speaker_num_summary_tokens(model.state_dict())
         checkpoint_uses_speaker = infer_speaker_conditioning_from_state_dict(
             normalized_state,
             False,
@@ -1012,9 +1440,15 @@ def load_pretrained_checkpoint(
                 "does not contain versioned speaker state. Set "
                 "initialize_speaker_conditioning: true to add a new trainable speaker path."
             )
+        elif model_summary_tokens != inspect_speaker_num_summary_tokens(normalized_state):
+            raise RuntimeError(
+                "The model and pretrained checkpoint declare different speaker summary-token "
+                "topologies."
+            )
     else:
+        speaker_state_keys = _speaker_state_keys(normalized_state)
         normalized_state = OrderedDict(
-            (key, value) for key, value in normalized_state.items() if key not in SPEAKER_STATE_KEYS
+            (key, value) for key, value in normalized_state.items() if key not in speaker_state_keys
         )
 
     model_uses_language = LANGUAGE_EMBEDDING_KEY in model_keys
@@ -1139,7 +1573,7 @@ def load_pretrained_checkpoint(
         missing = set(result.missing_keys)
         expected_missing = set()
         if initialize_speaker_conditioning:
-            expected_missing.update(SPEAKER_STATE_KEYS)
+            expected_missing.update(_speaker_state_keys(model.state_dict()))
         if initialize_language_conditioning:
             expected_missing.update(LANGUAGE_STATE_KEYS)
         if initialize_cross_lingual_capability:
@@ -1211,6 +1645,26 @@ class FlowCheckpoint:
             return int(embedding.shape[0])
         return fallback
 
+    def text_conditioning(self) -> TextConditioningCheckpointInfo:
+        """Return the validated scratch-token or frozen-feature text topology."""
+        return inspect_text_conditioning(self.architecture_state_dict)
+
+    def validate_architecture(self) -> int:
+        """Validate and return the checkpoint's exact NAR-VAE topology version."""
+        return inspect_architecture_version(self.architecture_state_dict)
+
+    def infer_target_patch_size(self) -> int:
+        """Return the exact versioned temporal target-latent packing factor."""
+        return inspect_target_patch_size(self.architecture_state_dict)
+
+    def generative_objective(self) -> str:
+        """Return the objective encoded by the selected checkpoint weights."""
+        return inspect_generative_objective(self.architecture_state_dict)
+
+    def diffusion_schedule_shift(self) -> float:
+        """Return the exact VP schedule shift authenticated by the state dict."""
+        return inspect_diffusion_schedule_shift(self.architecture_state_dict)
+
     def infer_speaker_conditioning(self, fallback: bool) -> bool:
         return infer_speaker_conditioning_from_state_dict(
             self.architecture_state_dict,
@@ -1226,6 +1680,10 @@ class FlowCheckpoint:
         if patch_size <= 0:
             raise LegacySpeakerCheckpointError("Speaker patch size metadata must be positive.")
         return patch_size
+
+    def infer_speaker_num_summary_tokens(self) -> int:
+        """Return zero for legacy references or the authenticated fixed token count."""
+        return inspect_speaker_num_summary_tokens(self.architecture_state_dict)
 
     def language_capability(self) -> LanguageCheckpointInfo:
         """Return validated language support stored with the architecture weights."""
@@ -1252,13 +1710,14 @@ class FlowCheckpoint:
 
     def load_into(self, model: torch.nn.Module) -> None:
         """Strictly load a base checkpoint, then overlay partial EMA weights if used."""
+        _validate_generation_contract_before_load(model, self.architecture_state_dict)
         model_keys = set(model.state_dict())
 
         def compatible_state_dict(
             state_dict: Mapping[str, torch.Tensor],
         ) -> Mapping[str, torch.Tensor]:
             ignored = (
-                SPEAKER_STATE_KEYS
+                _speaker_state_keys(state_dict)
                 | LANGUAGE_STATE_KEYS
                 | CROSS_LINGUAL_STATE_KEYS
                 | _duration_state_keys(state_dict)
@@ -1268,6 +1727,11 @@ class FlowCheckpoint:
             return {key: value for key, value in state_dict.items() if key not in ignored}
 
         if self.base_state_dict is not None:
+            _validate_partial_ema_immutable_state(
+                model,
+                self.base_state_dict,
+                self.state_dict,
+            )
             model.load_state_dict(compatible_state_dict(self.base_state_dict), strict=True)
             incompatible = model.load_state_dict(
                 compatible_state_dict(self.state_dict),
@@ -1282,15 +1746,20 @@ class FlowCheckpoint:
 
 
 __all__ = [
+    "ARCHITECTURE_METADATA_KEY",
     "CheckpointProvenance",
     "DURATION_METADATA_KEYS",
     "DurationCheckpointInfo",
     "FlowCheckpoint",
+    "GenerativeObjectiveCheckpointError",
     "HubCheckpointSource",
     "CROSS_LINGUAL_STATE_KEYS",
     "LANGUAGE_EMBEDDING_KEY",
+    "GLOBAL_LANGUAGE_EMBEDDING_KEY",
     "LANGUAGE_STATE_KEYS",
     "LegacySpeakerCheckpointError",
+    "LegacyTextConditioningCheckpointError",
+    "LegacyArchitectureCheckpointError",
     "LegacyLanguageCheckpointError",
     "LegacyCrossLingualCheckpointError",
     "LegacyDurationCheckpointError",
@@ -1299,10 +1768,19 @@ __all__ = [
     "ReferenceLanguageCheckpointInfo",
     "MONOTONIC_ALIGNMENT_METADATA_KEYS",
     "MonotonicAlignmentCheckpointInfo",
+    "TextConditioningCheckpointInfo",
     "SPEAKER_STATE_KEYS",
+    "SPEAKER_RESAMPLER_VERSION",
+    "TARGET_PATCH_SIZE_METADATA_KEY",
     "infer_speaker_conditioning_from_state_dict",
     "inspect_language_conditioning",
+    "inspect_architecture_version",
+    "inspect_target_patch_size",
+    "inspect_speaker_num_summary_tokens",
     "inspect_duration_capability",
+    "inspect_generative_objective",
+    "inspect_text_conditioning",
+    "inspect_diffusion_schedule_shift",
     "inspect_monotonic_alignment_capability",
     "inspect_reference_language_capability",
     "load_pretrained_checkpoint",

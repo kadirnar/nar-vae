@@ -11,6 +11,8 @@ from nar_vae.losses.flow_matching_loss import (
     sample_stratified_logit_normal,
 )
 from nar_vae.models.dit import JointAttention, RMSNorm, precompute_freqs_cis
+from nar_vae.models.duration import DurationAlignmentOutput
+from nar_vae.objectives import RECTIFIED_FLOW_OBJECTIVE, VP_DIFFUSION_OBJECTIVE
 
 
 class RecordingVelocityModel(torch.nn.Module):
@@ -23,6 +25,31 @@ class RecordingVelocityModel(torch.nn.Module):
         return torch.zeros_like(kwargs["latents"])
 
 
+class ContractVelocityModel(RecordingVelocityModel):
+    def __init__(self, objective: str, schedule_shift: float):
+        super().__init__()
+        self.generative_objective = objective
+        self.diffusion_schedule_shift = schedule_shift
+
+
+class ModuleWrapper(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, **kwargs):
+        return self.module(**kwargs)
+
+
+class OrigModuleWrapper(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module):
+        super().__init__()
+        self._orig_mod = module
+
+    def forward(self, **kwargs):
+        return self._orig_mod(**kwargs)
+
+
 class RecordingDurationModel(RecordingVelocityModel):
     def __init__(self, duration_prediction):
         super().__init__()
@@ -32,6 +59,47 @@ class RecordingDurationModel(RecordingVelocityModel):
         self.kwargs = kwargs
         velocity = torch.zeros_like(kwargs["latents"])
         return velocity, self.duration_prediction.to(velocity.device)
+
+
+class WrongShapeVelocityModel(RecordingVelocityModel):
+    def forward(self, **kwargs):
+        self.kwargs = kwargs
+        return kwargs["latents"][..., :-1]
+
+
+class RecordingMASModel(RecordingVelocityModel):
+    def __init__(self, ignored_token_value):
+        super().__init__()
+        self.ignored_token_value = ignored_token_value
+
+    def forward(self, **kwargs):
+        self.kwargs = kwargs
+        latents = kwargs["latents"]
+        batch_size, _, frame_count = latents.shape
+        token_count = kwargs["conditioning_ids"].shape[1]
+        token_durations = torch.full(
+            (batch_size, token_count),
+            self.ignored_token_value,
+            device=latents.device,
+        )
+        token_durations[:, 1] = frame_count
+        hard_alignment = torch.zeros(
+            (batch_size, token_count, frame_count),
+            dtype=torch.bool,
+            device=latents.device,
+        )
+        hard_alignment[:, 1] = True
+        log_likelihoods = torch.full_like(hard_alignment, -999.0, dtype=torch.float32)
+        log_likelihoods[:, 1] = -1.0
+        prediction = DurationAlignmentOutput(
+            total_log_frames=torch.log1p(
+                torch.full((batch_size,), float(frame_count), device=latents.device)
+            ),
+            token_durations=token_durations,
+            log_likelihoods=log_likelihoods,
+            hard_alignment=hard_alignment,
+        )
+        return torch.zeros_like(latents), prediction
 
 
 class StratifiedLogitNormalTest(unittest.TestCase):
@@ -92,6 +160,98 @@ class StratifiedLogitNormalTest(unittest.TestCase):
                 RMSNorm(4, eps=epsilon)
 
 
+class GenerationContractTest(unittest.TestCase):
+    def test_loss_rejects_wrapped_model_objective_or_schedule_mismatch_before_sampling(self):
+        mismatches = (
+            (RECTIFIED_FLOW_OBJECTIVE, 1.0),
+            (VP_DIFFUSION_OBJECTIVE, 0.2),
+        )
+        for objective, schedule_shift in mismatches:
+            with self.subTest(objective=objective, schedule_shift=schedule_shift):
+                inner = ContractVelocityModel(objective, schedule_shift)
+                model = ModuleWrapper(OrigModuleWrapper(inner))
+                loss = FlowMatchingLoss(
+                    generative_objective=VP_DIFFUSION_OBJECTIVE,
+                    diffusion_schedule_shift=1.0,
+                    timestep_distribution="uniform",
+                )
+                with (
+                    patch("nar_vae.losses.flow_matching_loss.torch.rand") as random_draw,
+                    self.assertRaisesRegex(ValueError, "does not match the training model"),
+                ):
+                    loss(
+                        model=model,
+                        latents=torch.ones(1, 2, 2),
+                        conditioning_ids=torch.ones(1, 2, dtype=torch.long),
+                    )
+
+                random_draw.assert_not_called()
+                self.assertIsNone(inner.kwargs)
+
+    def test_outer_contract_cannot_hide_canonical_model_mismatch(self):
+        inner = ContractVelocityModel(RECTIFIED_FLOW_OBJECTIVE, 1.0)
+        model = ModuleWrapper(OrigModuleWrapper(inner))
+        model.generative_objective = VP_DIFFUSION_OBJECTIVE
+        model.diffusion_schedule_shift = 1.0
+        loss = FlowMatchingLoss(
+            generative_objective=VP_DIFFUSION_OBJECTIVE,
+            diffusion_schedule_shift=1.0,
+            timestep_distribution="uniform",
+        )
+
+        with (
+            patch("nar_vae.losses.flow_matching_loss.torch.rand") as random_draw,
+            self.assertRaisesRegex(ValueError, "does not match the training model"),
+        ):
+            loss(
+                model=model,
+                latents=torch.ones(1, 2, 2),
+                conditioning_ids=torch.ones(1, 2, dtype=torch.long),
+            )
+
+        random_draw.assert_not_called()
+        self.assertIsNone(inner.kwargs)
+
+    def test_wrapper_cycle_is_rejected_before_sampling_or_forward(self):
+        first = ModuleWrapper(RecordingVelocityModel())
+        second = OrigModuleWrapper(first)
+        object.__setattr__(first, "module", second)
+        loss = FlowMatchingLoss(timestep_distribution="uniform")
+
+        with (
+            patch("nar_vae.losses.flow_matching_loss.torch.rand") as random_draw,
+            self.assertRaisesRegex(ValueError, "wrapper cycle"),
+        ):
+            loss(
+                model=first,
+                latents=torch.ones(1, 2, 2),
+                conditioning_ids=torch.ones(1, 2, dtype=torch.long),
+            )
+
+        random_draw.assert_not_called()
+
+    def test_loss_accepts_matching_wrapped_contract_and_models_without_metadata(self):
+        loss = FlowMatchingLoss(
+            generative_objective=VP_DIFFUSION_OBJECTIVE,
+            diffusion_schedule_shift=0.2,
+            timestep_distribution="uniform",
+        )
+        wrapped = ModuleWrapper(ContractVelocityModel(VP_DIFFUSION_OBJECTIVE, 0.2))
+        result = loss(
+            model=wrapped,
+            latents=torch.ones(1, 2, 2),
+            conditioning_ids=torch.ones(1, 2, dtype=torch.long),
+        )
+        self.assertTrue(torch.isfinite(result))
+
+        legacy_protocol_result = FlowMatchingLoss(timestep_distribution="uniform")(
+            model=RecordingVelocityModel(),
+            latents=torch.ones(1, 2, 2),
+            conditioning_ids=torch.ones(1, 2, dtype=torch.long),
+        )
+        self.assertTrue(torch.isfinite(legacy_protocol_result))
+
+
 class LatentMaskTest(unittest.TestCase):
     def test_flow_loss_passes_latent_mask_to_model(self):
         model = RecordingVelocityModel()
@@ -115,6 +275,60 @@ class LatentMaskTest(unittest.TestCase):
                 latents=torch.ones(1, 2, 3),
                 conditioning_ids=torch.ones(1, 2, dtype=torch.long),
                 latent_mask=torch.ones(1, 2, dtype=torch.bool),
+            )
+
+    def test_flow_loss_rejects_broadcastable_wrong_velocity_shape(self):
+        with self.assertRaisesRegex(ValueError, "target latent shape"):
+            FlowMatchingLoss(timestep_distribution="uniform")(
+                model=WrongShapeVelocityModel(),
+                latents=torch.ones(1, 2, 2),
+                conditioning_ids=torch.ones(1, 2, dtype=torch.long),
+            )
+
+    def test_flow_loss_threads_token_languages_and_alignment_mask(self):
+        model = RecordingVelocityModel()
+        token_language_ids = torch.tensor([[0, 1, 0]])
+        alignment_mask = torch.tensor([[False, True, False]])
+
+        FlowMatchingLoss(timestep_distribution="uniform")(
+            model=model,
+            latents=torch.ones(1, 2, 3),
+            conditioning_ids=torch.ones(1, 3, dtype=torch.long),
+            conditioning_mask=torch.ones(1, 3, dtype=torch.bool),
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+        )
+
+        torch.testing.assert_close(model.kwargs["token_language_ids"], token_language_ids)
+        torch.testing.assert_close(model.kwargs["alignment_mask"], alignment_mask)
+
+    def test_mas_objectives_ignore_non_speakable_control_tokens(self):
+        objective = FlowMatchingLoss(
+            timestep_distribution="uniform",
+            mas_duration_loss_weight=0.2,
+            mas_alignment_loss_weight=0.03,
+        )
+        inputs = {
+            "latents": torch.ones(1, 2, 4),
+            "conditioning_ids": torch.ones(1, 3, dtype=torch.long),
+            "conditioning_mask": torch.ones(1, 3, dtype=torch.bool),
+            "alignment_mask": torch.tensor([[False, True, False]]),
+        }
+        torch.manual_seed(19)
+        baseline = objective(model=RecordingMASModel(0.0), **inputs)
+        torch.manual_seed(19)
+        changed_controls = objective(model=RecordingMASModel(100_000.0), **inputs)
+
+        torch.testing.assert_close(baseline, changed_controls)
+
+    def test_alignment_mask_cannot_select_text_padding(self):
+        with self.assertRaisesRegex(ValueError, "padded conditioning"):
+            FlowMatchingLoss(timestep_distribution="uniform")(
+                model=RecordingVelocityModel(),
+                latents=torch.ones(1, 2, 3),
+                conditioning_ids=torch.ones(1, 2, dtype=torch.long),
+                conditioning_mask=torch.tensor([[True, False]]),
+                alignment_mask=torch.tensor([[True, True]]),
             )
 
 

@@ -118,7 +118,7 @@ class SpeakerReferenceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least two utterances"):
             validate_zero_shot_splits(splits)
 
-    def test_prepared_dataset_preserves_speaker_latents(self):
+    def test_legacy_save_opt_in_preserves_speaker_latents(self):
         sample = {
             "latents": np.zeros((2, 3), dtype=np.float32),
             "latent_num_frames": 3,
@@ -139,13 +139,26 @@ class SpeakerReferenceTest(unittest.TestCase):
                     "nar_vae.dataset.prepare_dataset.write_prepared_dataset_manifest"
                 ) as write_manifest,
             ):
-                save_dataset([sample], directory)
+                save_dataset([sample], directory, allow_legacy_representation=True)
 
         self.assertIn("speaker_latents", from_dict.call_args.args[0])
         self.assertEqual(from_dict.call_args.args[0]["latent_num_frames"], [3])
         self.assertIn(REPRESENTATION_CONTRACT_COLUMN, from_dict.call_args.args[0])
         dataset.save_to_disk.assert_called_once()
         write_manifest.assert_called_once_with(dataset, directory)
+
+    def test_new_save_rejects_duplicated_static_speaker_latents(self):
+        sample = {
+            "latents": np.zeros((2, 3), dtype=np.float32),
+            "latent_num_frames": 3,
+            "conditioning_ids": [1],
+            "speaker_latents": np.zeros((2, 4), dtype=np.float32),
+            REPRESENTATION_CONTRACT_COLUMN: {"contract_version": 1},
+        }
+
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "one latent per utterance"):
+                save_dataset([sample], directory)
 
     def test_prepared_dataset_rejects_partial_frame_metadata(self):
         samples = [

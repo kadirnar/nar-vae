@@ -17,10 +17,15 @@ from nar_vae.dacvae.loader import (
     describe_dacvae_source,
     normalize_dacvae_source,
 )
+from nar_vae.dacvae_encoding import DACVAE_POSTERIOR_SAMPLING_POLICY
 from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_VERSION,
     TEXT_FRONTEND_NAME,
     TEXT_FRONTEND_VERSION,
+)
+from nar_vae.frozen_text_provider import (
+    FROZEN_TEXT_REPRESENTATION_NAME,
+    FROZEN_TEXT_REPRESENTATION_VERSION,
 )
 from nar_vae.languages import (
     normalize_language_pairs,
@@ -28,22 +33,37 @@ from nar_vae.languages import (
     resolve_language_pair_support,
 )
 from nar_vae.model_presets import ARCHITECTURE_FIELDS, resolve_model_architecture
+from nar_vae.models.duration import ECHODIT_ARCHITECTURE_VERSION
+from nar_vae.objectives import (
+    DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+    RECTIFIED_FLOW_OBJECTIVE,
+    normalize_generative_objective,
+    validate_diffusion_schedule_shift,
+)
 
 MODEL_MANIFEST_FILENAME = "nar_vae_manifest.json"
-MODEL_MANIFEST_SCHEMA_VERSION = 2
+MODEL_MANIFEST_SCHEMA_VERSION = 5
+LEGACY_MODEL_MANIFEST_SCHEMA_VERSION = 3
+PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION = 4
 MODEL_MANIFEST_LIBRARY = "nar-vae"
 MODEL_MANIFEST_STAGES = ("pretrain", "sft", "grpo")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _HUB_COMMIT = re.compile(r"[0-9a-fA-F]{40}")
 
 _ARCHITECTURE_FIELDS = (
+    "architecture_version",
     "latent_size",
     *ARCHITECTURE_FIELDS,
     "text_vocab_size",
     "speaker_patch_size",
+    "speaker_num_summary_tokens",
+    "target_patch_size",
     "use_speaker_conditioning",
     "use_mas_duration",
     "norm_eps",
+)
+_LEGACY_ARCHITECTURE_FIELDS = tuple(
+    name for name in _ARCHITECTURE_FIELDS if name != "speaker_num_summary_tokens"
 )
 _CAPABILITY_FIELDS = (
     "speaker_conditioning",
@@ -58,7 +78,7 @@ _CAPABILITY_FIELDS = (
     "monotonic_alignment",
     "duration_alignment_hidden_size",
 )
-_REPRESENTATION_FIELDS = (
+_LEGACY_REPRESENTATION_FIELDS = (
     "contract_version",
     "text_frontend_name",
     "text_frontend_version",
@@ -70,6 +90,42 @@ _REPRESENTATION_FIELDS = (
     "sample_rate",
     "hop_length",
     "latent_width",
+)
+_REPRESENTATION_FIELDS = (
+    "contract_version",
+    "text_frontend_name",
+    "text_frontend_version",
+    "codec_source",
+    "codec_backend",
+    "codec_revision",
+    "codec_filename",
+    "codec_sha256",
+    "codec_encoding_policy",
+    "sample_rate",
+    "hop_length",
+    "latent_width",
+)
+_GENERATION_FIELDS = ("objective", "diffusion_schedule_shift")
+_TEXT_CONDITIONING_FIELDS = (
+    "mode",
+    "provider_vocab_size",
+    "provider_pad_token",
+    "feature_size",
+    "adapter_version",
+    "encoder_id",
+    "encoder_revision",
+    "config_sha256",
+    "model_filename",
+    "model_sha256",
+    "tokenizer_id",
+    "tokenizer_revision",
+    "tokenizer_filename",
+    "tokenizer_sha256",
+    "hidden_layer",
+    "feature_dtype",
+    "frontend",
+    "alignment",
+    "cache_version",
 )
 _PARENT_FIELDS = (
     "manifest_sha256",
@@ -111,6 +167,12 @@ def _canonical_sha256(value: Any) -> str:
 def _positive_integer(value: Any, *, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ModelManifestError(f"{name} must be a positive integer.")
+    return value
+
+
+def _nonnegative_integer(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ModelManifestError(f"{name} must be a non-negative integer.")
     return value
 
 
@@ -165,11 +227,19 @@ def architecture_from_config(config: Mapping[str, Any]) -> dict[str, int | float
     """Resolve the exact model-construction shape stored with exported weights."""
     preset = resolve_model_architecture(config)
     architecture: dict[str, int | float] = {
+        "architecture_version": ECHODIT_ARCHITECTURE_VERSION,
         "latent_size": _positive_integer(config.get("dacvae_latent_dim"), name="latent_size"),
         **preset.model_kwargs(),
         "text_vocab_size": _positive_integer(config.get("text_vocab_size"), name="text_vocab_size"),
         "speaker_patch_size": _positive_integer(
             config.get("speaker_patch_size"), name="speaker_patch_size"
+        ),
+        "speaker_num_summary_tokens": _nonnegative_integer(
+            config.get("speaker_num_summary_tokens", 0),
+            name="speaker_num_summary_tokens",
+        ),
+        "target_patch_size": _positive_integer(
+            config.get("target_patch_size", 1), name="target_patch_size"
         ),
         "use_speaker_conditioning": _strict_boolean(config, "use_speaker_conditioning"),
         "use_mas_duration": _strict_boolean(config, "use_mas_duration"),
@@ -177,7 +247,97 @@ def architecture_from_config(config: Mapping[str, Any]) -> dict[str, int | float
     }
     if architecture["norm_eps"] <= 0:
         raise ModelManifestError("norm_eps must be positive.")
+    if (
+        architecture["speaker_num_summary_tokens"] > 0
+        and not architecture["use_speaker_conditioning"]
+    ):
+        raise ModelManifestError("speaker_num_summary_tokens requires speaker conditioning.")
     return architecture
+
+
+def generation_from_config(config: Mapping[str, Any]) -> dict[str, str | float]:
+    """Build the exact continuous generative objective/schedule contract."""
+    try:
+        objective = normalize_generative_objective(
+            config.get("generative_objective", RECTIFIED_FLOW_OBJECTIVE)
+        )
+        shift = validate_diffusion_schedule_shift(
+            config.get("diffusion_schedule_shift", DEFAULT_DIFFUSION_SCHEDULE_SHIFT)
+        )
+    except ValueError as exc:
+        raise ModelManifestError(str(exc)) from exc
+    if objective == RECTIFIED_FLOW_OBJECTIVE and shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT:
+        raise ModelManifestError(
+            "Rectified-flow manifests cannot declare a shifted diffusion schedule."
+        )
+    return {"objective": objective, "diffusion_schedule_shift": shift}
+
+
+def text_conditioning_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind the frozen provider/cache identity without embedding it in acoustic weights."""
+    mode = config.get("text_conditioning_mode", "scratch_tokens")
+    if mode == "scratch_tokens":
+        return {
+            "mode": mode,
+            "provider_vocab_size": 0,
+            "provider_pad_token": 0,
+            "feature_size": 0,
+            "adapter_version": 0,
+            "encoder_id": None,
+            "encoder_revision": None,
+            "config_sha256": None,
+            "model_filename": None,
+            "model_sha256": None,
+            "tokenizer_id": None,
+            "tokenizer_revision": None,
+            "tokenizer_filename": None,
+            "tokenizer_sha256": None,
+            "hidden_layer": None,
+            "feature_dtype": None,
+            "frontend": None,
+            "alignment": None,
+            "cache_version": 0,
+        }
+    if mode != "frozen_features":
+        raise ModelManifestError(f"Unsupported text_conditioning_mode: {mode!r}.")
+    provider_vocab_size = _positive_integer(
+        config.get("text_vocab_size"),
+        name="text_vocab_size",
+    )
+    provider_pad_token = config.get("pad_token")
+    if (
+        isinstance(provider_pad_token, bool)
+        or not isinstance(provider_pad_token, int)
+        or not 0 <= provider_pad_token < provider_vocab_size
+    ):
+        raise ModelManifestError("pad_token must be within text_vocab_size.")
+    return {
+        "mode": mode,
+        "provider_vocab_size": provider_vocab_size,
+        "provider_pad_token": provider_pad_token,
+        "feature_size": _positive_integer(
+            config.get("conditioning_feature_size"),
+            name="conditioning_feature_size",
+        ),
+        "adapter_version": 1,
+        "encoder_id": config.get("frozen_text_encoder_id"),
+        "encoder_revision": config.get("frozen_text_encoder_revision"),
+        "config_sha256": config.get("frozen_text_config_sha256"),
+        "model_filename": config.get("frozen_text_model_filename"),
+        "model_sha256": config.get("frozen_text_model_sha256"),
+        "tokenizer_id": config.get("frozen_text_tokenizer_id"),
+        "tokenizer_revision": config.get("frozen_text_tokenizer_revision"),
+        "tokenizer_filename": config.get("frozen_text_tokenizer_filename"),
+        "tokenizer_sha256": config.get("frozen_text_tokenizer_sha256"),
+        "hidden_layer": config.get("frozen_text_hidden_layer"),
+        "feature_dtype": config.get("conditioning_feature_dtype"),
+        "frontend": config.get("frozen_text_frontend"),
+        "alignment": config.get("frozen_text_alignment"),
+        "cache_version": _positive_integer(
+            config.get("frozen_text_cache_version"),
+            name="frozen_text_cache_version",
+        ),
+    }
 
 
 def capabilities_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -266,15 +426,21 @@ def representation_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "dacvae_sha256 must bind the exact local or Hub codec artifact with a lowercase "
             "64-character SHA-256."
         )
+    frozen_features = config.get("text_conditioning_mode", "scratch_tokens") == "frozen_features"
     return {
         "contract_version": REPRESENTATION_CONTRACT_VERSION,
-        "text_frontend_name": TEXT_FRONTEND_NAME,
-        "text_frontend_version": TEXT_FRONTEND_VERSION,
+        "text_frontend_name": (
+            FROZEN_TEXT_REPRESENTATION_NAME if frozen_features else TEXT_FRONTEND_NAME
+        ),
+        "text_frontend_version": (
+            FROZEN_TEXT_REPRESENTATION_VERSION if frozen_features else TEXT_FRONTEND_VERSION
+        ),
         "codec_source": source.identifier,
         "codec_backend": backend,
         "codec_revision": source.revision,
         "codec_filename": source.filename,
         "codec_sha256": codec_sha256,
+        "codec_encoding_policy": DACVAE_POSTERIOR_SAMPLING_POLICY,
         "sample_rate": _positive_integer(
             config.get("dacvae_sample_rate"), name="dacvae_sample_rate"
         ),
@@ -295,6 +461,8 @@ class ModelManifest:
     architecture: Mapping[str, int | float]
     capabilities: Mapping[str, Any]
     representation: Mapping[str, Any]
+    generation: Mapping[str, Any]
+    text_conditioning: Mapping[str, Any]
     parent: Mapping[str, Any] | None
     raw: Mapping[str, Any]
 
@@ -307,6 +475,13 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
     if not isinstance(value, Mapping):
         raise ModelManifestError("NAR-VAE model manifest must be a JSON object.")
     raw = dict(value)
+    schema_version = raw.get("schema_version")
+    if schema_version not in {
+        LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
+        PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION,
+        MODEL_MANIFEST_SCHEMA_VERSION,
+    }:
+        raise ModelManifestError("Unsupported NAR-VAE model-manifest schema.")
     expected_root = {
         "schema_version",
         "library",
@@ -317,10 +492,10 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         "representation",
         "parent",
     }
+    if schema_version != LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+        expected_root.update({"generation", "text_conditioning"})
     if set(raw) != expected_root:
         raise ModelManifestError("NAR-VAE model manifest has incomplete or unknown root fields.")
-    if raw["schema_version"] != MODEL_MANIFEST_SCHEMA_VERSION:
-        raise ModelManifestError("Unsupported NAR-VAE model-manifest schema.")
     if raw["library"] != MODEL_MANIFEST_LIBRARY:
         raise ModelManifestError("The acoustic checkpoint was not exported by NAR-VAE.")
     stage = raw["stage"]
@@ -337,10 +512,15 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             raise ModelManifestError(f"Weight {resolved_name!r} has an invalid SHA-256.")
         weights[resolved_name] = checksum
 
-    architecture = _mapping_with_exact_fields(
-        raw["architecture"], _ARCHITECTURE_FIELDS, name="architecture"
+    architecture_fields = (
+        _LEGACY_ARCHITECTURE_FIELDS
+        if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION
+        else _ARCHITECTURE_FIELDS
     )
-    for name in _ARCHITECTURE_FIELDS:
+    architecture = _mapping_with_exact_fields(
+        raw["architecture"], architecture_fields, name="architecture"
+    )
+    for name in architecture_fields:
         if name in {"use_speaker_conditioning", "use_mas_duration"}:
             if not isinstance(architecture[name], bool):
                 raise ModelManifestError(f"Manifest architecture {name} must be a boolean.")
@@ -348,8 +528,18 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             architecture[name] = _finite_number(architecture[name], name=name)
             if architecture[name] <= 0:
                 raise ModelManifestError("Manifest architecture norm_eps must be positive.")
+        elif name in {"text_num_layers", "speaker_num_summary_tokens"}:
+            value = architecture[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ModelManifestError(f"Manifest architecture {name} must be non-negative.")
         else:
             architecture[name] = _positive_integer(architecture[name], name=name)
+    if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+        architecture["speaker_num_summary_tokens"] = 0
+    if architecture["architecture_version"] != ECHODIT_ARCHITECTURE_VERSION:
+        raise ModelManifestError(
+            "The model manifest uses an unsupported NAR-VAE architecture version."
+        )
 
     capabilities = _mapping_with_exact_fields(
         raw["capabilities"], _CAPABILITY_FIELDS, name="capabilities"
@@ -443,15 +633,115 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         )
     if architecture["use_speaker_conditioning"] != capabilities["speaker_conditioning"]:
         raise ModelManifestError("Speaker topology and speaker capability metadata disagree.")
+    if architecture["speaker_num_summary_tokens"] > 0 and not capabilities["speaker_conditioning"]:
+        raise ModelManifestError("Speaker summary tokens require speaker-conditioning capability.")
     if architecture["use_mas_duration"] != capabilities["monotonic_alignment"]:
         raise ModelManifestError(
             "MAS topology and monotonic-alignment capability metadata disagree."
         )
 
-    representation = _mapping_with_exact_fields(
-        raw["representation"], _REPRESENTATION_FIELDS, name="representation"
+    if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+        generation = generation_from_config({})
+        text_conditioning = text_conditioning_from_config({})
+    else:
+        generation = _mapping_with_exact_fields(
+            raw["generation"], _GENERATION_FIELDS, name="generation"
+        )
+        try:
+            objective = normalize_generative_objective(generation["objective"])
+            shift = validate_diffusion_schedule_shift(generation["diffusion_schedule_shift"])
+        except ValueError as exc:
+            raise ModelManifestError(str(exc)) from exc
+        if objective == RECTIFIED_FLOW_OBJECTIVE and shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT:
+            raise ModelManifestError(
+                "Rectified-flow manifests cannot declare a shifted diffusion schedule."
+            )
+        generation = {"objective": objective, "diffusion_schedule_shift": shift}
+
+        text_conditioning = _mapping_with_exact_fields(
+            raw["text_conditioning"],
+            _TEXT_CONDITIONING_FIELDS,
+            name="text_conditioning",
+        )
+        mode = text_conditioning["mode"]
+        if mode == "scratch_tokens":
+            expected_scratch = text_conditioning_from_config({})
+            if text_conditioning != expected_scratch or architecture["text_num_layers"] <= 0:
+                raise ModelManifestError(
+                    "Scratch-token text conditioning metadata/topology is inconsistent."
+                )
+        elif mode == "frozen_features":
+            if architecture["text_num_layers"] != 0:
+                raise ModelManifestError("Frozen-feature manifests require text_num_layers=0.")
+            for name in (
+                "provider_vocab_size",
+                "feature_size",
+                "adapter_version",
+                "cache_version",
+            ):
+                text_conditioning[name] = _positive_integer(
+                    text_conditioning[name], name=f"text_conditioning.{name}"
+                )
+            provider_pad_token = text_conditioning["provider_pad_token"]
+            if (
+                isinstance(provider_pad_token, bool)
+                or not isinstance(provider_pad_token, int)
+                or not 0 <= provider_pad_token < text_conditioning["provider_vocab_size"]
+            ):
+                raise ModelManifestError(
+                    "text_conditioning.provider_pad_token must be within provider_vocab_size."
+                )
+            if text_conditioning["provider_vocab_size"] != architecture["text_vocab_size"]:
+                raise ModelManifestError(
+                    "Frozen provider vocabulary must match architecture.text_vocab_size."
+                )
+            if text_conditioning["adapter_version"] != 1:
+                raise ModelManifestError("Unsupported frozen text adapter version.")
+            for name in ("encoder_id", "tokenizer_id"):
+                value = text_conditioning[name]
+                if not isinstance(value, str) or value.count("/") != 1 or not all(value.split("/")):
+                    raise ModelManifestError(f"text_conditioning.{name} must use owner/name.")
+            for name in ("encoder_revision", "tokenizer_revision"):
+                value = text_conditioning[name]
+                if not isinstance(value, str) or not _HUB_COMMIT.fullmatch(value):
+                    raise ModelManifestError(f"text_conditioning.{name} must be a full Hub commit.")
+            for name in ("config_sha256", "model_sha256", "tokenizer_sha256"):
+                value = text_conditioning[name]
+                if not isinstance(value, str) or not _SHA256.fullmatch(value):
+                    raise ModelManifestError(
+                        f"text_conditioning.{name} must be a lowercase SHA-256."
+                    )
+            for name in ("model_filename", "tokenizer_filename"):
+                text_conditioning[name] = _relative_filename(
+                    text_conditioning[name], name=f"text_conditioning.{name}"
+                )
+            hidden_layer = text_conditioning["hidden_layer"]
+            if isinstance(hidden_layer, bool) or not isinstance(hidden_layer, int):
+                raise ModelManifestError("text_conditioning.hidden_layer must be an integer.")
+            if text_conditioning["feature_dtype"] not in {
+                "float16",
+                "float32",
+            }:
+                raise ModelManifestError("Unsupported frozen text feature dtype.")
+            if text_conditioning["frontend"] not in {"phonemes", "raw_text"}:
+                raise ModelManifestError("Unsupported frozen text frontend.")
+            if text_conditioning["alignment"] != "hf_non_special_tokens_v1":
+                raise ModelManifestError("Unsupported frozen text alignment policy.")
+        else:
+            raise ModelManifestError(f"Unsupported text-conditioning mode: {mode!r}.")
+
+    representation_fields = (
+        _REPRESENTATION_FIELDS
+        if schema_version == MODEL_MANIFEST_SCHEMA_VERSION
+        else _LEGACY_REPRESENTATION_FIELDS
     )
-    if representation["contract_version"] != REPRESENTATION_CONTRACT_VERSION:
+    representation = _mapping_with_exact_fields(
+        raw["representation"], representation_fields, name="representation"
+    )
+    expected_representation_version = (
+        REPRESENTATION_CONTRACT_VERSION if schema_version == MODEL_MANIFEST_SCHEMA_VERSION else 2
+    )
+    if representation["contract_version"] != expected_representation_version:
         raise ModelManifestError("Unsupported prepared-data representation contract version.")
     for name in ("text_frontend_name", "codec_source", "codec_backend"):
         if not isinstance(representation[name], str) or not representation[name].strip():
@@ -471,6 +761,24 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
     artifact_sha256 = representation["codec_sha256"]
     if not isinstance(artifact_sha256, str) or not _SHA256.fullmatch(artifact_sha256):
         raise ModelManifestError("Manifest codec_sha256 must be a lowercase SHA-256.")
+    if (
+        schema_version == MODEL_MANIFEST_SCHEMA_VERSION
+        and representation["codec_encoding_policy"] != DACVAE_POSTERIOR_SAMPLING_POLICY
+    ):
+        raise ModelManifestError("Manifest codec_encoding_policy is unsupported.")
+    expected_frontend = (
+        (FROZEN_TEXT_REPRESENTATION_NAME, FROZEN_TEXT_REPRESENTATION_VERSION)
+        if text_conditioning["mode"] == "frozen_features"
+        else (TEXT_FRONTEND_NAME, TEXT_FRONTEND_VERSION)
+    )
+    observed_frontend = (
+        representation["text_frontend_name"],
+        representation["text_frontend_version"],
+    )
+    if observed_frontend != expected_frontend:
+        raise ModelManifestError(
+            "Manifest representation frontend contradicts its text-conditioning mode."
+        )
 
     parent = raw["parent"]
     if stage == "pretrain" and parent is not None:
@@ -533,14 +841,20 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             parent["selected_weight_filename"] = selected_name
             parent["base_weight_filename"] = base_name
 
+    raw_architecture = dict(architecture)
+    if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+        raw_architecture.pop("speaker_num_summary_tokens")
     normalized_raw = {
         **raw,
         "weights": weights,
-        "architecture": architecture,
+        "architecture": raw_architecture,
         "capabilities": capabilities,
         "representation": representation,
         "parent": parent,
     }
+    if schema_version != LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+        normalized_raw["generation"] = generation
+        normalized_raw["text_conditioning"] = text_conditioning
     return ModelManifest(
         path=path,
         stage=stage,
@@ -548,6 +862,8 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         architecture=architecture,
         capabilities=capabilities,
         representation=representation,
+        generation=generation,
+        text_conditioning=text_conditioning,
         parent=parent,
         raw=normalized_raw,
     )
@@ -664,8 +980,12 @@ def write_model_manifest(
         raise ModelManifestError(f"Unknown training stage {stage!r}.")
     if stage == "pretrain" and parent_manifest is not None:
         raise ModelManifestError("Pretraining exports cannot declare a parent manifest.")
-    if stage == "sft" and parent_manifest is None:
-        raise ModelManifestError("SFT exports require their pretraining parent manifest.")
+    if stage == "sft":
+        if not isinstance(parent_manifest, ModelManifest):
+            raise ModelManifestError(
+                "SFT exports require the fully validated pretraining parent model manifest."
+            )
+        _validate_sft_parent_contract(parent_manifest, config)
     if stage != "grpo" and (
         parent_checkpoint_path is not None or parent_base_checkpoint_path is not None
     ):
@@ -682,6 +1002,30 @@ def write_model_manifest(
         ):
             raise ModelManifestError(
                 "GRPO exports require an SFT reference with an explicit NAR-VAE pretraining parent."
+            )
+        if (
+            parent_manifest.representation.get("codec_encoding_policy")
+            != DACVAE_POSTERIOR_SAMPLING_POLICY
+        ):
+            raise ModelManifestError(
+                "GRPO exports require an SFT reference trained with the current seeded DACVAE "
+                "posterior policy; legacy representations cannot be relabeled during export."
+            )
+        if dict(parent_manifest.architecture) != architecture_from_config(config):
+            raise ModelManifestError("GRPO exports must preserve the SFT reference architecture.")
+        if dict(parent_manifest.capabilities) != capabilities_from_config(config):
+            raise ModelManifestError("GRPO exports must preserve the SFT reference capabilities.")
+        if dict(parent_manifest.representation) != representation_from_config(config):
+            raise ModelManifestError(
+                "GRPO exports must preserve the SFT reference codec/frontend representation."
+            )
+        if dict(parent_manifest.generation) != generation_from_config(config):
+            raise ModelManifestError(
+                "GRPO exports must preserve the SFT reference generative objective and schedule."
+            )
+        if dict(parent_manifest.text_conditioning) != text_conditioning_from_config(config):
+            raise ModelManifestError(
+                "GRPO exports must preserve the SFT reference frozen text-conditioning contract."
             )
         if parent_checkpoint_path is None:
             raise ModelManifestError("GRPO exports must bind the exact selected SFT checkpoint.")
@@ -704,6 +1048,8 @@ def write_model_manifest(
         "architecture": architecture_from_config(config),
         "capabilities": capabilities_from_config(config),
         "representation": representation_from_config(config),
+        "generation": generation_from_config(config),
+        "text_conditioning": text_conditioning_from_config(config),
         "parent": (
             _grpo_parent_reference(
                 parent_manifest,
@@ -725,14 +1071,11 @@ def write_model_manifest(
     return ModelManifest(**{**manifest.__dict__, "path": destination.resolve()})
 
 
-def validate_sft_parent_manifest(
-    checkpoint_path: str | os.PathLike[str],
+def _validate_sft_parent_contract(
+    manifest: ModelManifest,
     config: Mapping[str, Any],
 ) -> ModelManifest:
-    """Validate a pretraining parent and preserve its shape/representation for SFT."""
-    checkpoint = Path(checkpoint_path).expanduser()
-    manifest = load_model_manifest(checkpoint.parent / MODEL_MANIFEST_FILENAME)
-    validate_manifest_weight(manifest, checkpoint)
+    """Validate every immutable or explicitly migratable pretraining-to-SFT contract."""
     if manifest.stage != "pretrain":
         raise ModelManifestError("Fresh SFT requires a NAR-VAE pretraining model manifest.")
     requested_architecture = architecture_from_config(config)
@@ -744,9 +1087,12 @@ def validate_sft_parent_manifest(
         requested_without_speaker = dict(requested_architecture)
         parent_speaker = parent_without_speaker.pop("use_speaker_conditioning")
         requested_speaker = requested_without_speaker.pop("use_speaker_conditioning")
+        parent_summary_tokens = parent_without_speaker.pop("speaker_num_summary_tokens")
+        requested_without_speaker.pop("speaker_num_summary_tokens")
         architecture_matches = (
             parent_speaker is False
             and requested_speaker is True
+            and parent_summary_tokens == 0
             and parent_without_speaker == requested_without_speaker
         )
     if not architecture_matches:
@@ -815,7 +1161,26 @@ def validate_sft_parent_manifest(
         raise ModelManifestError(
             "SFT must preserve the pretraining parent's codec/frontend representation."
         )
+    if dict(manifest.generation) != generation_from_config(config):
+        raise ModelManifestError(
+            "SFT must preserve the pretraining parent's generative objective and schedule."
+        )
+    if dict(manifest.text_conditioning) != text_conditioning_from_config(config):
+        raise ModelManifestError(
+            "SFT must preserve the pretraining parent's frozen text-conditioning contract."
+        )
     return manifest
+
+
+def validate_sft_parent_manifest(
+    checkpoint_path: str | os.PathLike[str],
+    config: Mapping[str, Any],
+) -> ModelManifest:
+    """Validate a pretraining parent and preserve its shape/representation for SFT."""
+    checkpoint = Path(checkpoint_path).expanduser()
+    manifest = load_model_manifest(checkpoint.parent / MODEL_MANIFEST_FILENAME)
+    validate_manifest_weight(manifest, checkpoint)
+    return _validate_sft_parent_contract(manifest, config)
 
 
 def validate_sft_resume_manifest(
@@ -834,6 +1199,14 @@ def validate_sft_resume_manifest(
     if dict(manifest.representation) != representation_from_config(config):
         raise ModelManifestError(
             "Resumed SFT codec/frontend representation does not match its model manifest."
+        )
+    if dict(manifest.generation) != generation_from_config(config):
+        raise ModelManifestError(
+            "Resumed SFT objective/schedule does not match its model manifest."
+        )
+    if dict(manifest.text_conditioning) != text_conditioning_from_config(config):
+        raise ModelManifestError(
+            "Resumed SFT frozen text-conditioning contract does not match its manifest."
         )
 
 
@@ -857,6 +1230,11 @@ def validate_grpo_parent_manifest(
     if manifest.parent is None or manifest.parent.get("stage") != "pretrain":
         raise ModelManifestError(
             "The GRPO SFT reference must retain its NAR-VAE scratch-pretraining parent."
+        )
+    if manifest.representation.get("codec_encoding_policy") != DACVAE_POSTERIOR_SAMPLING_POLICY:
+        raise ModelManifestError(
+            "Fresh GRPO requires an SFT reference trained with the current seeded DACVAE "
+            "posterior policy; legacy representations cannot be relabeled during export."
         )
     is_ema = checkpoint.name in {"ema_model.bin", "pytorch_model_ema.bin"} or (
         "_ema" in checkpoint.stem
@@ -882,6 +1260,8 @@ def validate_inference_manifest(
     base_filename: str | None = None,
     architecture: Mapping[str, Any],
     capabilities: Mapping[str, Any],
+    generation: Mapping[str, Any] | None = None,
+    text_conditioning: Mapping[str, Any] | None = None,
     codec_source: str | os.PathLike[str] | HubDACVAESource,
     codec_backend: str,
 ) -> None:
@@ -910,10 +1290,25 @@ def validate_inference_manifest(
         )
     if dict(manifest.capabilities) != dict(capabilities):
         raise ModelManifestError("Checkpoint capabilities do not match the NAR-VAE model manifest.")
+    if generation is not None and dict(manifest.generation) != dict(generation):
+        raise ModelManifestError(
+            "Checkpoint objective/schedule does not match the NAR-VAE model manifest."
+        )
+    if text_conditioning is not None and dict(manifest.text_conditioning) != dict(
+        text_conditioning
+    ):
+        raise ModelManifestError(
+            "Checkpoint frozen text-conditioning topology does not match the manifest."
+        )
     representation = manifest.representation
+    expected_frontend = (
+        (FROZEN_TEXT_REPRESENTATION_NAME, FROZEN_TEXT_REPRESENTATION_VERSION)
+        if manifest.text_conditioning["mode"] == "frozen_features"
+        else (TEXT_FRONTEND_NAME, TEXT_FRONTEND_VERSION)
+    )
     if (
-        representation["text_frontend_name"] != TEXT_FRONTEND_NAME
-        or representation["text_frontend_version"] != TEXT_FRONTEND_VERSION
+        representation["text_frontend_name"] != expected_frontend[0]
+        or representation["text_frontend_version"] != expected_frontend[1]
     ):
         raise ModelManifestError(
             "The checkpoint text frontend is incompatible with this NAR-VAE runtime."
@@ -966,8 +1361,10 @@ __all__ = [
     "ModelManifestError",
     "architecture_from_config",
     "capabilities_from_config",
+    "generation_from_config",
     "load_model_manifest",
     "representation_from_config",
+    "text_conditioning_from_config",
     "validate_inference_manifest",
     "validate_loaded_codec",
     "validate_grpo_parent_manifest",

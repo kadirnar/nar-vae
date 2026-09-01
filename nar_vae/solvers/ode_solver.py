@@ -8,6 +8,15 @@ from tqdm import tqdm
 
 from nar_vae.caching.cache_dit import assert_cache_dit_healthy
 from nar_vae.configuration import cfg_guidance_active
+from nar_vae.objectives import (
+    DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+    RECTIFIED_FLOW_OBJECTIVE,
+    VP_DIFFUSION_OBJECTIVE,
+    diffusion_probability_flow_scale,
+    normalize_generative_objective,
+    shifted_cosine_vp_coefficients,
+    validate_diffusion_schedule_shift,
+)
 
 if TYPE_CHECKING:
     from nar_vae.caching import SCMContext
@@ -52,6 +61,7 @@ class ODESolver:
         temporal_rescale_k: float = 1.0,
         temporal_rescale_sigma: float = 3.0,
         conditioning_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
         speaker_latent: torch.Tensor | None = None,
         speaker_mask: torch.Tensor | None = None,
         show_progress: bool = False,
@@ -62,9 +72,13 @@ class ODESolver:
         integration_start_callback: Callable[[], None] | None = None,
         fuse_cfg_branches: bool = False,
         language_ids: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
         token_durations: torch.Tensor | None = None,
         prepared_conditioning: object | None = None,
         prepared_cfg_conditioning: object | None = None,
+        generative_objective: str | None = None,
+        diffusion_schedule_shift: float | None = None,
     ) -> torch.Tensor:
         # A failed Cache-DiT teardown can leave third-party forward hooks or
         # monkey patches installed. Never run that model again, even through an
@@ -72,8 +86,8 @@ class ODESolver:
         assert_cache_dit_healthy(model)
         if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps <= 0:
             raise ValueError("num_steps must be a positive non-boolean integer.")
-        if solver not in {"euler", "midpoint", "heun", "rk4"}:
-            raise ValueError("solver must be 'euler', 'midpoint', 'heun', or 'rk4'.")
+        if solver not in {"ddim", "euler", "midpoint", "heun", "rk4"}:
+            raise ValueError("solver must be 'ddim', 'euler', 'midpoint', 'heun', or 'rk4'.")
         if cfg_mode not in {"joint", "independent", "alternating"}:
             raise ValueError("cfg_mode must be 'joint', 'independent', or 'alternating'.")
         numerical_fields = {
@@ -115,6 +129,58 @@ class ODESolver:
             raise ValueError("Temporal rescale k and sigma must be positive.")
         if target_latent_std is not None and target_latent_std <= 0:
             raise ValueError("target_latent_std must be positive when provided.")
+        model_objective_value = getattr(model, "generative_objective", None)
+        model_objective = (
+            normalize_generative_objective(model_objective_value)
+            if model_objective_value is not None
+            else None
+        )
+        objective = normalize_generative_objective(
+            generative_objective
+            if generative_objective is not None
+            else (model_objective or RECTIFIED_FLOW_OBJECTIVE)
+        )
+        if model_objective is not None and objective != model_objective:
+            raise ValueError(
+                "The requested generative objective does not match the loaded model: "
+                f"requested={objective!r}, model={model_objective!r}."
+            )
+        model_schedule_shift = getattr(model, "diffusion_schedule_shift", None)
+        schedule_shift = validate_diffusion_schedule_shift(
+            diffusion_schedule_shift
+            if diffusion_schedule_shift is not None
+            else (
+                model_schedule_shift
+                if model_schedule_shift is not None
+                else DEFAULT_DIFFUSION_SCHEDULE_SHIFT
+            )
+        )
+        if (
+            model_schedule_shift is not None
+            and diffusion_schedule_shift is not None
+            and schedule_shift != validate_diffusion_schedule_shift(model_schedule_shift)
+        ):
+            raise ValueError(
+                "The requested diffusion schedule shift does not match the loaded model."
+            )
+        if solver == "ddim" and objective != VP_DIFFUSION_OBJECTIVE:
+            raise ValueError("solver='ddim' requires a vp_diffusion_v checkpoint.")
+        if solver == "ddim" and temporal_rescale_k != 1.0:
+            raise ValueError("Temporal score rescaling is not defined for the DDIM update.")
+        if solver == "ddim" and initial_noise_scale != 1.0:
+            raise ValueError(
+                "solver='ddim' requires initial_noise_scale=1.0 to preserve the trained VP prior."
+            )
+        if solver == "ddim" and target_latent_std is not None:
+            raise ValueError(
+                "target_latent_std is an untrained post-hoc transform and is not supported "
+                "by the DDIM path."
+            )
+        if solver == "ddim" and scm_ctx is not None:
+            raise ValueError(
+                "SCM/step caching has not been validated for analytic DDIM updates; "
+                "disable the cache or use an ODE solver."
+            )
         guidance_active = cfg_guidance_active(
             cfg_scale=cfg_scale,
             cfg_mode=cfg_mode,
@@ -150,16 +216,71 @@ class ODESolver:
             )
         if conditioning_ids.shape[1] <= 0:
             raise ValueError("conditioning_ids must contain at least one text token.")
+        parameters = tuple(model.parameters())
+        if not parameters:
+            raise ValueError("The diffusion model must expose at least one floating parameter.")
+        state_parameter = parameters[0]
+        supported_state_dtypes = {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        }
+        if (
+            not torch.is_floating_point(state_parameter)
+            or state_parameter.dtype not in supported_state_dtypes
+        ):
+            raise ValueError(
+                "The diffusion model's state parameter must use float16, bfloat16, "
+                "float32, or float64."
+            )
+        state_dtype = state_parameter.dtype
+        state_device = state_parameter.device
+        if any(
+            not torch.is_floating_point(parameter)
+            or parameter.dtype != state_dtype
+            or parameter.device != state_device
+            for parameter in parameters[1:]
+        ):
+            raise ValueError(
+                "All diffusion-model parameters must share one floating dtype and device."
+            )
         if device is None:
-            device = next(model.parameters()).device
+            device = state_device
+        else:
+            requested_device = torch.device(device)
+            if requested_device.type != state_device.type or (
+                requested_device.index is not None and requested_device.index != state_device.index
+            ):
+                raise ValueError(
+                    "The requested solver device must match the diffusion model device: "
+                    f"{requested_device} != {state_device}."
+                )
+            # Resolve an index-less CUDA request (``cuda``) to the exact model
+            # device (for example ``cuda:0``) before allocating solver state.
+            device = state_device
 
         batch_size = latent_shape[0]
 
         # Start from noise
-        x = torch.randn(latent_shape, device=device) * initial_noise_scale
+        x = torch.randn(latent_shape, device=device, dtype=state_dtype) * initial_noise_scale
 
         # Move to device
         conditioning_ids = conditioning_ids.to(device)
+        if conditioning_features is not None:
+            if conditioning_features.ndim != 3 or tuple(conditioning_features.shape[:2]) != tuple(
+                conditioning_ids.shape
+            ):
+                raise ValueError(
+                    "conditioning_features must have shape [batch, token, feature] and share "
+                    "the conditioning_ids token axes."
+                )
+            if not torch.is_floating_point(conditioning_features):
+                raise TypeError("conditioning_features must use a floating-point dtype.")
+            conditioning_features = conditioning_features.to(
+                device=device,
+                dtype=state_dtype,
+            )
         if language_ids is not None:
             if language_ids.ndim != 1 or language_ids.shape[0] != batch_size:
                 raise ValueError("language_ids must have shape [batch].")
@@ -168,6 +289,18 @@ class ODESolver:
             if tuple(conditioning_mask.shape) != tuple(conditioning_ids.shape):
                 raise ValueError("conditioning_mask must have the conditioning_ids shape.")
             conditioning_mask = conditioning_mask.to(device=device, dtype=torch.bool)
+        if token_language_ids is not None:
+            if tuple(token_language_ids.shape) != tuple(conditioning_ids.shape):
+                raise ValueError("token_language_ids must have the conditioning_ids shape.")
+            token_language_ids = token_language_ids.to(device=device, dtype=torch.long)
+        if alignment_mask is not None:
+            if tuple(alignment_mask.shape) != tuple(conditioning_ids.shape):
+                raise ValueError("alignment_mask must have the conditioning_ids shape.")
+            alignment_mask = alignment_mask.to(device=device, dtype=torch.bool)
+            if conditioning_mask is not None and bool((alignment_mask & ~conditioning_mask).any()):
+                raise ValueError("alignment_mask cannot enable padded conditioning tokens.")
+            if not bool(alignment_mask.any(dim=1).all()):
+                raise ValueError("Every row must contain at least one alignable text token.")
         if token_durations is not None:
             if tuple(token_durations.shape) != tuple(conditioning_ids.shape):
                 raise ValueError("token_durations must have the conditioning_ids shape.")
@@ -187,11 +320,14 @@ class ODESolver:
                 raise ValueError(
                     "Every token_durations row must sum to the generated latent frame count."
                 )
-            if conditioning_mask is not None:
-                if bool((token_durations.masked_select(~conditioning_mask) != 0).any()):
-                    raise ValueError("Padded conditioning tokens must have zero duration.")
-                if bool((token_durations.masked_select(conditioning_mask) <= 0).any()):
-                    raise ValueError("Every valid conditioning token must have positive duration.")
+            duration_mask = alignment_mask if alignment_mask is not None else conditioning_mask
+            if duration_mask is not None:
+                if bool((token_durations.masked_select(~duration_mask) != 0).any()):
+                    raise ValueError("Non-alignable conditioning tokens must have zero duration.")
+                if bool((token_durations.masked_select(duration_mask) <= 0).any()):
+                    raise ValueError(
+                        "Every alignable conditioning token must have positive duration."
+                    )
         if speaker_latent is not None:
             if speaker_latent.ndim != 3:
                 raise ValueError("speaker_latent must have shape [batch, latent_channels, frames].")
@@ -203,7 +339,7 @@ class ODESolver:
                 raise ValueError("speaker_latent must contain at least one frame.")
             if not torch.isfinite(speaker_latent).all():
                 raise ValueError("speaker_latent contains non-finite values.")
-            speaker_latent = speaker_latent.to(device)
+            speaker_latent = speaker_latent.to(device=device, dtype=state_dtype)
         if speaker_mask is not None:
             if speaker_latent is None:
                 raise ValueError("speaker_mask requires speaker_latent.")
@@ -277,8 +413,14 @@ class ODESolver:
             }
             if language_ids is not None:
                 prepare_cfg_kwargs["language_ids"] = language_ids
+            if token_language_ids is not None:
+                prepare_cfg_kwargs["token_language_ids"] = token_language_ids
+            if alignment_mask is not None:
+                prepare_cfg_kwargs["alignment_mask"] = alignment_mask
             if token_durations is not None:
                 prepare_cfg_kwargs["token_durations"] = token_durations
+            if conditioning_features is not None:
+                prepare_cfg_kwargs["conditioning_features"] = conditioning_features
             candidate = prepare_cfg(
                 conditioning_ids,
                 conditioning_mask,
@@ -298,8 +440,14 @@ class ODESolver:
             prepare_kwargs = {}
             if language_ids is not None:
                 prepare_kwargs["language_ids"] = language_ids
+            if token_language_ids is not None:
+                prepare_kwargs["token_language_ids"] = token_language_ids
+            if alignment_mask is not None:
+                prepare_kwargs["alignment_mask"] = alignment_mask
             if token_durations is not None:
                 prepare_kwargs["token_durations"] = token_durations
+            if conditioning_features is not None:
+                prepare_kwargs["conditioning_features"] = conditioning_features
             prepared_conditioning = prepare_conditioning(
                 conditioning_ids,
                 conditioning_mask,
@@ -350,7 +498,7 @@ class ODESolver:
                 return unconditional + scale * (conditional - unconditional)
             raise ValueError(f"Unknown CFG mode: {prepared_cfg_conditioning.mode}")
 
-        def model_velocity(
+        def raw_model_velocity(
             x_in: torch.Tensor,
             t_in: torch.Tensor,
             *,
@@ -379,8 +527,14 @@ class ODESolver:
                     cfg_kwargs["fuse_cfg_branches"] = True
                 if language_ids is not None:
                     cfg_kwargs["language_ids"] = language_ids
+                if token_language_ids is not None:
+                    cfg_kwargs["token_language_ids"] = token_language_ids
+                if alignment_mask is not None:
+                    cfg_kwargs["alignment_mask"] = alignment_mask
                 if token_durations is not None:
                     cfg_kwargs["token_durations"] = token_durations
+                if conditioning_features is not None:
+                    cfg_kwargs["conditioning_features"] = conditioning_features
                 return model.forward_with_cfg(
                     x_in,
                     conditioning_ids,
@@ -398,10 +552,23 @@ class ODESolver:
             if speaker_latent is None:
                 # Preserve compatibility with simple callable models that
                 # implement only the original four-argument protocol.
-                if language_ids is not None:
-                    model_kwargs = {"language_ids": language_ids}
+                if (
+                    language_ids is not None
+                    or token_language_ids is not None
+                    or alignment_mask is not None
+                    or conditioning_features is not None
+                ):
+                    model_kwargs = {}
+                    if language_ids is not None:
+                        model_kwargs["language_ids"] = language_ids
+                    if token_language_ids is not None:
+                        model_kwargs["token_language_ids"] = token_language_ids
+                    if alignment_mask is not None:
+                        model_kwargs["alignment_mask"] = alignment_mask
                     if token_durations is not None:
                         model_kwargs["token_durations"] = token_durations
+                    if conditioning_features is not None:
+                        model_kwargs["conditioning_features"] = conditioning_features
                     return model(
                         latents=x_in,
                         conditioning_ids=conditioning_ids,
@@ -419,10 +586,23 @@ class ODESolver:
                     )
                 return model(x_in, conditioning_ids, t_in, conditioning_mask)
             if speaker_mask is None:
-                if language_ids is not None:
-                    model_kwargs = {"language_ids": language_ids}
+                if (
+                    language_ids is not None
+                    or token_language_ids is not None
+                    or alignment_mask is not None
+                    or conditioning_features is not None
+                ):
+                    model_kwargs = {}
+                    if language_ids is not None:
+                        model_kwargs["language_ids"] = language_ids
+                    if token_language_ids is not None:
+                        model_kwargs["token_language_ids"] = token_language_ids
+                    if alignment_mask is not None:
+                        model_kwargs["alignment_mask"] = alignment_mask
                     if token_durations is not None:
                         model_kwargs["token_durations"] = token_durations
+                    if conditioning_features is not None:
+                        model_kwargs["conditioning_features"] = conditioning_features
                     return model(
                         latents=x_in,
                         conditioning_ids=conditioning_ids,
@@ -461,9 +641,56 @@ class ODESolver:
             }
             if language_ids is not None:
                 model_kwargs["language_ids"] = language_ids
+            if token_language_ids is not None:
+                model_kwargs["token_language_ids"] = token_language_ids
+            if alignment_mask is not None:
+                model_kwargs["alignment_mask"] = alignment_mask
             if token_durations is not None:
                 model_kwargs["token_durations"] = token_durations
+            if conditioning_features is not None:
+                model_kwargs["conditioning_features"] = conditioning_features
             return model(**model_kwargs)
+
+        def model_velocity(
+            x_in: torch.Tensor,
+            t_in: torch.Tensor,
+            *,
+            step_idx: int,
+            apply_cfg: bool,
+        ) -> torch.Tensor:
+            """Evaluate one model state while preserving the solver-state dtype."""
+            prediction = raw_model_velocity(
+                x_in,
+                t_in.to(device=x_in.device, dtype=state_dtype),
+                step_idx=step_idx,
+                apply_cfg=apply_cfg,
+            )
+            if not isinstance(prediction, torch.Tensor) or tuple(prediction.shape) != tuple(
+                x_in.shape
+            ):
+                actual_shape = (
+                    None if not isinstance(prediction, torch.Tensor) else tuple(prediction.shape)
+                )
+                raise ValueError(
+                    "The diffusion model prediction must preserve the latent state shape: "
+                    f"{actual_shape} != {tuple(x_in.shape)}."
+                )
+            if not torch.is_floating_point(prediction):
+                raise TypeError("The diffusion model prediction must use a floating dtype.")
+            return prediction.to(device=x_in.device, dtype=state_dtype)
+
+        def probability_flow_derivative(
+            prediction: torch.Tensor,
+            timestep: torch.Tensor,
+        ) -> torch.Tensor:
+            """Convert the checkpoint prediction into the solver's dx/dt field."""
+            if objective != VP_DIFFUSION_OBJECTIVE:
+                return prediction
+            scale = diffusion_probability_flow_scale(timestep, schedule_shift)
+            assert isinstance(scale, torch.Tensor)
+            return prediction * scale.to(device=prediction.device, dtype=prediction.dtype).view(
+                -1, 1, 1
+            )
 
         # Invariant text/speaker encoders and their projected KV caches are part
         # of request conditioning, not iterative ODE work.  Realtime callers use
@@ -476,9 +703,16 @@ class ODESolver:
         dt = 1.0 / num_steps
 
         # Pre-compute timesteps on GPU
-        timesteps = torch.linspace(0, 1 - dt, num_steps, device=device)
+        schedule_dtype = torch.float64 if state_dtype == torch.float64 else torch.float32
+        timesteps = torch.linspace(
+            0,
+            1 - dt,
+            num_steps,
+            device=device,
+            dtype=schedule_dtype,
+        )
         half_timesteps = timesteps + dt / 2 if solver in ("midpoint", "rk4") else None
-        next_timesteps = timesteps + dt if solver in ("heun", "rk4") else None
+        next_timesteps = timesteps + dt if solver in ("ddim", "heun", "rk4") else None
 
         iterator = range(num_steps)
         if show_progress:
@@ -488,7 +722,41 @@ class ODESolver:
         if scm_ctx is not None:
             scm_ctx.reset()
 
-        if solver == "euler":
+        if solver == "ddim":
+            assert next_timesteps is not None
+            # Deterministic DDIM update for the model's v-prediction.  Unlike a
+            # generic ODE step, this moves analytically between two points on the
+            # shifted VP path and therefore does not use the d-angle/dt factor.
+            for i in iterator:
+                t = i * dt
+                t_tensor = timesteps[i].unsqueeze(0).expand(batch_size)
+                apply_cfg = cfg_min_t <= t <= cfg_max_t and guidance_active
+
+                prediction = model_velocity(
+                    x,
+                    t_tensor,
+                    step_idx=i,
+                    apply_cfg=apply_cfg,
+                )
+
+                t_next_tensor = next_timesteps[i].unsqueeze(0).expand(batch_size)
+                alpha, sigma = shifted_cosine_vp_coefficients(t_tensor, schedule_shift)
+                alpha_next, sigma_next = shifted_cosine_vp_coefficients(
+                    t_next_tensor,
+                    schedule_shift,
+                )
+                alpha = alpha.to(device=x.device, dtype=x.dtype).view(-1, 1, 1)
+                sigma = sigma.to(device=x.device, dtype=x.dtype).view(-1, 1, 1)
+                alpha_next = alpha_next.to(device=x.device, dtype=x.dtype).view(-1, 1, 1)
+                sigma_next = sigma_next.to(device=x.device, dtype=x.dtype).view(-1, 1, 1)
+                clean_prediction = alpha * x + sigma * prediction
+                noise_prediction = sigma * x - alpha * prediction
+                x = alpha_next * clean_prediction + sigma_next * noise_prediction
+
+                if step_callback is not None:
+                    step_callback(i, x)
+
+        elif solver == "euler":
             # Optimized Euler: pre-computed timesteps with SCM-based step skipping
             for i in iterator:
                 # Keep the CFG decision on the host. Calling ``.item()`` on the
@@ -504,11 +772,14 @@ class ODESolver:
                     scm_ctx.cached_steps += 1
                 else:
                     # Compute step: run model normally
-                    v = model_velocity(
-                        x,
+                    v = probability_flow_derivative(
+                        model_velocity(
+                            x,
+                            t_tensor,
+                            step_idx=i,
+                            apply_cfg=apply_cfg,
+                        ),
                         t_tensor,
-                        step_idx=i,
-                        apply_cfg=apply_cfg,
                     )
                     # Update predictor with computed velocity
                     if scm_ctx is not None:
@@ -534,11 +805,14 @@ class ODESolver:
                 t_half_tensor = half_timesteps[i].expand(batch_size)
 
                 apply_cfg = cfg_min_t <= t <= cfg_max_t and guidance_active
-                v1 = model_velocity(
-                    x,
+                v1 = probability_flow_derivative(
+                    model_velocity(
+                        x,
+                        t_tensor,
+                        step_idx=i,
+                        apply_cfg=apply_cfg,
+                    ),
                     t_tensor,
-                    step_idx=i,
-                    apply_cfg=apply_cfg,
                 )
                 if temporal_rescale_k != 1.0:
                     v1 = temporal_score_rescaling(
@@ -547,11 +821,14 @@ class ODESolver:
 
                 t_half = t + dt / 2
                 apply_cfg_half = cfg_min_t <= t_half <= cfg_max_t and guidance_active
-                v2 = model_velocity(
-                    x + dt / 2 * v1,
+                v2 = probability_flow_derivative(
+                    model_velocity(
+                        x + dt / 2 * v1,
+                        t_half_tensor,
+                        step_idx=i,
+                        apply_cfg=apply_cfg_half,
+                    ),
                     t_half_tensor,
-                    step_idx=i,
-                    apply_cfg=apply_cfg_half,
                 )
                 if temporal_rescale_k != 1.0:
                     v2 = temporal_score_rescaling(
@@ -573,11 +850,14 @@ class ODESolver:
                 apply_cfg = cfg_min_t <= t <= cfg_max_t and guidance_active
 
                 # Predictor
-                v1 = model_velocity(
-                    x,
+                v1 = probability_flow_derivative(
+                    model_velocity(
+                        x,
+                        t_tensor,
+                        step_idx=i,
+                        apply_cfg=apply_cfg,
+                    ),
                     t_tensor,
-                    step_idx=i,
-                    apply_cfg=apply_cfg,
                 )
 
                 if temporal_rescale_k != 1.0:
@@ -591,11 +871,14 @@ class ODESolver:
                 t_next = t + dt
                 apply_cfg_next = cfg_min_t <= t_next <= cfg_max_t and guidance_active
 
-                v2 = model_velocity(
-                    x_pred,
+                v2 = probability_flow_derivative(
+                    model_velocity(
+                        x_pred,
+                        t_next_tensor,
+                        step_idx=i,
+                        apply_cfg=apply_cfg_next,
+                    ),
                     t_next_tensor,
-                    step_idx=i,
-                    apply_cfg=apply_cfg_next,
                 )
 
                 if temporal_rescale_k != 1.0:
@@ -617,11 +900,14 @@ class ODESolver:
 
                 def get_velocity(x_in, t_in, time_value):
                     apply_cfg = cfg_min_t <= time_value <= cfg_max_t and guidance_active
-                    v = model_velocity(
-                        x_in,
+                    v = probability_flow_derivative(
+                        model_velocity(
+                            x_in,
+                            t_in,
+                            step_idx=i,
+                            apply_cfg=apply_cfg,
+                        ),
                         t_in,
-                        step_idx=i,
-                        apply_cfg=apply_cfg,
                     )
                     if temporal_rescale_k != 1.0:
                         v = temporal_score_rescaling(

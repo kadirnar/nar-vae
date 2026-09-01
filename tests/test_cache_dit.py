@@ -20,7 +20,7 @@ from nar_vae.caching import (
     CacheDiTUnavailableError,
     assert_cache_dit_healthy,
 )
-from nar_vae.caching.cache_dit import _SESSION_LOCK, _PersistentCacheDiTRequest
+from nar_vae.caching.cache_dit import _SESSION_LOCK, _load_cache_dit, _PersistentCacheDiTRequest
 from nar_vae.models.dit import DiTBlock
 from nar_vae.models.flow_matching import FlowMatchingEchoDiT
 from nar_vae.solvers.ode_solver import ODESolver
@@ -495,6 +495,15 @@ class CacheDiTTest(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("cache_dit"), "Cache-DiT dependency not installed")
 class CacheDiTInstalledIntegrationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            _load_cache_dit()
+        except CacheDiTUnavailableError as exc:
+            raise unittest.SkipTest(
+                f"Compatible Cache-DiT dependency not installed: {exc}"
+            ) from exc
+
     def test_real_cache_dit_reduces_block_work_at_fixed_step_count(self):
         class CountingBlock(torch.nn.Module):
             def __init__(self):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import weakref
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from pathlib import Path
 from types import TracebackType
@@ -20,8 +21,14 @@ from nar_vae.caching import (
 from nar_vae.checkpoint import HubCheckpointSource
 from nar_vae.configuration import GenerationConfig, validate_cache_dit_options
 from nar_vae.dacvae import HubDACVAESource
-from nar_vae.inference import AudioReference, FlowMatchingTTSInference
+from nar_vae.inference import (
+    AudioReference,
+    FlowMatchingTTSInference,
+    _runtime_generation_contract,
+)
+from nar_vae.objectives import VP_DIFFUSION_OBJECTIVE
 from nar_vae.solvers.ode_solver import ODESolver
+from nar_vae.tokenization import TextSpan
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 
@@ -31,7 +38,7 @@ def _mark_compiled_cuda_graph_step() -> None:
     marker = getattr(compiler, "cudagraph_mark_step_begin", None)
     if not callable(marker):
         raise RuntimeError(
-            "Compiled CUDA inference requires torch>=2.7.1 with "
+            "Compiled CUDA inference requires torch>=2.9 with "
             "torch.compiler.cudagraph_mark_step_begin()."
         )
     marker()
@@ -55,6 +62,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         intermediate_size: int = 4096,
         text_vocab_size: int | None = None,
         text_num_layers: int = 6,
+        target_patch_size: int | None = None,
         speaker_patch_size: int | None = None,
         speaker_model_size: int = 512,
         speaker_num_layers: int = 4,
@@ -73,6 +81,8 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         adaln_rank: int = 128,
         norm_eps: float = 1e-6,
         use_duration_predictor: bool | None = None,
+        speaker_num_summary_tokens: int | None = None,
+        acoustic_dtype: str | torch.dtype = "float32",
     ):
         super().__init__(
             flow_model_path=flow_model_path,
@@ -86,6 +96,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             intermediate_size=intermediate_size,
             text_vocab_size=text_vocab_size,
             text_num_layers=text_num_layers,
+            target_patch_size=target_patch_size,
             speaker_patch_size=speaker_patch_size,
             speaker_model_size=speaker_model_size,
             speaker_num_layers=speaker_num_layers,
@@ -96,6 +107,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             max_reference_seconds=max_reference_seconds,
             use_language_conditioning=use_language_conditioning,
             use_duration_predictor=use_duration_predictor,
+            speaker_num_summary_tokens=speaker_num_summary_tokens,
             supported_languages=supported_languages,
             text_model_size=text_model_size,
             text_num_heads=text_num_heads,
@@ -103,6 +115,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             timestep_embed_size=timestep_embed_size,
             adaln_rank=adaln_rank,
             norm_eps=norm_eps,
+            acoustic_dtype=acoustic_dtype,
         )
         self.compile_model = False
         self.compile_mode = compile_mode
@@ -237,12 +250,12 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         """Release persistent optimization hooks when leaving the context."""
         self.close()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def synthesize(
         self,
         text: str,
-        num_steps: int = 64,
-        solver: str = "heun",
+        num_steps: int = 32,
+        solver: str | None = None,
         cfg_scale: float = 1.0,
         cfg_mode: str = "joint",
         cfg_scale_text: float | None = None,
@@ -261,6 +274,9 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,
+        normalized_text: str | None = None,
+        phonemes: str | Sequence[str] | None = None,
+        language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
     ) -> torch.Tensor:
         """Use the managed realtime lifecycle for the conventional synthesis API."""
         del show_progress
@@ -285,6 +301,9 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             speaker_latent=speaker_latent,
             language=language,
             reference_language=reference_language,
+            normalized_text=normalized_text,
+            phonemes=phonemes,
+            language_spans=language_spans,
         )
 
     def synthesize_with_config(
@@ -299,6 +318,9 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,
+        normalized_text: str | None = None,
+        phonemes: str | Sequence[str] | None = None,
+        language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
     ) -> torch.Tensor:
         """Apply a typed profile without bypassing compiled cache request state."""
         del show_progress
@@ -311,17 +333,22 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             speaker_latent=speaker_latent,
             language=language,
             reference_language=reference_language,
+            normalized_text=normalized_text,
+            phonemes=phonemes,
+            language_spans=language_spans,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def synthesize_batch(
         self,
         texts: list[str],
         num_steps: int = 32,
         cfg_scale: float = 1.0,
-        solver: str = "euler",
+        solver: str | None = None,
         max_duration: float | None = None,
         languages: str | list[str] | tuple[str, ...] | None = None,
+        phonemes: Sequence[str | Sequence[str] | None] | None = None,
+        language_spans: (Sequence[Sequence[TextSpan | Mapping[str, object]] | None] | None) = None,
     ) -> list[torch.Tensor]:
         """Batch only when no persistent single-request Cache-DiT session is installed."""
         assert_cache_dit_healthy(self.flow_model)
@@ -345,9 +372,11 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             solver=solver,
             max_duration=max_duration,
             languages=languages,
+            phonemes=phonemes,
+            language_spans=language_spans,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def synthesize_fast(
         self,
         text: str,
@@ -374,6 +403,9 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         speaker_latent: torch.Tensor | None = None,
         language: str | None = None,
         reference_language: str | None = None,
+        normalized_text: str | None = None,
+        phonemes: str | Sequence[str] | None = None,
+        language_spans: Sequence[TextSpan | Mapping[str, object]] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """Synthesize with a configured low-step profile and optional timings."""
         # Cache metrics are request-local. A failed request must not leave the
@@ -386,6 +418,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
                 "Call close() to restore eager inference, or construct a new runtime."
             )
         profile_config = config or self.generation_profile("fast")
+        generative_objective, diffusion_schedule_shift = _runtime_generation_contract(self)
         effective_cache_mode = (
             cache_mode
             if cache_mode is not None
@@ -393,6 +426,20 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             if self.cache_mode is not None
             else profile_config.cache_mode
         )
+        if solver is None:
+            if effective_cache_mode == "cache_dit":
+                # Cache-DiT currently operates on the generic Euler trajectory.
+                # This remains an explicit experimental profile for VP weights;
+                # the canonical uncached VP profiles use analytic DDIM below.
+                solver = "euler"
+            elif generative_objective == VP_DIFFUSION_OBJECTIVE:
+                # Strict VP checkpoints use their diffusion sampler even when an older
+                # deployment profile was loaded.
+                solver = "ddim"
+            elif profile_config.solver == "ddim":
+                # Canonical packaged profiles target VP diffusion. Protocol/custom
+                # runtimes with absent metadata are legacy flow and require an ODE solver.
+                solver = "euler"
         config_cache_mode = (
             effective_cache_mode if effective_cache_mode in ("none", "cache_dit") else "none"
         )
@@ -433,7 +480,18 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             reference_language,
             has_reference=reference_audio is not None or speaker_latent is not None,
         )
-        conditioning_ids = self._prepare_conditioning(text, language_pair.target)
+        prepared_text = self._prepare_conditioning(
+            text,
+            language_pair.target,
+            normalized_text=normalized_text,
+            phonemes=phonemes,
+            language_spans=language_spans,
+        )
+        conditioning_ids = prepared_text.conditioning_ids
+        conditioning_mask = prepared_text.conditioning_mask
+        conditioning_features = prepared_text.conditioning_features
+        token_language_ids = prepared_text.token_language_ids
+        alignment_mask = prepared_text.alignment_mask
         language_ids = self._language_ids(language_pair)
         resolved_speaker = self._resolve_speaker_latent(
             reference_audio=reference_audio,
@@ -452,8 +510,11 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         encoded_conditioning, predicted_frames, expected_token_durations = (
             self._encode_trajectory_conditioning(
                 conditioning_ids,
-                conditioning_mask=None,
+                conditioning_mask=conditioning_mask,
                 language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
+                conditioning_features=conditioning_features,
                 speaker_latent=resolved_speaker,
                 cfg_scale=effective_cfg_scale,
                 cfg_mode=effective_cfg_mode,
@@ -470,12 +531,20 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
             conditioning_ids,
             language_ids,
             resolved_speaker,
-            predicted_frames,
+            conditioning_mask=conditioning_mask,
+            conditioning_features=conditioning_features,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            predicted_frames=predicted_frames,
         )
         token_durations = self._resolve_token_durations(
             conditioning_ids,
             num_frames=num_frames,
+            conditioning_mask=conditioning_mask,
             language_ids=language_ids,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            conditioning_features=conditioning_features,
             speaker_latent=resolved_speaker,
             expected_token_durations=expected_token_durations,
         )
@@ -589,9 +658,12 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
                     temporal_rescale_k=selected.temporal_rescale_k,
                     temporal_rescale_sigma=selected.temporal_rescale_sigma,
                     target_latent_std=selected.target_latent_std,
-                    conditioning_mask=None,
+                    conditioning_mask=conditioning_mask,
+                    conditioning_features=conditioning_features,
                     speaker_latent=resolved_speaker,
                     language_ids=language_ids,
+                    token_language_ids=token_language_ids,
+                    alignment_mask=alignment_mask,
                     token_durations=token_durations,
                     prepared_conditioning=prepared_conditioning,
                     prepared_cfg_conditioning=prepared_cfg_conditioning,
@@ -603,6 +675,8 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
                     integration_start_callback=(
                         record_integration_start if return_timing else None
                     ),
+                    generative_objective=generative_objective,
+                    diffusion_schedule_shift=diffusion_schedule_shift,
                 )
         except BaseException:
             if getattr(self, "_compiled_cache_session", None) is not None:
@@ -649,7 +723,7 @@ class RealtimeTTSInference(FlowMatchingTTSInference):
         decode_started_at = time.perf_counter()
         assert ode_started_at is not None
         timings["ode_sampling"] = decode_started_at - ode_started_at
-        audio = self._decode(generated_latents)
+        audio = self._decode_generated_latents(generated_latents)
         if return_timing and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 

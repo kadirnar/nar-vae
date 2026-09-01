@@ -464,7 +464,7 @@ class ODESpeakerConditioningTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "sum to"):
             ODESolver.sample(**common, token_durations=torch.tensor([[1, 1]]))
-        with self.assertRaisesRegex(ValueError, "Padded"):
+        with self.assertRaisesRegex(ValueError, "Non-alignable"):
             ODESolver.sample(
                 **common,
                 token_durations=torch.tensor([[1, 2]]),

@@ -25,7 +25,7 @@ class LanguageRegistryTest(unittest.TestCase):
     @staticmethod
     def _checkpoint(language_info: LanguageCheckpointInfo) -> Mock:
         checkpoint = Mock()
-        checkpoint.infer_text_vocab_size.return_value = 100312
+        checkpoint.infer_text_vocab_size.return_value = 530
         checkpoint.infer_speaker_conditioning.return_value = False
         checkpoint.language_capability.return_value = language_info
         checkpoint.reference_language_capability.return_value = ReferenceLanguageCheckpointInfo(
@@ -218,11 +218,15 @@ class LanguageRegistryTest(unittest.TestCase):
             language_pair=LanguagePair.resolve("es", "en", has_reference=True),
             reference_audio="reference.wav",
             reference_sample_rate=None,
+            phonemes=("o", "l", "a"),
+            language_spans=None,
         )
 
         self.assertEqual(runtime.kwargs["language"], "es")
         self.assertEqual(runtime.kwargs["reference_language"], "en")
         self.assertEqual(runtime.kwargs["reference_audio"], "reference.wav")
+        self.assertEqual(runtime.kwargs["phonemes"], ("o", "l", "a"))
+        self.assertIsNone(runtime.kwargs["language_spans"])
 
 
 if __name__ == "__main__":

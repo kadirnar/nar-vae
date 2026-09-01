@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from .alignment import allocate_integer_durations
 
-ECHODIT_ARCHITECTURE_VERSION = 3
+ECHODIT_ARCHITECTURE_VERSION = 4
 DURATION_PREDICTOR_VERSION = 1
 MONOTONIC_ALIGNMENT_VERSION = 1
 
@@ -338,12 +338,16 @@ def expand_text_by_durations(
         raise ValueError("Every duration row must sum exactly to target_frames.")
 
     boundaries = durations.cumsum(dim=1).contiguous()
-    frame_positions = torch.arange(
-        1,
-        target_frames + 1,
-        device=text_state.device,
-        dtype=torch.long,
-    ).expand(text_state.shape[0], -1)
+    frame_positions = (
+        torch.arange(
+            1,
+            target_frames + 1,
+            device=text_state.device,
+            dtype=torch.long,
+        )
+        .expand(text_state.shape[0], -1)
+        .contiguous()
+    )
     token_indices = torch.searchsorted(boundaries, frame_positions, right=False)
     return torch.gather(
         text_state,

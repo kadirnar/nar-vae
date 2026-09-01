@@ -57,8 +57,10 @@ class ModelPreset:
         if not self.name:
             raise ValueError("Model preset name must not be empty.")
         for field_name in ARCHITECTURE_FIELDS:
-            if getattr(self, field_name) <= 0:
-                raise ValueError(f"{field_name} must be positive in preset {self.name!r}.")
+            minimum = 0 if field_name == "text_num_layers" else 1
+            if getattr(self, field_name) < minimum:
+                qualifier = "non-negative" if minimum == 0 else "positive"
+                raise ValueError(f"{field_name} must be {qualifier} in preset {self.name!r}.")
         for prefix in ("", "text_", "speaker_"):
             width = getattr(self, f"{prefix}model_size")
             heads = getattr(self, f"{prefix}num_heads")
@@ -117,10 +119,15 @@ def resolve_model_architecture(config: Mapping[str, Any]) -> ModelPreset:
         if not isinstance(preset_name, str):
             raise ValueError("model_preset must be a string.")
         preset = get_model_preset(preset_name)
+        frozen_features = config.get("text_conditioning_mode") == "frozen_features"
         conflicts = {
             field_name: (config[field_name], getattr(preset, field_name))
             for field_name in ARCHITECTURE_FIELDS
-            if field_name in config and config[field_name] != getattr(preset, field_name)
+            if field_name in config
+            and config[field_name] != getattr(preset, field_name)
+            and not (
+                frozen_features and field_name == "text_num_layers" and config[field_name] == 0
+            )
         }
         if conflicts:
             details = ", ".join(
@@ -129,6 +136,17 @@ def resolve_model_architecture(config: Mapping[str, Any]) -> ModelPreset:
             )
             raise ValueError(
                 f"Configuration conflicts with model_preset {preset_name!r}: {details}."
+            )
+        if frozen_features:
+            # Frozen contextual states replace the scratch text Transformer.
+            # Retain the preset's adapter width while making the absent layers
+            # explicit in parameter counts, manifests, and checkpoint topology.
+            return ModelPreset(
+                **{
+                    **preset.__dict__,
+                    "description": f"{preset.description} Frozen text-feature adapter.",
+                    "text_num_layers": 0,
+                }
             )
         return preset
 

@@ -10,6 +10,7 @@ import torch
 
 from nar_vae.benchmark import run_benchmark
 from nar_vae.checkpoint import CheckpointProvenance
+from nar_vae.tokenization import TextSpan
 
 
 class DummyFlowModel(torch.nn.Module):
@@ -52,6 +53,7 @@ class DummyRealtimeTTS:
             block_work_reduction=0.0,
         )
         self.closed = False
+        self.calls = []
 
     @staticmethod
     def _effective_cfg(**kwargs):
@@ -63,7 +65,7 @@ class DummyRealtimeTTS:
         )
 
     def synthesize_fast(self, text, **kwargs):
-        del text, kwargs
+        self.calls.append((text, kwargs))
         return torch.zeros(16), {
             "ttft": 0.1,
             "ttfa": 0.7,
@@ -99,6 +101,8 @@ class BenchmarkCompatibilityTest(unittest.TestCase):
                     warmup_runs=1,
                     runs=2,
                     output=output,
+                    language="tr",
+                    language_spans=(TextSpan(text="", language="tr", phonemes=("m", "e", "r")),),
                 )
 
         measurement = result["measurements"][0]
@@ -111,6 +115,27 @@ class BenchmarkCompatibilityTest(unittest.TestCase):
         self.assertFalse(result["definitions"]["streaming"])
         self.assertEqual(result["evidence"]["result_kind"], "complete_waveform_benchmark")
         self.assertFalse(result["evidence"]["named_gpu_streaming_evidence"])
+        self.assertEqual(
+            result["configuration"]["text_conditioning"],
+            {
+                "phonemes": None,
+                "language_spans": [
+                    {
+                        "text": "",
+                        "language": "tr",
+                        "normalized_text": None,
+                        "phonemes": ["m", "e", "r"],
+                    }
+                ],
+            },
+        )
+        self.assertEqual(len(runtime.calls), 3)
+        for _, kwargs in runtime.calls:
+            self.assertEqual(kwargs["language"], "tr")
+            self.assertEqual(
+                kwargs["language_spans"],
+                (TextSpan(text="", language="tr", phonemes=("m", "e", "r")),),
+            )
         self.assertTrue(runtime.closed)
 
 

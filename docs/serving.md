@@ -132,6 +132,7 @@ streaming, multilingual, or cross-lingual checkpoint claim.
 
 The next current-checkpoint cycle must connect actual compatible ODE work to this boundary and run
 the load matrix on a named GPU while continuing to label complete-waveform results as
-non-streaming. True first-playable-audio evidence still requires newly trained blockwise/local
-generation, a causal codec, versioned checkpoint metadata, continuity testing, and held-out
-intelligibility and external speaker-similarity evaluation.
+non-streaming. True first-playable-audio generation would require a different causal decoding
+contract in addition to separately trained blockwise/local acoustic weights. Because this project
+keeps DACVAE immutable, that redesign is out of scope; this serving boundary must continue to label
+its output as complete-waveform, non-streaming inference.

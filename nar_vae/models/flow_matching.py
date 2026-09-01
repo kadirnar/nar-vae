@@ -18,6 +18,17 @@ from nar_vae.languages import (
     normalize_languages,
     resolve_language_pair_support,
 )
+from nar_vae.objectives import (
+    DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+    DIFFUSION_SCHEDULE_SHIFT_METADATA_KEY,
+    GENERATIVE_OBJECTIVE_METADATA_KEY,
+    RECTIFIED_FLOW_OBJECTIVE,
+    VP_DIFFUSION_OBJECTIVE,
+    normalize_generative_objective,
+    objective_metadata_code,
+    validate_diffusion_schedule_shift,
+)
+from nar_vae.tokenization import TOTAL_VOCAB_SIZE
 from nar_vae.voice import (
     CROSS_LINGUAL_CAPABILITY_VERSION,
     SPEAKER_CONDITIONING_VERSION,
@@ -35,6 +46,16 @@ from .duration import (
     EchoDurationPredictor,
     allocate_positive_token_durations,
     expand_text_by_durations,
+)
+from .text_conditioning import (
+    FROZEN_FEATURE_TEXT_CONDITIONING,
+    SCRATCH_TOKEN_TEXT_CONDITIONING,
+    TEXT_CONDITIONING_ADAPTER_VERSION_KEY,
+    TEXT_CONDITIONING_FEATURE_SIZE_KEY,
+    TEXT_CONDITIONING_MODE_KEY,
+    TEXT_CONDITIONING_VERSION,
+    TEXT_CONDITIONING_VERSION_KEY,
+    resolve_text_conditioning_metadata,
 )
 
 
@@ -57,6 +78,7 @@ class PreparedConditioning:
     kv_cache_text: list[tuple[torch.Tensor, torch.Tensor]]
     kv_cache_speaker: list[tuple[torch.Tensor, torch.Tensor]]
     frame_text_state: torch.Tensor | None
+    global_language_state: torch.Tensor | None = None
 
     def slice_batch(self, start: int, stop: int) -> "PreparedConditioning":
         """Return a batch slice as views without recomputing its encoders."""
@@ -71,6 +93,11 @@ class PreparedConditioning:
             ],
             frame_text_state=(
                 self.frame_text_state[start:stop] if self.frame_text_state is not None else None
+            ),
+            global_language_state=(
+                self.global_language_state[start:stop]
+                if self.global_language_state is not None
+                else None
             ),
         )
 
@@ -93,14 +120,26 @@ class EncodedConditioning:
     speaker_mask: torch.Tensor | None
     text_state: torch.Tensor
     speaker_state: torch.Tensor
+    alignment_mask: torch.Tensor | None = None
+    global_language_state: torch.Tensor | None = None
+    text_is_null: torch.Tensor | None = None
 
     def slice_batch(self, start: int, stop: int) -> "EncodedConditioning":
         """Return a contiguous batch slice without running either encoder again."""
         return EncodedConditioning(
             text_mask=(self.text_mask[start:stop] if self.text_mask is not None else None),
+            alignment_mask=(
+                self.alignment_mask[start:stop] if self.alignment_mask is not None else None
+            ),
             speaker_mask=(self.speaker_mask[start:stop] if self.speaker_mask is not None else None),
             text_state=self.text_state[start:stop],
             speaker_state=self.speaker_state[start:stop],
+            global_language_state=(
+                self.global_language_state[start:stop]
+                if self.global_language_state is not None
+                else None
+            ),
+            text_is_null=(self.text_is_null[start:stop] if self.text_is_null is not None else None),
         )
 
     def index_select_batch(self, indices: torch.Tensor) -> "EncodedConditioning":
@@ -110,6 +149,11 @@ class EncodedConditioning:
             text_mask=(
                 self.text_mask.index_select(0, indices) if self.text_mask is not None else None
             ),
+            alignment_mask=(
+                self.alignment_mask.index_select(0, indices)
+                if self.alignment_mask is not None
+                else None
+            ),
             speaker_mask=(
                 self.speaker_mask.index_select(0, indices)
                 if self.speaker_mask is not None
@@ -117,6 +161,16 @@ class EncodedConditioning:
             ),
             text_state=self.text_state.index_select(0, indices),
             speaker_state=self.speaker_state.index_select(0, indices),
+            global_language_state=(
+                self.global_language_state.index_select(0, indices)
+                if self.global_language_state is not None
+                else None
+            ),
+            text_is_null=(
+                self.text_is_null.index_select(0, indices)
+                if self.text_is_null is not None
+                else None
+            ),
         )
 
 
@@ -165,11 +219,13 @@ class FlowMatchingEchoDiT(nn.Module):
         num_heads: int = 16,
         intermediate_size: int = 4096,
         #
-        text_vocab_size: int = 152000,
+        text_vocab_size: int = TOTAL_VOCAB_SIZE,
         text_model_size: int = 768,
         text_num_layers: int = 6,
         text_num_heads: int = 12,
         text_intermediate_size: int = 3072,
+        text_conditioning_mode: str = SCRATCH_TOKEN_TEXT_CONDITIONING,
+        conditioning_feature_size: int | None = None,
         #
         speaker_patch_size: int = 4,
         speaker_model_size: int = 512,
@@ -197,10 +253,59 @@ class FlowMatchingEchoDiT(nn.Module):
         duration_predictor_use_speaker: bool = False,
         use_mas_duration: bool = False,
         duration_alignment_hidden_size: int = 64,
+        target_patch_size: int = 1,
+        generative_objective: str = RECTIFIED_FLOW_OBJECTIVE,
+        diffusion_schedule_shift: float = DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+        speaker_num_summary_tokens: int = 0,
     ):
         super().__init__()
 
         self.latent_size = latent_size
+        self.text_conditioning = resolve_text_conditioning_metadata(
+            text_conditioning_mode,
+            conditioning_feature_size,
+        )
+        self.text_conditioning_mode = self.text_conditioning.mode
+        self.conditioning_feature_size = self.text_conditioning.feature_size or None
+        # Metadata is additive only for the new topology.  Its absence retains
+        # the exact legacy meaning and state-dict schema: scratch token encoder.
+        if self.text_conditioning.mode == FROZEN_FEATURE_TEXT_CONDITIONING:
+            self.register_buffer(
+                TEXT_CONDITIONING_VERSION_KEY,
+                torch.tensor(TEXT_CONDITIONING_VERSION, dtype=torch.int32),
+            )
+            self.register_buffer(
+                TEXT_CONDITIONING_MODE_KEY,
+                torch.tensor(self.text_conditioning.mode_code, dtype=torch.int32),
+            )
+            self.register_buffer(
+                TEXT_CONDITIONING_FEATURE_SIZE_KEY,
+                torch.tensor(self.text_conditioning.feature_size, dtype=torch.int32),
+            )
+            self.register_buffer(
+                TEXT_CONDITIONING_ADAPTER_VERSION_KEY,
+                torch.tensor(self.text_conditioning.adapter_version, dtype=torch.int32),
+            )
+        self.generative_objective = normalize_generative_objective(generative_objective)
+        self.diffusion_schedule_shift = validate_diffusion_schedule_shift(diffusion_schedule_shift)
+        if (
+            self.generative_objective == RECTIFIED_FLOW_OBJECTIVE
+            and self.diffusion_schedule_shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT
+        ):
+            raise ValueError(
+                "diffusion_schedule_shift is only meaningful for vp_diffusion_v checkpoints."
+            )
+        objective_code = objective_metadata_code(self.generative_objective)
+        if objective_code is not None:
+            self.register_buffer(
+                GENERATIVE_OBJECTIVE_METADATA_KEY,
+                torch.tensor(objective_code, dtype=torch.int32),
+            )
+        if self.generative_objective == VP_DIFFUSION_OBJECTIVE:
+            self.register_buffer(
+                DIFFUSION_SCHEDULE_SHIFT_METADATA_KEY,
+                torch.tensor(self.diffusion_schedule_shift, dtype=torch.float64),
+            )
         self.cfg_dropout = _cfg_dropout_probability(cfg_dropout, name="cfg_dropout")
         self.cfg_dropout_text = (
             self.cfg_dropout
@@ -270,16 +375,29 @@ class FlowMatchingEchoDiT(nn.Module):
             text_num_layers=text_num_layers,
             text_num_heads=text_num_heads,
             text_intermediate_size=text_intermediate_size,
+            text_conditioning_mode=self.text_conditioning.mode,
+            conditioning_feature_size=self.conditioning_feature_size,
             speaker_patch_size=speaker_patch_size,
             speaker_model_size=speaker_model_size,
             speaker_num_layers=speaker_num_layers,
             speaker_num_heads=speaker_num_heads,
             speaker_intermediate_size=speaker_intermediate_size,
+            speaker_num_summary_tokens=speaker_num_summary_tokens,
+            target_patch_size=target_patch_size,
             timestep_embed_size=timestep_embed_size,
             adaln_rank=adaln_rank,
             num_languages=LANGUAGE_COUNT if use_language_conditioning else 0,
             use_speaker_conditioning=use_speaker_conditioning,
             use_duration_alignment=use_mas_duration,
+        )
+        self.speaker_num_summary_tokens = self.dit.speaker_num_summary_tokens
+        self.register_buffer(
+            "echodit_architecture_version",
+            torch.tensor(ECHODIT_ARCHITECTURE_VERSION, dtype=torch.int32),
+        )
+        self.register_buffer(
+            "target_patch_size_metadata",
+            torch.tensor(self.dit.target_patch_size, dtype=torch.int32),
         )
         if use_duration_predictor:
             self.duration_predictor = EchoDurationPredictor(
@@ -287,10 +405,6 @@ class FlowMatchingEchoDiT(nn.Module):
                 hidden_size=duration_predictor_hidden_size,
                 num_layers=duration_predictor_num_layers,
                 speaker_size=(speaker_model_size if duration_predictor_use_speaker else None),
-            )
-            self.register_buffer(
-                "echodit_architecture_version",
-                torch.tensor(ECHODIT_ARCHITECTURE_VERSION, dtype=torch.int32),
             )
             self.register_buffer(
                 "duration_predictor_version",
@@ -323,14 +437,18 @@ class FlowMatchingEchoDiT(nn.Module):
                     torch.tensor(duration_alignment_hidden_size, dtype=torch.int32),
                 )
 
-        # Null embeddings for unconditional generation (CFG)
-        self.register_buffer("null_text_embed", torch.zeros(1, 1, text_model_size))
+        # Learned encoder-level null states make classifier-free branches explicit.
+        # Reusing the historical null_text_embed key keeps old state dictionaries
+        # loadable even though the tensor is now trainable and actually consumed.
+        self.null_text_embed = nn.Parameter(torch.zeros(1, 1, text_model_size))
 
         if use_speaker_conditioning:
-            # Null speaker must have time_dim = patch_size (minimum for patching)
+            # Retain the historical raw-latent sentinel as checkpoint metadata, but
+            # CFG now substitutes a learned encoded state and skips a fake codec pass.
             self.register_buffer(
                 "null_speaker_embed", torch.zeros(1, latent_size, speaker_patch_size)
             )
+            self.null_speaker_state = nn.Parameter(torch.zeros(1, 1, speaker_model_size))
             self.register_buffer(
                 "speaker_conditioning_version",
                 torch.tensor(SPEAKER_CONDITIONING_VERSION, dtype=torch.int32),
@@ -343,6 +461,17 @@ class FlowMatchingEchoDiT(nn.Module):
                 "speaker_patch_size_metadata",
                 torch.tensor(speaker_patch_size, dtype=torch.int32),
             )
+            if self.speaker_num_summary_tokens > 0:
+                # Additive topology metadata: its absence means the exact legacy
+                # variable-length speaker state and state-dict schema.
+                self.register_buffer(
+                    "speaker_resampler_version",
+                    torch.tensor(1, dtype=torch.int32),
+                )
+                self.register_buffer(
+                    "speaker_num_summary_tokens_metadata",
+                    torch.tensor(self.speaker_num_summary_tokens, dtype=torch.int32),
+                )
 
         if use_language_conditioning:
             supported_ids = tuple(language_id(code) for code in self.supported_languages)
@@ -393,17 +522,14 @@ class FlowMatchingEchoDiT(nn.Module):
         batch_size: int,
         device: torch.device,
     ) -> torch.Tensor | None:
-        """Validate language IDs and apply the legacy English default."""
+        """Validate explicit utterance-level target language IDs."""
         uses_language_conditioning = getattr(self, "use_language_conditioning", False)
         if language_ids is None:
-            if not uses_language_conditioning:
-                return None
-            return torch.full(
-                (batch_size,),
-                language_id(DEFAULT_LANGUAGE),
-                dtype=torch.long,
-                device=device,
-            )
+            if uses_language_conditioning:
+                raise ValueError(
+                    "language_ids are required by a language-conditioned NAR-VAE checkpoint."
+                )
+            return None
         if language_ids.ndim != 1 or language_ids.shape[0] != batch_size:
             raise ValueError("language_ids must have shape [batch].")
         language_ids = language_ids.to(device=device, dtype=torch.long)
@@ -426,6 +552,185 @@ class FlowMatchingEchoDiT(nn.Module):
             )
         return language_ids
 
+    def _prepare_token_language_ids(
+        self,
+        token_language_ids: torch.Tensor | None,
+        *,
+        conditioning_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Validate optional language IDs for individual text/span tokens."""
+        if token_language_ids is None:
+            return None
+        if tuple(token_language_ids.shape) != tuple(conditioning_ids.shape):
+            raise ValueError("token_language_ids must have shape [batch, token].")
+        token_language_ids = token_language_ids.to(
+            device=conditioning_ids.device,
+            dtype=torch.long,
+        )
+        if not self.use_language_conditioning:
+            default_id = language_id(DEFAULT_LANGUAGE)
+            if torch.any(
+                (token_language_ids != default_id) & (token_language_ids != NULL_LANGUAGE_ID)
+            ):
+                raise RuntimeError(
+                    "Non-English token language IDs require a language-conditioned checkpoint."
+                )
+            return None
+        supported = self.supported_language_ids_metadata.to(
+            device=conditioning_ids.device,
+            dtype=torch.long,
+        )
+        valid = (token_language_ids[..., None] == supported).any(dim=-1)
+        valid = valid | (token_language_ids == NULL_LANGUAGE_ID)
+        if not bool(valid.all()):
+            invalid = sorted(set(token_language_ids[~valid].detach().cpu().tolist()))
+            raise ValueError(
+                f"token_language_ids contain values not supported by this checkpoint: {invalid}."
+            )
+        return token_language_ids
+
+    @staticmethod
+    def _prepare_alignment_mask(
+        alignment_mask: torch.Tensor | None,
+        *,
+        conditioning_ids: torch.Tensor,
+        text_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Validate a possibly non-contiguous subset of tokens allowed to own frames."""
+        if alignment_mask is None:
+            return None
+        if tuple(alignment_mask.shape) != tuple(conditioning_ids.shape):
+            raise ValueError("alignment_mask must have shape [batch, token].")
+        alignment_mask = alignment_mask.to(device=conditioning_ids.device, dtype=torch.bool)
+        if text_mask is not None and bool((alignment_mask & ~text_mask).any()):
+            raise ValueError("alignment_mask cannot select padded text tokens.")
+        if not bool(alignment_mask.any(dim=1).all()):
+            raise ValueError("Every alignment_mask row must select at least one token.")
+        return alignment_mask
+
+    @staticmethod
+    def _materialize_mask(
+        mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if mask is None:
+            return torch.ones((batch_size, length), dtype=torch.bool, device=device)
+        return mask.to(device=device, dtype=torch.bool)
+
+    def _null_text_conditioning(
+        self,
+        *,
+        batch_size: int,
+        token_count: int,
+        state_size: int | None = None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return one learned valid null token in a fixed-length padded state."""
+        null_text_embed = self.null_text_embed
+        if state_size is not None and state_size != null_text_embed.shape[-1]:
+            raise RuntimeError("The learned null text state width does not match the encoder.")
+        state_size = int(null_text_embed.shape[-1])
+        state = torch.zeros(
+            (batch_size, token_count, state_size),
+            device=device,
+            dtype=dtype,
+        )
+        state[:, :1] = null_text_embed.to(device=device, dtype=dtype)
+        mask = torch.zeros((batch_size, token_count), device=device, dtype=torch.bool)
+        mask[:, 0] = True
+        return state, mask
+
+    def _null_speaker_conditioning(
+        self,
+        *,
+        batch_size: int,
+        state_count: int,
+        state_size: int | None = None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return one learned timbre-null token without encoding zero codec latents."""
+        if not self.use_speaker_conditioning:
+            speaker_size = int(
+                getattr(self.dit, "speaker_model_size", getattr(self, "latent_size", 0))
+            )
+            return (
+                torch.empty(
+                    (batch_size, 0, speaker_size),
+                    device=device,
+                    dtype=dtype,
+                ),
+                None,
+            )
+        null_speaker_state = self.null_speaker_state
+        if state_size is not None and state_size != null_speaker_state.shape[-1]:
+            raise RuntimeError("The learned null speaker state width does not match the encoder.")
+        state_count = max(1, state_count)
+        state = torch.zeros(
+            (batch_size, state_count, null_speaker_state.shape[-1]),
+            device=device,
+            dtype=dtype,
+        )
+        state[:, :1] = null_speaker_state.to(device=device, dtype=dtype)
+        if state_count == 1:
+            return state, None
+        mask = torch.zeros((batch_size, state_count), device=device, dtype=torch.bool)
+        mask[:, 0] = True
+        return state, mask
+
+    @staticmethod
+    def _compact_text_state(
+        text_state: torch.Tensor,
+        alignment_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack an arbitrary frame-owning token subset into a prefix-masked tensor."""
+        if tuple(alignment_mask.shape) != tuple(text_state.shape[:2]):
+            raise ValueError("alignment_mask must have the encoded text shape.")
+        alignment_mask = alignment_mask.to(device=text_state.device, dtype=torch.bool)
+        token_counts = alignment_mask.sum(dim=1)
+        # Stable ranks map selected source tokens onto a contiguous prefix. Retain
+        # the static padded length so compilation/DDP never incurs a GPU-to-CPU
+        # shape synchronization for a data-dependent max token count.
+        compact_indices = alignment_mask.cumsum(dim=1).sub(1).clamp_min(0)
+        compact = text_state.new_zeros(text_state.shape)
+        compact.scatter_add_(
+            1,
+            compact_indices[..., None].expand_as(text_state),
+            text_state * alignment_mask[..., None].to(dtype=text_state.dtype),
+        )
+        compact_mask = (
+            torch.arange(text_state.shape[1], device=text_state.device)[None, :]
+            < token_counts[:, None]
+        )
+        return compact, compact_mask
+
+    @staticmethod
+    def _scatter_compact_rows(
+        compact: torch.Tensor,
+        alignment_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scatter compact token-leading tensors back to the public full-token shape."""
+        if compact.shape[:2] != alignment_mask.shape:
+            raise ValueError("Compact state and alignment_mask must have the same padded shape.")
+        alignment_mask = alignment_mask.to(device=compact.device, dtype=torch.bool)
+        compact_indices = alignment_mask.cumsum(dim=1).sub(1).clamp_min(0)
+        trailing_dims = (1,) * (compact.ndim - 2)
+        gather_indices = compact_indices.reshape(
+            alignment_mask.shape[0],
+            alignment_mask.shape[1],
+            *trailing_dims,
+        ).expand_as(compact)
+        full = compact.gather(1, gather_indices)
+        return full * alignment_mask.reshape(
+            alignment_mask.shape[0],
+            alignment_mask.shape[1],
+            *trailing_dims,
+        ).to(dtype=compact.dtype)
+
     def prepare_inference_conditioning(
         self,
         conditioning_ids: torch.Tensor,
@@ -434,6 +739,9 @@ class FlowMatchingEchoDiT(nn.Module):
         speaker_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
         token_durations: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> PreparedConditioning:
         """Encode invariant text/speaker context once for an ODE trajectory."""
         encoded = self.encode_inference_conditioning(
@@ -442,6 +750,9 @@ class FlowMatchingEchoDiT(nn.Module):
             speaker_latent,
             speaker_mask=speaker_mask,
             language_ids=language_ids,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            conditioning_features=conditioning_features,
         )
         prepared, _ = self.finalize_inference_conditioning(
             encoded,
@@ -458,8 +769,11 @@ class FlowMatchingEchoDiT(nn.Module):
         cfg_mode: str | None = None,
         speaker_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> EncodedCFGConditioning:
-        """Encode all request and CFG invariants in one branch-major encoder batch."""
+        """Encode the real conditions once, then assemble learned-null CFG branches."""
         if cfg_mode not in {None, "joint", "independent", "alternating"}:
             raise ValueError(f"Unknown CFG mode: {cfg_mode}")
         batch_size = conditioning_ids.shape[0]
@@ -470,122 +784,168 @@ class FlowMatchingEchoDiT(nn.Module):
             batch_size=batch_size,
             device=device,
         )
-
-        def null_speaker_like(reference: torch.Tensor | None) -> torch.Tensor | None:
-            if not self.use_speaker_conditioning or reference is None:
-                return None
-            null_speaker = self.null_speaker_embed.expand(batch_size, -1, -1)
-            reference_frames = reference.shape[-1]
-            if null_speaker.shape[-1] < reference_frames:
-                null_speaker = torch.nn.functional.pad(
-                    null_speaker,
-                    (0, reference_frames - null_speaker.shape[-1]),
-                )
-            return null_speaker[..., :reference_frames]
-
-        conditional = (conditioning_ids, speaker_latent, language_ids)
-        if cfg_mode is None:
-            branch_count = 1
-            branch_variants = ((conditional,),)
-        else:
-            null_ids = torch.zeros_like(conditioning_ids)
-            null_language_ids = torch.zeros_like(language_ids) if language_ids is not None else None
-            null_speaker = null_speaker_like(speaker_latent)
-            if cfg_mode == "joint":
-                branch_count = 2
-                branch_variants = (
-                    (
-                        conditional,
-                        (null_ids, null_speaker, null_language_ids),
-                    ),
-                )
-            elif cfg_mode == "independent":
-                branch_count = 3
-                branch_variants = (
-                    (
-                        conditional,
-                        (null_ids, speaker_latent, null_language_ids),
-                        (conditioning_ids, null_speaker, language_ids),
-                    ),
-                )
-            else:
-                branch_count = 2
-                branch_variants = (
-                    (
-                        conditional,
-                        (null_ids, speaker_latent, null_language_ids),
-                    ),
-                    (
-                        conditional,
-                        (conditioning_ids, null_speaker, language_ids),
-                    ),
-                )
-
-        flat_branches = tuple(branch for variant in branch_variants for branch in variant)
-        flat_conditioning_ids = torch.cat([branch[0] for branch in flat_branches], dim=0)
-        flat_text_mask = (
-            torch.cat([text_mask] * len(flat_branches), dim=0) if text_mask is not None else None
+        token_language_ids = self._prepare_token_language_ids(
+            token_language_ids,
+            conditioning_ids=conditioning_ids,
         )
-        flat_language_ids = (
-            torch.cat([branch[2] for branch in flat_branches], dim=0)
-            if all(branch[2] is not None for branch in flat_branches)
+        alignment_mask = self._prepare_alignment_mask(
+            alignment_mask,
+            conditioning_ids=conditioning_ids,
+            text_mask=text_mask,
+        )
+
+        encode_text_kwargs = {}
+        if token_language_ids is not None:
+            encode_text_kwargs["token_language_ids"] = token_language_ids
+        if conditioning_features is not None:
+            encode_text_kwargs["conditioning_features"] = conditioning_features
+        text_state = self.dit.encode_text(
+            conditioning_ids,
+            text_mask,
+            language_ids,
+            **encode_text_kwargs,
+        )
+        encode_global_language = getattr(self.dit, "encode_global_language", None)
+        global_language_state = (
+            encode_global_language(language_ids, batch_size=batch_size, device=device)
+            if callable(encode_global_language)
             else None
         )
-        flat_text_state = self.dit.encode_text(
-            flat_conditioning_ids,
-            flat_text_mask,
-            flat_language_ids,
-        )
-
-        flat_speaker_latent = None
-        if any(branch[1] is not None for branch in flat_branches):
-            if not all(branch[1] is not None for branch in flat_branches):
-                raise ValueError("Speaker CFG branches must either all be tensors or all be None.")
-            flat_speaker_latent = torch.cat(
-                [branch[1] for branch in flat_branches if branch[1] is not None],
-                dim=0,
-            )
-        flat_speaker_mask = (
-            torch.cat([speaker_mask] * len(flat_branches), dim=0)
-            if speaker_mask is not None
-            else None
-        )
-        flat_speaker_latent, flat_speaker_mask = self._prepare_speaker_inputs(
-            flat_speaker_latent,
-            flat_speaker_mask,
-            batch_size=batch_size * len(flat_branches),
+        speaker_state, speaker_attention_mask = self._encode_speaker_conditioning(
+            speaker_latent,
+            speaker_mask,
+            batch_size=batch_size,
             device=device,
         )
-        encode_speaker = getattr(self.dit, "encode_speaker", None)
-        flat_speaker_state = (
-            encode_speaker(flat_speaker_latent, flat_speaker_mask)
-            if callable(encode_speaker)
-            else flat_speaker_latent
+
+        conditional = EncodedConditioning(
+            text_mask=text_mask,
+            alignment_mask=alignment_mask,
+            speaker_mask=speaker_attention_mask,
+            text_state=text_state,
+            speaker_state=speaker_state,
+            global_language_state=global_language_state,
+            text_is_null=torch.zeros(batch_size, dtype=torch.bool, device=device),
+        )
+        if cfg_mode is None:
+            return EncodedCFGConditioning(
+                mode=None,
+                branch_count=1,
+                variants=(conditional,),
+                conditional=conditional,
+            )
+
+        null_text_state, null_text_mask = self._null_text_conditioning(
+            batch_size=batch_size,
+            token_count=text_state.shape[1],
+            state_size=text_state.shape[2],
+            device=text_state.device,
+            dtype=text_state.dtype,
+        )
+        null_speaker_state, null_speaker_mask = self._null_speaker_conditioning(
+            batch_size=batch_size,
+            state_count=speaker_state.shape[1],
+            state_size=speaker_state.shape[2],
+            device=speaker_state.device,
+            dtype=speaker_state.dtype,
+        )
+        null_global_state = (
+            torch.zeros_like(global_language_state) if global_language_state is not None else None
+        )
+        null_alignment_mask = torch.zeros_like(null_text_mask)
+        null_alignment_mask[:, 0] = True
+        text_null = EncodedConditioning(
+            text_mask=null_text_mask,
+            alignment_mask=null_alignment_mask,
+            speaker_mask=speaker_attention_mask,
+            text_state=null_text_state,
+            speaker_state=speaker_state,
+            global_language_state=null_global_state,
+            text_is_null=torch.ones(batch_size, dtype=torch.bool, device=device),
+        )
+        speaker_null = EncodedConditioning(
+            text_mask=text_mask,
+            alignment_mask=alignment_mask,
+            speaker_mask=null_speaker_mask,
+            text_state=text_state,
+            speaker_state=null_speaker_state,
+            global_language_state=global_language_state,
+            text_is_null=torch.zeros(batch_size, dtype=torch.bool, device=device),
+        )
+        fully_null = EncodedConditioning(
+            text_mask=null_text_mask,
+            alignment_mask=null_alignment_mask,
+            speaker_mask=null_speaker_mask,
+            text_state=null_text_state,
+            speaker_state=null_speaker_state,
+            global_language_state=null_global_state,
+            text_is_null=torch.ones(batch_size, dtype=torch.bool, device=device),
         )
 
-        variant_size = branch_count * batch_size
-        variants = tuple(
-            EncodedConditioning(
-                text_mask=(
-                    flat_text_mask[offset : offset + variant_size]
-                    if flat_text_mask is not None
+        def combine(branches: tuple[EncodedConditioning, ...]) -> EncodedConditioning:
+            def combine_mask(name: str, length: int) -> torch.Tensor | None:
+                values = [getattr(branch, name) for branch in branches]
+                if all(value is None for value in values):
+                    return None
+                return torch.cat(
+                    [
+                        self._materialize_mask(
+                            value,
+                            batch_size=batch_size,
+                            length=length,
+                            device=device,
+                        )
+                        for value in values
+                    ],
+                    dim=0,
+                )
+
+            global_states = [branch.global_language_state for branch in branches]
+            return EncodedConditioning(
+                text_mask=combine_mask("text_mask", text_state.shape[1]),
+                alignment_mask=combine_mask("alignment_mask", text_state.shape[1]),
+                speaker_mask=combine_mask("speaker_mask", speaker_state.shape[1]),
+                text_state=torch.cat([branch.text_state for branch in branches], dim=0),
+                speaker_state=torch.cat([branch.speaker_state for branch in branches], dim=0),
+                global_language_state=(
+                    torch.cat(
+                        [
+                            state if state is not None else torch.zeros_like(global_states[0])
+                            for state in global_states
+                        ],
+                        dim=0,
+                    )
+                    if global_states[0] is not None
                     else None
                 ),
-                speaker_mask=(
-                    flat_speaker_mask[offset : offset + variant_size]
-                    if flat_speaker_mask is not None
-                    else None
+                text_is_null=torch.cat(
+                    [
+                        branch.text_is_null
+                        if branch.text_is_null is not None
+                        else torch.zeros(batch_size, dtype=torch.bool, device=device)
+                        for branch in branches
+                    ],
+                    dim=0,
                 ),
-                text_state=flat_text_state[offset : offset + variant_size],
-                speaker_state=flat_speaker_state[offset : offset + variant_size],
             )
-            for offset in range(0, len(flat_branches) * batch_size, variant_size)
-        )
+
+        if cfg_mode == "joint":
+            branch_count = 2
+            variants = (combine((conditional, fully_null)),)
+        elif cfg_mode == "independent":
+            branch_count = 3
+            variants = (combine((conditional, text_null, speaker_null)),)
+        else:
+            branch_count = 2
+            variants = (
+                combine((conditional, text_null)),
+                combine((conditional, speaker_null)),
+            )
         return EncodedCFGConditioning(
             mode=cfg_mode,
             branch_count=branch_count,
             variants=variants,
-            conditional=variants[0].slice_batch(0, batch_size),
+            conditional=conditional,
         )
 
     def finalize_inference_conditioning(
@@ -610,6 +970,11 @@ class FlowMatchingEchoDiT(nn.Module):
             variant_durations = None
             if token_durations is not None:
                 variant_durations = torch.cat([token_durations] * encoded.branch_count, dim=0)
+                if variant.text_is_null is not None and bool(variant.text_is_null.any()):
+                    totals = variant_durations.sum(dim=1)
+                    variant_durations = variant_durations.clone()
+                    variant_durations[variant.text_is_null] = 0
+                    variant_durations[variant.text_is_null, 0] = totals[variant.text_is_null]
             project_speaker = getattr(self.dit, "project_speaker_kv_cache", None)
             kv_cache_speaker = (
                 project_speaker(variant.speaker_state)
@@ -626,6 +991,7 @@ class FlowMatchingEchoDiT(nn.Module):
                     if variant_durations is not None
                     else None
                 ),
+                global_language_state=variant.global_language_state,
             )
 
         variants = tuple(finalize_variant(variant) for variant in encoded.variants)
@@ -692,7 +1058,73 @@ class FlowMatchingEchoDiT(nn.Module):
                     )
             return speaker_latent, speaker_attention_mask
 
-        return self.null_speaker_embed.expand(batch_size, -1, -1), None
+        raise ValueError(
+            "speaker_latent is required here; use learned null_speaker_state for an "
+            "unconditional speaker branch."
+        )
+
+    def _encode_speaker_conditioning(
+        self,
+        speaker_latent: torch.Tensor | None,
+        speaker_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Encode a real reference once or return the learned encoder-level null state."""
+        if not self.use_speaker_conditioning:
+            if speaker_latent is not None or speaker_mask is not None:
+                raise ValueError("Speaker inputs require a speaker-conditioned NAR-VAE checkpoint.")
+            return self._null_speaker_conditioning(
+                batch_size=batch_size,
+                state_count=0,
+                device=device,
+                dtype=self.dit.in_proj.weight.dtype,
+            )
+        if speaker_latent is None:
+            if speaker_mask is not None:
+                raise ValueError("speaker_mask requires speaker_latent.")
+            return self._null_speaker_conditioning(
+                batch_size=batch_size,
+                state_count=max(
+                    1,
+                    int(getattr(self.dit, "speaker_num_summary_tokens", 0)),
+                ),
+                device=device,
+                dtype=self.dit.in_proj.weight.dtype,
+            )
+
+        prepared_latent, patch_mask = self._prepare_speaker_inputs(
+            speaker_latent,
+            speaker_mask,
+            batch_size=batch_size,
+            device=device,
+        )
+        encode_speaker = getattr(self.dit, "encode_speaker", None)
+        if not callable(encode_speaker):
+            # Compatibility for small protocol fakes used by downstream callers.
+            return prepared_latent, patch_mask
+        speaker_state = encode_speaker(prepared_latent, patch_mask)
+        summary_token_count = int(getattr(self.dit, "speaker_num_summary_tokens", 0))
+        if summary_token_count > 0:
+            if speaker_state.shape[1] != summary_token_count:
+                raise RuntimeError(
+                    "Speaker resampler output length does not match speaker_num_summary_tokens."
+                )
+            # The source padding mask has been consumed by cross-attention and
+            # every learned summary query is a valid downstream conditioning token.
+            return speaker_state, None
+        if patch_mask is None:
+            return speaker_state, None
+        if speaker_state.shape[1] == patch_mask.shape[1] + 1:
+            global_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+            return speaker_state, torch.cat((global_mask, patch_mask), dim=1)
+        if speaker_state.shape[1] != patch_mask.shape[1]:
+            raise RuntimeError(
+                "Speaker encoder output length must equal the patch count or include one "
+                "leading global timbre token."
+            )
+        return speaker_state, patch_mask
 
     def predict_log_duration(
         self,
@@ -701,15 +1133,21 @@ class FlowMatchingEchoDiT(nn.Module):
         speaker_latent: torch.Tensor | None = None,
         speaker_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict ``log1p`` DACVAE frame count with a trained EchoDiT v2 head."""
-        text_state, text_mask, speaker_state, speaker_attention_mask = (
+        text_state, text_mask, _, speaker_state, speaker_attention_mask = (
             self._encode_duration_conditioning(
                 conditioning_ids,
                 attention_mask,
                 speaker_latent,
                 speaker_mask,
                 language_ids,
+                token_language_ids,
+                alignment_mask,
+                conditioning_features,
             )
         )
         return self._predict_log_duration_from_encoded(
@@ -726,9 +1164,13 @@ class FlowMatchingEchoDiT(nn.Module):
         speaker_latent: torch.Tensor | None,
         speaker_mask: torch.Tensor | None,
         language_ids: torch.Tensor | None,
+        token_language_ids: torch.Tensor | None,
+        alignment_mask: torch.Tensor | None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
-        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
@@ -745,20 +1187,58 @@ class FlowMatchingEchoDiT(nn.Module):
             batch_size=batch_size,
             device=device,
         )
-        text_state = self.dit.encode_text(conditioning_ids, text_mask, language_ids)
+        token_language_ids = self._prepare_token_language_ids(
+            token_language_ids,
+            conditioning_ids=conditioning_ids,
+        )
+        alignment_mask = self._prepare_alignment_mask(
+            alignment_mask,
+            conditioning_ids=conditioning_ids,
+            text_mask=text_mask,
+        )
+        encode_text_kwargs = {}
+        if token_language_ids is not None:
+            encode_text_kwargs["token_language_ids"] = token_language_ids
+        if conditioning_features is not None:
+            encode_text_kwargs["conditioning_features"] = conditioning_features
+        full_text_state = self.dit.encode_text(
+            conditioning_ids,
+            text_mask,
+            language_ids,
+            **encode_text_kwargs,
+        )
+        effective_alignment_mask = (
+            alignment_mask
+            if alignment_mask is not None
+            else self._materialize_mask(
+                text_mask,
+                batch_size=batch_size,
+                length=conditioning_ids.shape[1],
+                device=device,
+            )
+        )
+        text_state, duration_text_mask = self._compact_text_state(
+            full_text_state,
+            effective_alignment_mask,
+        )
 
         speaker_state = None
         speaker_attention_mask = None
         if self.duration_predictor_use_speaker:
-            speaker_latent, speaker_attention_mask = self._prepare_speaker_inputs(
+            speaker_state, speaker_attention_mask = self._encode_speaker_conditioning(
                 speaker_latent,
                 speaker_mask,
                 batch_size=batch_size,
                 device=device,
             )
-            speaker_state = self.dit.encode_speaker(speaker_latent, speaker_attention_mask)
 
-        return text_state, text_mask, speaker_state, speaker_attention_mask
+        return (
+            text_state,
+            duration_text_mask,
+            effective_alignment_mask,
+            speaker_state,
+            speaker_attention_mask,
+        )
 
     def predict_expected_token_durations(
         self,
@@ -767,19 +1247,25 @@ class FlowMatchingEchoDiT(nn.Module):
         speaker_latent: torch.Tensor | None = None,
         speaker_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict positive floating-point frame contributions for each valid token."""
         if not getattr(self, "use_mas_duration", False):
             raise RuntimeError(
                 "Token duration prediction requires a versioned MAS-duration checkpoint."
             )
-        text_state, text_mask, speaker_state, speaker_attention_mask = (
+        text_state, text_mask, full_alignment_mask, speaker_state, speaker_attention_mask = (
             self._encode_duration_conditioning(
                 conditioning_ids,
                 attention_mask,
                 speaker_latent,
                 speaker_mask,
                 language_ids,
+                token_language_ids,
+                alignment_mask,
+                conditioning_features,
             )
         )
         _, token_durations = self._predict_duration_components_from_encoded(
@@ -788,7 +1274,7 @@ class FlowMatchingEchoDiT(nn.Module):
             speaker_state,
             speaker_attention_mask,
         )
-        return token_durations
+        return self._scatter_compact_rows(token_durations, full_alignment_mask)
 
     def _predict_log_duration_from_encoded(
         self,
@@ -849,17 +1335,32 @@ class FlowMatchingEchoDiT(nn.Module):
         conditional = encoded.conditional
         speaker_state = conditional.speaker_state if self.duration_predictor_use_speaker else None
         speaker_mask = conditional.speaker_mask if self.duration_predictor_use_speaker else None
+        alignment_mask = (
+            conditional.alignment_mask
+            if conditional.alignment_mask is not None
+            else self._materialize_mask(
+                conditional.text_mask,
+                batch_size=conditional.text_state.shape[0],
+                length=conditional.text_state.shape[1],
+                device=conditional.text_state.device,
+            )
+        )
+        duration_text_state, duration_text_mask = self._compact_text_state(
+            conditional.text_state,
+            alignment_mask,
+        )
         if getattr(self, "use_mas_duration", False):
             log_frames, token_weights = self._predict_duration_components_from_encoded(
-                conditional.text_state,
-                conditional.text_mask,
+                duration_text_state,
+                duration_text_mask,
                 speaker_state,
                 speaker_mask,
             )
+            token_weights = self._scatter_compact_rows(token_weights, alignment_mask)
         else:
             log_frames = self._predict_log_duration_from_encoded(
-                conditional.text_state,
-                conditional.text_mask,
+                duration_text_state,
+                duration_text_mask,
                 speaker_state,
                 speaker_mask,
             )
@@ -877,11 +1378,13 @@ class FlowMatchingEchoDiT(nn.Module):
         attention_mask: torch.Tensor | None = None,
         *,
         total_frames: int | torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Allocate exact positive MAS durations from already predicted token weights."""
+        selected_mask = alignment_mask if alignment_mask is not None else attention_mask
         token_mask = (
-            attention_mask.to(device=expected.device, dtype=torch.bool)
-            if attention_mask is not None
+            selected_mask.to(device=expected.device, dtype=torch.bool)
+            if selected_mask is not None
             else torch.ones_like(expected, dtype=torch.bool)
         )
         if total_frames is None:
@@ -897,6 +1400,9 @@ class FlowMatchingEchoDiT(nn.Module):
         speaker_latent: torch.Tensor | None = None,
         speaker_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
         *,
         total_frames: int | torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -907,11 +1413,15 @@ class FlowMatchingEchoDiT(nn.Module):
             speaker_latent,
             speaker_mask,
             language_ids,
+            token_language_ids,
+            alignment_mask,
+            conditioning_features,
         )
         return self.allocate_token_duration_frames(
             expected,
             attention_mask,
             total_frames=total_frames,
+            alignment_mask=alignment_mask,
         )
 
     def forward_prepared(
@@ -933,6 +1443,7 @@ class FlowMatchingEchoDiT(nn.Module):
             kv_cache_latent=None,
             latent_mask=latent_mask,
             frame_text_state=conditioning.frame_text_state,
+            global_language_state=conditioning.global_language_state,
         )
 
     def prepare_fused_cfg_conditioning(
@@ -945,6 +1456,9 @@ class FlowMatchingEchoDiT(nn.Module):
         speaker_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
         token_durations: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> PreparedCFGConditioning:
         """Precompute every fixed CFG branch needed during one request."""
         encoded = self.encode_inference_conditioning(
@@ -954,6 +1468,9 @@ class FlowMatchingEchoDiT(nn.Module):
             cfg_mode=cfg_mode,
             speaker_mask=speaker_mask,
             language_ids=language_ids,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            conditioning_features=conditioning_features,
         )
         _, prepared = self.finalize_inference_conditioning(
             encoded,
@@ -1014,6 +1531,9 @@ class FlowMatchingEchoDiT(nn.Module):
         return_duration_alignment: bool = False,
         duration_target_latents: torch.Tensor | None = None,
         token_durations: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,  # [B, L] span-language IDs
+        alignment_mask: torch.Tensor | None = None,  # [B, L] frame-owning text tokens
+        conditioning_features: torch.Tensor | None = None,  # [B, L, F] frozen text states
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | DurationAlignmentOutput]:
         """
         Forward pass for training.
@@ -1021,12 +1541,15 @@ class FlowMatchingEchoDiT(nn.Module):
         Args:
             latents: Noisy latents [B, latent_size, T]
             conditioning_ids: Text token IDs [B, L]
+            conditioning_features: Optional cached frozen-backbone states [B, L, F]
             timesteps: Timesteps [B] in range [0, 1]
             attention_mask: Text attention mask [B, L]
             speaker_latent: Speaker conditioning latents [B, D, T_speaker] (optional)
             use_cfg_dropout: Whether to apply CFG dropout
             speaker_mask: Valid speaker frames or patches (optional)
             language_ids: Stable target-language IDs (optional for legacy English)
+            token_language_ids: Optional per-token language IDs for code-switched text
+            alignment_mask: Possibly non-contiguous tokens allowed to own acoustic frames
             latent_mask: Valid target-latent positions for padded training batches
             return_duration_prediction: Return the v2 log-frame prediction for joint training
             return_duration_alignment: Return versioned per-token predictions and likelihoods
@@ -1064,55 +1587,84 @@ class FlowMatchingEchoDiT(nn.Module):
             batch_size=B,
             device=device,
         )
+        token_language_ids = self._prepare_token_language_ids(
+            token_language_ids,
+            conditioning_ids=conditioning_ids,
+        )
+        alignment_mask = self._prepare_alignment_mask(
+            alignment_mask,
+            conditioning_ids=conditioning_ids,
+            text_mask=text_mask,
+        )
+        effective_alignment_mask = (
+            alignment_mask
+            if alignment_mask is not None
+            else self._materialize_mask(
+                text_mask,
+                batch_size=B,
+                length=conditioning_ids.shape[1],
+                device=device,
+            )
+        )
 
-        # Duration uses the complete condition, before classifier-free dropout. Keep
-        # those encoded states so the velocity path can reuse unchanged rows and only
-        # re-encode the rows selected for CFG dropout.
+        # Encode each real condition exactly once. Duration/MAS uses compacted
+        # frame-owning tokens, while the complete state remains available to DiT.
+        encode_text_kwargs = {}
+        if token_language_ids is not None:
+            encode_text_kwargs["token_language_ids"] = token_language_ids
+        if conditioning_features is not None:
+            encode_text_kwargs["conditioning_features"] = conditioning_features
+        complete_text_state = self.dit.encode_text(
+            conditioning_ids,
+            text_mask,
+            language_ids,
+            **encode_text_kwargs,
+        )
+        encode_global_language = getattr(self.dit, "encode_global_language", None)
+        global_language_state = (
+            encode_global_language(language_ids, batch_size=B, device=device)
+            if callable(encode_global_language)
+            else None
+        )
+        complete_speaker_state, complete_speaker_mask = self._encode_speaker_conditioning(
+            speaker_latent,
+            speaker_mask,
+            batch_size=B,
+            device=device,
+        )
+
         duration_prediction = None
-        complete_text_state = None
-        complete_speaker_state = None
-        complete_speaker_latent = None
-        complete_speaker_mask = None
         hard_alignment = None
         if return_duration_prediction:
             if not getattr(self, "use_duration_predictor", False):
                 raise RuntimeError(
                     "Learned duration requires a versioned EchoDiT v2 duration checkpoint."
                 )
-            complete_text_state = self.dit.encode_text(
-                conditioning_ids,
-                text_mask,
-                language_ids,
+            duration_text_state, duration_text_mask = self._compact_text_state(
+                complete_text_state,
+                effective_alignment_mask,
             )
-            if self.duration_predictor_use_speaker:
-                complete_speaker_latent, complete_speaker_mask = self._prepare_speaker_inputs(
-                    speaker_latent,
-                    speaker_mask,
-                    batch_size=B,
-                    device=device,
-                )
-                complete_speaker_state = self.dit.encode_speaker(
-                    complete_speaker_latent,
-                    complete_speaker_mask,
-                )
+            duration_speaker_state = (
+                complete_speaker_state if self.duration_predictor_use_speaker else None
+            )
+            duration_speaker_mask = (
+                complete_speaker_mask if self.duration_predictor_use_speaker else None
+            )
             if return_duration_alignment:
-                total_log_frames, token_durations = self._predict_duration_components_from_encoded(
-                    complete_text_state,
-                    text_mask,
-                    complete_speaker_state,
-                    complete_speaker_mask,
+                total_log_frames, compact_token_durations = (
+                    self._predict_duration_components_from_encoded(
+                        duration_text_state,
+                        duration_text_mask,
+                        duration_speaker_state,
+                        duration_speaker_mask,
+                    )
                 )
-                log_likelihoods = self.duration_alignment(
-                    complete_text_state,
+                compact_log_likelihoods = self.duration_alignment(
+                    duration_text_state,
                     duration_target_latents,
                 )
-                alignment_token_mask = (
-                    text_mask
-                    if text_mask is not None
-                    else torch.ones_like(conditioning_ids, dtype=torch.bool)
-                )
                 alignment_frame_mask = (
-                    latent_mask
+                    latent_mask.to(device=device, dtype=torch.bool)
                     if latent_mask is not None
                     else torch.ones(
                         (B, latents.shape[-1]),
@@ -1121,143 +1673,142 @@ class FlowMatchingEchoDiT(nn.Module):
                     )
                 )
                 with torch.no_grad():
-                    hard_alignment = monotonic_alignment_search(
-                        log_likelihoods.detach(),
-                        alignment_token_mask,
+                    compact_hard_alignment = monotonic_alignment_search(
+                        compact_log_likelihoods.detach(),
+                        duration_text_mask,
                         alignment_frame_mask,
                     )
+                predicted_token_durations = self._scatter_compact_rows(
+                    compact_token_durations,
+                    effective_alignment_mask,
+                )
+                log_likelihoods = self._scatter_compact_rows(
+                    compact_log_likelihoods,
+                    effective_alignment_mask,
+                )
+                hard_alignment = self._scatter_compact_rows(
+                    compact_hard_alignment,
+                    effective_alignment_mask,
+                )
                 duration_prediction = DurationAlignmentOutput(
                     total_log_frames=total_log_frames,
-                    token_durations=token_durations,
+                    token_durations=predicted_token_durations,
                     log_likelihoods=log_likelihoods,
                     hard_alignment=hard_alignment,
                 )
             else:
                 duration_prediction = self._predict_log_duration_from_encoded(
-                    complete_text_state,
-                    text_mask,
-                    complete_speaker_state,
-                    complete_speaker_mask,
+                    duration_text_state,
+                    duration_text_mask,
+                    duration_speaker_state,
+                    duration_speaker_mask,
                 )
 
-        # Independent classifier-free conditioning dropout per training row.
-        # Text and speaker are dropped independently at separate rates
+        text_state = complete_text_state
+        velocity_text_mask = text_mask
+        speaker_state = complete_speaker_state
+        velocity_speaker_mask = complete_speaker_mask
         text_cfg_mask = None
         speaker_cfg_mask = None
-        text_condition_changed = False
-        speaker_condition_changed = False
         if self.training and use_cfg_dropout:
-            # Text dropout (independent)
             text_cfg_mask = torch.rand(B, device=device) < self.cfg_dropout_text
-            if text_cfg_mask.any():
-                text_condition_changed = True
-                conditioning_ids = conditioning_ids.clone()
-                conditioning_ids[text_cfg_mask] = 0  # Pad token
-                if language_ids is not None:
-                    language_ids = language_ids.clone()
-                    language_ids[text_cfg_mask] = NULL_LANGUAGE_ID
-
-            # Speaker dropout (independent, separate random draw)
-            if self.use_speaker_conditioning and speaker_latent is not None:
-                speaker_cfg_mask = torch.rand(B, device=device) < self.cfg_dropout_speaker
-                if speaker_cfg_mask.any():
-                    speaker_condition_changed = True
-                    # Replace dropped speakers with null embedding
-                    speaker_latent = speaker_latent.clone()
-                    null_speaker = self.null_speaker_embed.expand(speaker_cfg_mask.sum(), -1, -1)
-                    # Pad null_speaker to match speaker_latent time dimension
-                    if null_speaker.shape[2] < speaker_latent.shape[2]:
-                        null_speaker = torch.nn.functional.pad(
-                            null_speaker,
-                            (0, speaker_latent.shape[2] - null_speaker.shape[2]),
-                            value=0.0,
-                        )
-                    speaker_latent[speaker_cfg_mask] = null_speaker[:, :, : speaker_latent.shape[2]]
-
-        if complete_text_state is None:
-            # Preserve the public preparation path for legacy subclasses and inference.
-            conditioning = self.prepare_inference_conditioning(
-                conditioning_ids,
-                text_mask,
-                speaker_latent,
-                speaker_mask,
-                language_ids,
-                token_durations,
-            )
-        else:
-            text_state = complete_text_state
-            if text_condition_changed:
-                assert text_cfg_mask is not None
-                changed_rows = text_cfg_mask.nonzero(as_tuple=False).squeeze(1)
-                changed_text_state = self.dit.encode_text(
-                    conditioning_ids.index_select(0, changed_rows),
-                    text_mask.index_select(0, changed_rows) if text_mask is not None else None,
-                    (
-                        language_ids.index_select(0, changed_rows)
-                        if language_ids is not None
-                        else None
-                    ),
-                )
-                text_state = text_state.index_copy(0, changed_rows, changed_text_state)
-
-            if complete_speaker_state is None:
-                velocity_speaker_latent, velocity_speaker_mask = self._prepare_speaker_inputs(
-                    speaker_latent,
-                    speaker_mask,
+            if bool(text_cfg_mask.any()):
+                null_text_state, null_text_mask = self._null_text_conditioning(
                     batch_size=B,
+                    token_count=text_state.shape[1],
+                    state_size=text_state.shape[2],
+                    device=text_state.device,
+                    dtype=text_state.dtype,
+                )
+                text_state = torch.where(text_cfg_mask[:, None, None], null_text_state, text_state)
+                materialized_text_mask = self._materialize_mask(
+                    velocity_text_mask,
+                    batch_size=B,
+                    length=text_state.shape[1],
                     device=device,
                 )
-                speaker_state = self.dit.encode_speaker(
-                    velocity_speaker_latent,
-                    velocity_speaker_mask,
+                velocity_text_mask = torch.where(
+                    text_cfg_mask[:, None],
+                    null_text_mask,
+                    materialized_text_mask,
                 )
-            else:
-                velocity_speaker_mask = complete_speaker_mask
-                speaker_state = complete_speaker_state
-                if speaker_condition_changed:
-                    assert speaker_cfg_mask is not None
-                    changed_rows = speaker_cfg_mask.nonzero(as_tuple=False).squeeze(1)
-                    changed_speaker_latent, changed_speaker_mask = self._prepare_speaker_inputs(
-                        speaker_latent.index_select(0, changed_rows),
-                        (
-                            speaker_mask.index_select(0, changed_rows)
-                            if speaker_mask is not None
-                            else None
-                        ),
-                        batch_size=changed_rows.shape[0],
+                if global_language_state is not None:
+                    global_language_state = torch.where(
+                        text_cfg_mask[:, None],
+                        torch.zeros_like(global_language_state),
+                        global_language_state,
+                    )
+
+            if self.use_speaker_conditioning and speaker_latent is not None:
+                speaker_cfg_mask = torch.rand(B, device=device) < self.cfg_dropout_speaker
+                if bool(speaker_cfg_mask.any()):
+                    null_speaker_state, null_speaker_mask = self._null_speaker_conditioning(
+                        batch_size=B,
+                        state_count=speaker_state.shape[1],
+                        state_size=speaker_state.shape[2],
+                        device=speaker_state.device,
+                        dtype=speaker_state.dtype,
+                    )
+                    speaker_state = torch.where(
+                        speaker_cfg_mask[:, None, None],
+                        null_speaker_state,
+                        speaker_state,
+                    )
+                    materialized_speaker_mask = self._materialize_mask(
+                        velocity_speaker_mask,
+                        batch_size=B,
+                        length=speaker_state.shape[1],
                         device=device,
                     )
-                    changed_speaker_state = self.dit.encode_speaker(
-                        changed_speaker_latent,
-                        changed_speaker_mask,
+                    null_speaker_mask = self._materialize_mask(
+                        null_speaker_mask,
+                        batch_size=B,
+                        length=speaker_state.shape[1],
+                        device=device,
                     )
-                    speaker_state = speaker_state.index_copy(
-                        0,
-                        changed_rows,
-                        changed_speaker_state,
+                    velocity_speaker_mask = torch.where(
+                        speaker_cfg_mask[:, None],
+                        null_speaker_mask,
+                        materialized_speaker_mask,
                     )
-            conditioning = PreparedConditioning(
-                text_mask=text_mask,
-                speaker_mask=velocity_speaker_mask,
-                kv_cache_text=self.dit.project_text_kv_cache(text_state),
-                kv_cache_speaker=self.dit.project_speaker_kv_cache(speaker_state),
-                frame_text_state=(
-                    torch.bmm(
-                        hard_alignment.transpose(1, 2).to(dtype=text_state.dtype),
-                        text_state,
-                    )
-                    if hard_alignment is not None
-                    else (
-                        expand_text_by_durations(
-                            text_state,
-                            token_durations,
-                            target_frames=latents.shape[-1],
-                        )
-                        if getattr(self, "use_mas_duration", False) and token_durations is not None
-                        else None
-                    )
-                ),
+
+        frame_text_state = None
+        if hard_alignment is not None:
+            frame_text_state = torch.bmm(
+                hard_alignment.transpose(1, 2).to(dtype=complete_text_state.dtype),
+                complete_text_state,
             )
+        elif getattr(self, "use_mas_duration", False) and token_durations is not None:
+            frame_text_state = expand_text_by_durations(
+                complete_text_state,
+                token_durations,
+                target_frames=latents.shape[-1],
+            )
+        if frame_text_state is not None and text_cfg_mask is not None and bool(text_cfg_mask.any()):
+            frame_null = self.null_text_embed.to(
+                device=frame_text_state.device,
+                dtype=frame_text_state.dtype,
+            ).expand(B, frame_text_state.shape[1], -1)
+            frame_text_state = torch.where(
+                text_cfg_mask[:, None, None],
+                frame_null,
+                frame_text_state,
+            )
+
+        project_speaker = getattr(self.dit, "project_speaker_kv_cache", None)
+        kv_cache_speaker = (
+            project_speaker(speaker_state)
+            if callable(project_speaker)
+            else self.dit.get_kv_cache_speaker(speaker_state, velocity_speaker_mask)
+        )
+        conditioning = PreparedConditioning(
+            text_mask=velocity_text_mask,
+            speaker_mask=velocity_speaker_mask,
+            kv_cache_text=self.dit.project_text_kv_cache(text_state),
+            kv_cache_speaker=kv_cache_speaker,
+            frame_text_state=frame_text_state,
+            global_language_state=global_language_state,
+        )
         velocity = self.forward_prepared(latents, timesteps, conditioning, latent_mask)
         if duration_prediction is not None:
             return velocity, duration_prediction
@@ -1279,6 +1830,9 @@ class FlowMatchingEchoDiT(nn.Module):
         fuse_cfg_branches: bool = False,
         language_ids: torch.Tensor | None = None,
         token_durations: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        alignment_mask: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass with classifier-free guidance (inference).
@@ -1305,14 +1859,16 @@ class FlowMatchingEchoDiT(nn.Module):
             fuse_cfg_branches: Batch CFG branches into one backbone call
             language_ids: Stable target-language IDs
             token_durations: Exact token-to-frame allocation for MAS checkpoints
+            token_language_ids: Optional per-token language IDs for code-switched text
+            alignment_mask: Possibly non-contiguous tokens allowed to own acoustic frames
+            conditioning_features: Cached frozen-backbone states aligned to conditioning IDs
 
         Returns:
             Guided velocity prediction [B, D, T]
         """
+        # CFG is assembled only from explicit learned encoded-null states. The real
+        # text/reference encoders run once, independently of branch count.
         if cfg_scale == 1.0 and cfg_mode == "joint":
-            forward_kwargs = {}
-            if token_durations is not None:
-                forward_kwargs["token_durations"] = token_durations
             return self.forward(
                 latents,
                 conditioning_ids,
@@ -1322,179 +1878,69 @@ class FlowMatchingEchoDiT(nn.Module):
                 use_cfg_dropout=False,
                 speaker_mask=speaker_mask,
                 language_ids=language_ids,
-                **forward_kwargs,
+                token_durations=token_durations,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
+                conditioning_features=conditioning_features,
             )
 
-        B = latents.shape[0]
-        language_ids = self._prepare_language_ids(
-            language_ids,
-            batch_size=B,
-            device=conditioning_ids.device,
+        encoded = self.encode_inference_conditioning(
+            conditioning_ids,
+            attention_mask,
+            speaker_latent,
+            cfg_mode=cfg_mode,
+            speaker_mask=speaker_mask,
+            language_ids=language_ids,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            conditioning_features=conditioning_features,
         )
-        # Default scales for independent/alternating
-        if cfg_scale_text is None:
-            cfg_scale_text = cfg_scale
-        if cfg_scale_speaker is None:
-            cfg_scale_speaker = cfg_scale
-
-        def null_speaker_like(reference: torch.Tensor | None) -> torch.Tensor | None:
-            if not self.use_speaker_conditioning or reference is None:
-                return None
-            null_speaker = self.null_speaker_embed.expand(B, -1, -1)
-            reference_frames = reference.shape[-1]
-            if null_speaker.shape[-1] < reference_frames:
-                null_speaker = torch.nn.functional.pad(
-                    null_speaker,
-                    (0, reference_frames - null_speaker.shape[-1]),
-                )
-            return null_speaker[..., :reference_frames]
-
-        def batched_predictions(
-            text_branches: list[torch.Tensor],
-            speaker_branches: list[torch.Tensor | None],
-            language_branches: list[torch.Tensor | None],
-        ) -> tuple[torch.Tensor, ...]:
-            """Evaluate CFG branches sequentially or as one fixed batch.
-
-            Compiled and Cache-DiT inference use one fixed transformer batch per
-            solver evaluation. Other profiles keep the lower-memory sequential path.
-            """
-            branch_count = len(text_branches)
-            if not branch_count == len(speaker_branches) == len(language_branches):
-                raise ValueError("Text, speaker, and language CFG branches must align.")
-
-            def forward_branch(
-                text_branch: torch.Tensor,
-                speaker_branch: torch.Tensor | None,
-                language_branch: torch.Tensor | None,
-            ) -> torch.Tensor:
-                branch_kwargs = {}
-                if language_branch is not None:
-                    branch_kwargs["language_ids"] = language_branch
-                if token_durations is not None:
-                    branch_kwargs["token_durations"] = token_durations
-                return self.forward(
-                    latents,
-                    text_branch,
-                    timesteps,
-                    attention_mask,
-                    speaker_branch,
-                    use_cfg_dropout=False,
-                    speaker_mask=speaker_mask,
-                    **branch_kwargs,
-                )
-
-            if not fuse_cfg_branches:
-                return tuple(
-                    forward_branch(text_branch, speaker_branch, language_branch)
-                    for text_branch, speaker_branch, language_branch in zip(
-                        text_branches,
-                        speaker_branches,
-                        language_branches,
-                    )
-                )
-
-            batched_speakers = None
-            if any(branch is not None for branch in speaker_branches):
-                if not all(branch is not None for branch in speaker_branches):
-                    raise ValueError(
-                        "Speaker CFG branches must either all be tensors or all be None."
-                    )
-                batched_speakers = torch.cat(speaker_branches, dim=0)  # type: ignore[arg-type]
-
-            batched_kwargs = {}
-            if all(branch is not None for branch in language_branches):
-                batched_kwargs["language_ids"] = torch.cat(language_branches, dim=0)
-            if token_durations is not None:
-                batched_kwargs["token_durations"] = torch.cat(
-                    [token_durations] * branch_count,
-                    dim=0,
-                )
-            prediction = self.forward(
-                torch.cat([latents] * branch_count, dim=0),
-                torch.cat(text_branches, dim=0),
-                torch.cat([timesteps] * branch_count, dim=0),
-                (
-                    torch.cat([attention_mask] * branch_count, dim=0)
-                    if attention_mask is not None
-                    else None
-                ),
-                batched_speakers,
-                use_cfg_dropout=False,
-                speaker_mask=(
-                    torch.cat([speaker_mask] * branch_count, dim=0)
-                    if speaker_mask is not None
-                    else None
-                ),
-                **batched_kwargs,
+        _, prepared_cfg = self.finalize_inference_conditioning(
+            encoded,
+            token_durations=token_durations,
+        )
+        assert prepared_cfg is not None
+        resolved_step = 0 if step_idx is None else step_idx
+        if fuse_cfg_branches:
+            return self.forward_with_prepared_cfg(
+                latents,
+                timesteps,
+                prepared_cfg,
+                cfg_scale=cfg_scale,
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_speaker=cfg_scale_speaker,
+                step_idx=resolved_step,
             )
-            return prediction.chunk(branch_count, dim=0)
 
-        null_language_ids = torch.zeros_like(language_ids) if language_ids is not None else None
-
+        variant_index = resolved_step % 2 if cfg_mode == "alternating" else 0
+        fused_variant = prepared_cfg.variants[variant_index]
+        batch_size = latents.shape[0]
+        predictions = tuple(
+            self.forward_prepared(
+                latents,
+                timesteps,
+                fused_variant.slice_batch(
+                    branch_index * batch_size,
+                    (branch_index + 1) * batch_size,
+                ),
+            )
+            for branch_index in range(prepared_cfg.branch_count)
+        )
+        text_scale = cfg_scale if cfg_scale_text is None else cfg_scale_text
+        speaker_scale = cfg_scale if cfg_scale_speaker is None else cfg_scale_speaker
         if cfg_mode == "joint":
-            # Joint unconditional: drop both text and speaker
-            null_ids = torch.zeros_like(conditioning_ids)
-            null_speaker = null_speaker_like(speaker_latent)
-            v_cond, v_uncond = batched_predictions(
-                [conditioning_ids, null_ids],
-                [speaker_latent, null_speaker],
-                [language_ids, null_language_ids],
+            conditional, unconditional = predictions
+            return unconditional + cfg_scale * (conditional - unconditional)
+        if cfg_mode == "independent":
+            conditional, unconditional_text, unconditional_speaker = predictions
+            return (
+                conditional
+                + text_scale * (conditional - unconditional_text)
+                + speaker_scale * (conditional - unconditional_speaker)
             )
-
-            # CFG: v = v_uncond + scale * (v_cond - v_uncond)
-            v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)
-
-        elif cfg_mode == "independent":
-            # Independent guidance: separate scales for text and speaker.
-            # v = v_cond + w_text*(v_cond - v_uncond_text) + w_speaker*(v_cond - v_uncond_speaker)
-
-            # Unconditional text (keep speaker)
-            null_ids = torch.zeros_like(conditioning_ids)
-            null_speaker = null_speaker_like(speaker_latent)
-            v_cond, v_uncond_text, v_uncond_speaker = batched_predictions(
-                [conditioning_ids, null_ids, conditioning_ids],
-                [speaker_latent, speaker_latent, null_speaker],
-                [language_ids, null_language_ids, language_ids],
-            )
-
-            # Independent CFG formula
-            v_guided = (
-                v_cond
-                + cfg_scale_text * (v_cond - v_uncond_text)
-                + cfg_scale_speaker * (v_cond - v_uncond_speaker)
-            )
-
-        elif cfg_mode == "alternating":
-            # Alternating guidance: alternate between text and speaker each step (2x NFE)
-            if step_idx is None:
-                step_idx = 0
-
-            if step_idx % 2 == 0:
-                # Text guidance step
-                null_ids = torch.zeros_like(conditioning_ids)
-                v_cond, v_uncond = batched_predictions(
-                    [conditioning_ids, null_ids],
-                    [speaker_latent, speaker_latent],
-                    [language_ids, null_language_ids],
-                )
-                v_guided = v_uncond + cfg_scale_text * (v_cond - v_uncond)
-            else:
-                # Speaker guidance step
-                null_speaker = null_speaker_like(speaker_latent)
-                v_cond, v_uncond = batched_predictions(
-                    [conditioning_ids, conditioning_ids],
-                    [speaker_latent, null_speaker],
-                    [language_ids, language_ids],
-                )
-                v_guided = v_uncond + cfg_scale_speaker * (v_cond - v_uncond)
-
-        else:
-            raise ValueError(
-                f"Unknown CFG mode: {cfg_mode}. Use 'joint', 'independent', or 'alternating'"
-            )
-
-        return v_guided
+        conditional, unconditional = predictions
+        scale = text_scale if resolved_step % 2 == 0 else speaker_scale
+        return unconditional + scale * (conditional - unconditional)
 
     @torch.no_grad()
     def encode_text(
@@ -1502,6 +1948,8 @@ class FlowMatchingEchoDiT(nn.Module):
         conditioning_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         language_ids: torch.Tensor | None = None,
+        token_language_ids: torch.Tensor | None = None,
+        conditioning_features: torch.Tensor | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Encode text and return KV cache."""
         if attention_mask is None:
@@ -1511,9 +1959,17 @@ class FlowMatchingEchoDiT(nn.Module):
             batch_size=conditioning_ids.shape[0],
             device=conditioning_ids.device,
         )
-        if language_ids is None:
-            return self.dit.get_kv_cache_text(conditioning_ids, attention_mask)
-        return self.dit.get_kv_cache_text(conditioning_ids, attention_mask, language_ids)
+        token_language_ids = self._prepare_token_language_ids(
+            token_language_ids,
+            conditioning_ids=conditioning_ids,
+        )
+        return self.dit.get_kv_cache_text(
+            conditioning_ids,
+            attention_mask,
+            language_ids,
+            token_language_ids=token_language_ids,
+            conditioning_features=conditioning_features,
+        )
 
     def get_num_params(self):
         """Get parameter counts."""
@@ -1577,7 +2033,9 @@ def create_flow_matching_echodit(
     num_layers: int = 24,
     num_heads: int = 16,
     intermediate_size: int = 4096,
-    text_vocab_size: int = 152000,
+    text_vocab_size: int = TOTAL_VOCAB_SIZE,
+    text_conditioning_mode: str = SCRATCH_TOKEN_TEXT_CONDITIONING,
+    conditioning_feature_size: int | None = None,
     cfg_dropout: float = 0.1,
     cfg_dropout_text: float | None = None,
     cfg_dropout_speaker: float | None = None,
@@ -1594,6 +2052,10 @@ def create_flow_matching_echodit(
     duration_predictor_use_speaker: bool = False,
     use_mas_duration: bool = False,
     duration_alignment_hidden_size: int = 64,
+    target_patch_size: int = 1,
+    generative_objective: str = RECTIFIED_FLOW_OBJECTIVE,
+    diffusion_schedule_shift: float = DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+    speaker_num_summary_tokens: int = 0,
     **kwargs,
 ) -> FlowMatchingEchoDiT:
     """
@@ -1606,10 +2068,14 @@ def create_flow_matching_echodit(
         num_heads: Number of attention heads
         intermediate_size: MLP intermediate size
         text_vocab_size: Text vocabulary size
+        text_conditioning_mode: ``scratch_tokens`` or token-aligned ``frozen_features``
+        conditioning_feature_size: Frozen feature width; required only in frozen-feature mode
+        target_patch_size: Exact temporal target-latent packing factor
         cfg_dropout: Default classifier-free conditioning dropout rate
         cfg_dropout_text: Optional text-specific override of ``cfg_dropout``
         cfg_dropout_speaker: Optional speaker-specific override of ``cfg_dropout``
         use_speaker_conditioning: Enable speaker conditioning
+        speaker_num_summary_tokens: Fixed speaker-summary token count; zero keeps legacy topology
         use_language_conditioning: Enable a learned target-language embedding
         supported_languages: Canonical codes or aliases represented by training data
         supported_reference_languages: Languages represented by speaker-reference audio
@@ -1629,10 +2095,16 @@ def create_flow_matching_echodit(
         num_heads=num_heads,
         intermediate_size=intermediate_size,
         text_vocab_size=text_vocab_size,
+        text_conditioning_mode=text_conditioning_mode,
+        conditioning_feature_size=conditioning_feature_size,
+        target_patch_size=target_patch_size,
+        generative_objective=generative_objective,
+        diffusion_schedule_shift=diffusion_schedule_shift,
         cfg_dropout=cfg_dropout,
         cfg_dropout_text=cfg_dropout_text,
         cfg_dropout_speaker=cfg_dropout_speaker,
         use_speaker_conditioning=use_speaker_conditioning,
+        speaker_num_summary_tokens=speaker_num_summary_tokens,
         use_language_conditioning=use_language_conditioning,
         supported_languages=supported_languages,
         supported_reference_languages=supported_reference_languages,

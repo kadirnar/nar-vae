@@ -36,8 +36,8 @@ class PackagingMetadataTest(unittest.TestCase):
                 "Issues": "https://github.com/kadirnar/nar-vae/issues",
             },
         )
-        self.assertIn("torch>=2.7.1", project["dependencies"])
-        self.assertIn("torchaudio>=2.7.1", project["dependencies"])
+        self.assertIn("torch>=2.9", project["dependencies"])
+        self.assertIn("torchaudio>=2.9", project["dependencies"])
 
     def test_pyproject_is_the_single_dependency_manifest(self):
         dependencies = set(self.metadata["project"]["dependencies"])

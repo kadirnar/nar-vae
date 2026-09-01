@@ -39,6 +39,22 @@ _LAZY_EXPORTS = {
         "nar_vae.dataset.speaker_references",
         "validate_zero_shot_splits",
     ),
+    "DynamicReferenceDataset": (
+        "nar_vae.dataset.utterance_store",
+        "DynamicReferenceDataset",
+    ),
+    "attach_utterance_metadata": (
+        "nar_vae.dataset.utterance_store",
+        "attach_utterance_metadata",
+    ),
+    "canonical_audio_sha256": (
+        "nar_vae.dataset.utterance_store",
+        "canonical_audio_sha256",
+    ),
+    "validate_utterance_store": (
+        "nar_vae.dataset.utterance_store",
+        "validate_utterance_store",
+    ),
     "FrameBudgetBatchSampler": (
         "nar_vae.dataset.sampling",
         "FrameBudgetBatchSampler",
@@ -58,6 +74,14 @@ _LAZY_EXPORTS = {
     "REPRESENTATION_CONTRACT_VERSION": (
         "nar_vae.dataset.representation",
         "REPRESENTATION_CONTRACT_VERSION",
+    ),
+    "PREPARED_ROW_VERSION": (
+        "nar_vae.dataset.representation",
+        "PREPARED_ROW_VERSION",
+    ),
+    "PREPARED_ROW_VERSION_COLUMN": (
+        "nar_vae.dataset.representation",
+        "PREPARED_ROW_VERSION_COLUMN",
     ),
     "RepresentationContract": (
         "nar_vae.dataset.representation",
@@ -99,11 +123,17 @@ __all__ = [
     "prepare_from_hf_dataset",
     "prepare_finetune_dataset",
     "validate_zero_shot_splits",
+    "DynamicReferenceDataset",
+    "attach_utterance_metadata",
+    "canonical_audio_sha256",
+    "validate_utterance_store",
     "FrameBudgetBatchSampler",
     "LATENT_NUM_FRAMES_COLUMN",
     "read_dataset_frame_lengths",
     "REPRESENTATION_CONTRACT_COLUMN",
     "REPRESENTATION_CONTRACT_VERSION",
+    "PREPARED_ROW_VERSION",
+    "PREPARED_ROW_VERSION_COLUMN",
     "RepresentationContract",
     "attach_representation_contract",
     "build_representation_contract",

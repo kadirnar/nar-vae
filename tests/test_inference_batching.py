@@ -9,6 +9,8 @@ import torch
 
 from nar_vae.configuration import load_inference_settings
 from nar_vae.inference import FlowMatchingTTSInference
+from nar_vae.languages import MultilingualUnsupportedError
+from nar_vae.tokenization import TextSpan
 
 
 class FakeTokenizer:
@@ -46,7 +48,10 @@ class FakeMASFlowModel:
         conditioning_ids,
         attention_mask=None,
         speaker_latent=None,
+        speaker_mask=None,
         language_ids=None,
+        token_language_ids=None,
+        alignment_mask=None,
         *,
         total_frames,
     ):
@@ -55,21 +60,40 @@ class FakeMASFlowModel:
                 "conditioning_ids": conditioning_ids,
                 "attention_mask": attention_mask,
                 "speaker_latent": speaker_latent,
+                "speaker_mask": speaker_mask,
                 "language_ids": language_ids,
+                "token_language_ids": token_language_ids,
+                "alignment_mask": alignment_mask,
                 "total_frames": total_frames,
             }
         )
         valid = (
-            attention_mask.to(dtype=torch.bool)
+            alignment_mask.to(dtype=torch.bool)
+            if alignment_mask is not None
+            else attention_mask.to(dtype=torch.bool)
             if attention_mask is not None
             else torch.ones_like(conditioning_ids, dtype=torch.bool)
         )
         durations = valid.to(dtype=torch.long)
-        durations[:, 0] += total_frames - valid.sum(dim=1)
+        first_valid = valid.to(dtype=torch.long).argmax(dim=1, keepdim=True)
+        durations.scatter_add_(1, first_valid, total_frames - valid.sum(dim=1, keepdim=True))
         return durations
 
 
 class InferenceBatchingTest(unittest.TestCase):
+    def test_single_and_batch_reject_undeclared_code_switch_token_languages(self):
+        runtime = make_runtime()
+        spans = [TextSpan(text="merhaba", language="tr")]
+
+        with self.assertRaises(MultilingualUnsupportedError):
+            runtime._prepare_conditioning("", "en", language_spans=spans)
+        with self.assertRaises(MultilingualUnsupportedError):
+            runtime.synthesize_batch(
+                ["ignored"],
+                language_spans=[spans],
+                num_steps=1,
+            )
+
     def test_public_inference_defaults_do_not_enable_uncalibrated_cfg(self):
         synthesize = inspect.signature(FlowMatchingTTSInference.synthesize).parameters
         to_file = inspect.signature(FlowMatchingTTSInference.synthesize_to_file).parameters
@@ -98,8 +122,9 @@ class InferenceBatchingTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["latent_shape"], (2, 2, 6))
-        self.assertEqual(tuple(calls[0]["conditioning_ids"].shape), (2, 10))
-        self.assertEqual(calls[0]["conditioning_mask"].sum(dim=1).tolist(), [5, 10])
+        self.assertEqual(tuple(calls[0]["conditioning_ids"].shape), (2, 8))
+        self.assertEqual(calls[0]["conditioning_mask"].sum(dim=1).tolist(), [3, 8])
+        self.assertEqual(calls[0]["alignment_mask"].sum(dim=1).tolist(), [1, 6])
         self.assertEqual(calls[0]["cfg_scale"], 1.0)
         self.assertEqual(calls[0]["cfg_mode"], "joint")
         self.assertIsNone(calls[0]["cfg_scale_text"])
@@ -128,8 +153,9 @@ class InferenceBatchingTest(unittest.TestCase):
         self.assertEqual(prediction_call["total_frames"], 6)
         self.assertEqual(
             prediction_call["attention_mask"].sum(dim=1).tolist(),
-            [5, 10],
+            [3, 8],
         )
+        self.assertEqual(prediction_call["alignment_mask"].sum(dim=1).tolist(), [1, 6])
         token_durations = calls[0]["token_durations"]
         self.assertEqual(token_durations.sum(dim=1).tolist(), [6, 6])
         self.assertEqual(

@@ -18,6 +18,7 @@ from nar_vae.checkpoint import (
     MonotonicAlignmentCheckpointInfo,
 )
 from nar_vae.dacvae import HubDACVAESource, load_dacvae
+from nar_vae.dacvae_encoding import DACVAE_POSTERIOR_SAMPLING_POLICY
 from nar_vae.dataset.data_collator import FlowMatchingDataCollator
 from nar_vae.dataset.identity import resolve_local_prepared_dataset_identity
 from nar_vae.distributed import (
@@ -26,6 +27,7 @@ from nar_vae.distributed import (
     propagate_distributed_error,
     resolve_node_consistent_value,
 )
+from nar_vae.frozen_text_provider import FrozenTextProviderSpec
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
 from nar_vae.model_manifest import (
     ModelManifest,
@@ -36,6 +38,7 @@ from nar_vae.model_manifest import (
 )
 from nar_vae.models.duration import MONOTONIC_ALIGNMENT_VERSION
 from nar_vae.models.flow_matching import create_flow_matching_echodit
+from nar_vae.objectives import RECTIFIED_FLOW_OBJECTIVE
 from nar_vae.post_training.stage import (
     GRPOPreparedBatch,
     GRPOStageConfig,
@@ -44,6 +47,7 @@ from nar_vae.post_training.stage import (
     load_grpo_stage_config,
     run_grpo_stage,
 )
+from nar_vae.tokenization import PAD_TOKEN
 from nar_vae.training_utils import freeze_layers, validate_tts_dataset
 
 SpeechRewardFunction = Callable[[torch.Tensor, Any], Mapping[str, torch.Tensor]]
@@ -73,6 +77,13 @@ def model_export_config_from_manifest(manifest: ModelManifest) -> dict[str, Any]
     architecture = dict(manifest.architecture)
     capabilities = dict(manifest.capabilities)
     representation = dict(manifest.representation)
+    if representation.get("codec_encoding_policy") != DACVAE_POSTERIOR_SAMPLING_POLICY:
+        raise ModelManifestError(
+            "A legacy codec representation cannot be relabeled with the current seeded "
+            "DACVAE posterior policy during model export."
+        )
+    generation = dict(manifest.generation)
+    text_conditioning = dict(manifest.text_conditioning)
     config = {
         **{
             name: architecture[name]
@@ -117,7 +128,31 @@ def model_export_config_from_manifest(manifest: ModelManifest) -> dict[str, Any]
         "dacvae_sha256": representation["codec_sha256"],
         "dacvae_sample_rate": representation["sample_rate"],
         "dacvae_hop_length": representation["hop_length"],
+        "generative_objective": generation["objective"],
+        "diffusion_schedule_shift": generation["diffusion_schedule_shift"],
+        "text_conditioning_mode": text_conditioning["mode"],
+        "conditioning_feature_size": text_conditioning["feature_size"] or None,
     }
+    if text_conditioning["mode"] == "frozen_features":
+        config.update(
+            {
+                "pad_token": text_conditioning["provider_pad_token"],
+                "conditioning_feature_dtype": text_conditioning["feature_dtype"],
+                "frozen_text_alignment": text_conditioning["alignment"],
+                "frozen_text_cache_version": text_conditioning["cache_version"],
+                "frozen_text_config_sha256": text_conditioning["config_sha256"],
+                "frozen_text_encoder_id": text_conditioning["encoder_id"],
+                "frozen_text_encoder_revision": text_conditioning["encoder_revision"],
+                "frozen_text_frontend": text_conditioning["frontend"],
+                "frozen_text_hidden_layer": text_conditioning["hidden_layer"],
+                "frozen_text_model_filename": text_conditioning["model_filename"],
+                "frozen_text_model_sha256": text_conditioning["model_sha256"],
+                "frozen_text_tokenizer_filename": text_conditioning["tokenizer_filename"],
+                "frozen_text_tokenizer_id": text_conditioning["tokenizer_id"],
+                "frozen_text_tokenizer_revision": text_conditioning["tokenizer_revision"],
+                "frozen_text_tokenizer_sha256": text_conditioning["tokenizer_sha256"],
+            }
+        )
     return config
 
 
@@ -128,6 +163,8 @@ def _new_model_from_manifest(
 ) -> nn.Module:
     architecture = manifest.architecture
     capabilities = manifest.capabilities
+    generation = manifest.generation
+    text_conditioning = manifest.text_conditioning
     model_kwargs = {
         name: architecture[name]
         for name in (
@@ -150,7 +187,11 @@ def _new_model_from_manifest(
     return create_flow_matching_echodit(
         latent_size=architecture["latent_size"],
         text_vocab_size=architecture["text_vocab_size"],
+        text_conditioning_mode=text_conditioning["mode"],
+        conditioning_feature_size=text_conditioning["feature_size"] or None,
         speaker_patch_size=architecture["speaker_patch_size"],
+        speaker_num_summary_tokens=architecture["speaker_num_summary_tokens"],
+        target_patch_size=architecture["target_patch_size"],
         norm_eps=architecture["norm_eps"],
         cfg_dropout=cfg_dropout,
         use_speaker_conditioning=capabilities["speaker_conditioning"],
@@ -164,6 +205,8 @@ def _new_model_from_manifest(
         duration_predictor_use_speaker=capabilities["duration_predictor_use_speaker"],
         use_mas_duration=capabilities["monotonic_alignment"],
         duration_alignment_hidden_size=capabilities["duration_alignment_hidden_size"] or 64,
+        generative_objective=generation["objective"],
+        diffusion_schedule_shift=generation["diffusion_schedule_shift"],
         **model_kwargs,
     )
 
@@ -187,6 +230,18 @@ def _validate_grpo_checkpoint_capabilities(
 ) -> None:
     """Bind value-bearing checkpoint metadata to the already authenticated manifest."""
     expected = manifest.capabilities
+    checkpoint.validate_architecture()
+    if checkpoint.infer_target_patch_size() != manifest.architecture["target_patch_size"]:
+        raise ModelManifestError(
+            "GRPO checkpoint target patch size does not match its model manifest."
+        )
+    if (
+        checkpoint.infer_speaker_num_summary_tokens()
+        != manifest.architecture["speaker_num_summary_tokens"]
+    ):
+        raise ModelManifestError(
+            "GRPO checkpoint speaker summary-token topology does not match its model manifest."
+        )
     checkpoint_uses_speaker = checkpoint.infer_speaker_conditioning(False)
     if checkpoint_uses_speaker != expected["speaker_conditioning"]:
         raise ModelManifestError(
@@ -324,7 +379,11 @@ def _pad_token_durations_to_batch_frames(
     padded_frames: int,
 ) -> torch.Tensor:
     """Assign only padded tail frames to each row's final valid text token."""
+    if token_durations.ndim != 2:
+        raise ValueError("GRPO token durations must have shape [batch, token].")
     batch_size = token_durations.shape[0]
+    if tuple(true_lengths.shape) != (batch_size,):
+        raise ValueError("GRPO latent lengths must contain one value per prompt.")
     padding = padded_frames - true_lengths.to(token_durations.device)
     if torch.any(padding < 0):
         raise ValueError("Latent lengths cannot exceed the collated frame dimension.")
@@ -336,10 +395,22 @@ def _pad_token_durations_to_batch_frames(
             dtype=torch.long,
         )
     else:
-        token_counts = token_mask.sum(dim=1, dtype=torch.long)
-        if torch.any(token_counts <= 0):
+        if tuple(token_mask.shape) != tuple(token_durations.shape):
+            raise ValueError("The GRPO token mask must have the token-duration shape.")
+        token_mask = token_mask.to(device=token_durations.device, dtype=torch.bool)
+        if not bool(token_mask.any(dim=1).all()):
             raise ValueError("Every MAS GRPO prompt must contain a valid text token.")
-        last_tokens = token_counts - 1
+        if bool((token_durations.masked_select(~token_mask) != 0).any()):
+            raise ValueError("Non-alignable GRPO text tokens must have zero duration.")
+        token_positions = torch.arange(
+            token_durations.shape[1],
+            device=token_durations.device,
+            dtype=torch.long,
+        ).expand(batch_size, -1)
+        # Alignment masks are intentionally allowed to be non-contiguous: v2
+        # control/boundary tokens remain in the public text sequence but never
+        # own acoustic frames. Add padding only to the final alignable token.
+        last_tokens = token_positions.masked_fill(~token_mask, -1).amax(dim=1)
     padded = token_durations.clone()
     padded[torch.arange(batch_size, device=token_durations.device), last_tokens] += padding
     if not torch.equal(
@@ -376,6 +447,15 @@ def _velocity_adapter(
         ),
         speaker_mask=_expand_prompt_tensor(conditioning.get("speaker_mask"), group_size=group_size),
         language_ids=_expand_prompt_tensor(conditioning.get("language_ids"), group_size=group_size),
+        token_language_ids=_expand_prompt_tensor(
+            conditioning.get("token_language_ids"), group_size=group_size
+        ),
+        alignment_mask=_expand_prompt_tensor(
+            conditioning.get("alignment_mask"), group_size=group_size
+        ),
+        conditioning_features=_expand_prompt_tensor(
+            conditioning.get("conditioning_features"), group_size=group_size
+        ),
         latent_mask=_expand_prompt_tensor(conditioning.get("latent_mask"), group_size=group_size),
         token_durations=_expand_prompt_tensor(
             conditioning.get("token_durations"), group_size=group_size
@@ -472,11 +552,23 @@ def build_nar_vae_grpo_runtime(
     reward: SpeechRewardFunction,
     device: torch.device,
     codec: nn.Module | None = None,
-    pad_token: int = 100286,
+    pad_token: int | None = None,
 ) -> GRPOStageRuntime:
     """Build independent policy/reference copies and concrete speech adapters."""
     if not callable(reward):
         raise TypeError("reward must be a callable speech evaluator.")
+    manifest_pad_token = (
+        int(parent_manifest.text_conditioning["provider_pad_token"])
+        if parent_manifest.text_conditioning["mode"] == "frozen_features"
+        else PAD_TOKEN
+    )
+    if pad_token is None:
+        pad_token = manifest_pad_token
+    elif pad_token != manifest_pad_token:
+        raise ValueError(
+            "GRPO pad_token does not match the authenticated parent text-conditioning "
+            f"contract: {pad_token} != {manifest_pad_token}."
+        )
     declared_evaluators = getattr(reward, "nar_vae_reward_evaluators", None)
     expected_evaluators = {
         name: dict(identity) for name, identity in config.reward_evaluators.items()
@@ -498,6 +590,12 @@ def build_nar_vae_grpo_runtime(
             provenance,
         ),
     )
+    if parent_weights.generative_objective() != RECTIFIED_FLOW_OBJECTIVE:
+        raise ValueError(
+            "The current GRPO stage implements rectified-flow SDE ratios only and cannot "
+            "post-train a VP-diffusion checkpoint. Train/evaluate the diffusion model before "
+            "adding a diffusion-native policy objective."
+        )
     _validate_grpo_checkpoint_capabilities(parent_weights, parent_manifest)
     parent_weights.load_into(policy)
     parent_weights.load_into(reference)
@@ -550,10 +648,13 @@ def build_nar_vae_grpo_runtime(
             with torch.no_grad():
                 token_durations = reference.predict_token_duration_frames(
                     model_inputs["conditioning_ids"],
-                    model_inputs.get("conditioning_mask"),
-                    model_inputs.get("speaker_latents"),
-                    model_inputs.get("speaker_mask"),
-                    model_inputs.get("language_ids"),
+                    attention_mask=model_inputs.get("conditioning_mask"),
+                    conditioning_features=model_inputs.get("conditioning_features"),
+                    speaker_latent=model_inputs.get("speaker_latents"),
+                    speaker_mask=model_inputs.get("speaker_mask"),
+                    language_ids=model_inputs.get("language_ids"),
+                    token_language_ids=model_inputs.get("token_language_ids"),
+                    alignment_mask=model_inputs.get("alignment_mask"),
                     total_frames=batch["latent_lengths"].to(selected_device),
                 ).detach()
                 # expand_text_by_durations requires one tensor-wide frame count. Allocate only
@@ -561,7 +662,7 @@ def build_nar_vae_grpo_runtime(
                 # reference allocation, and event_mask removes the tail from GRPO statistics.
                 model_inputs["token_durations"] = _pad_token_durations_to_batch_frames(
                     token_durations,
-                    model_inputs.get("conditioning_mask"),
+                    model_inputs.get("alignment_mask"),
                     batch["latent_lengths"],
                     padded_frames=frames,
                 )
@@ -622,6 +723,9 @@ def build_nar_vae_grpo_runtime(
                 speaker_mask=inputs.get("speaker_mask"),
                 language_ids=inputs.get("language_ids"),
                 token_durations=inputs.get("token_durations"),
+                token_language_ids=inputs.get("token_language_ids"),
+                alignment_mask=inputs.get("alignment_mask"),
+                conditioning_features=inputs.get("conditioning_features"),
             )
 
     return GRPOStageRuntime(
@@ -750,6 +854,19 @@ def _grpo_post_train(
             ),
             require_language_coverage=True,
             use_mas_duration=parent_manifest.capabilities["monotonic_alignment"],
+            text_conditioning_mode=parent_manifest.text_conditioning["mode"],
+            conditioning_feature_size=(parent_manifest.text_conditioning["feature_size"] or None),
+            frozen_text_provider_spec=(
+                FrozenTextProviderSpec.from_manifest(parent_manifest)
+                if parent_manifest.text_conditioning["mode"] == "frozen_features"
+                else None
+            ),
+            text_vocab_size=int(parent_manifest.architecture["text_vocab_size"]),
+            text_pad_token=(
+                int(parent_manifest.text_conditioning["provider_pad_token"])
+                if parent_manifest.text_conditioning["mode"] == "frozen_features"
+                else None
+            ),
             allow_legacy_representation=False,
             expected_codec_source=parent_manifest.representation["codec_source"],
             expected_codec_backend=parent_manifest.representation["codec_backend"],

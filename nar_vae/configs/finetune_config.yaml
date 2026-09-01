@@ -18,7 +18,7 @@ resume_from_checkpoint: null  # true, or save_folder/checkpoint-N from this exac
 # ============================================================================
 
 # Layer freezing options
-freeze_text_encoder: false     # Freeze text encoder (recommended for small datasets)
+freeze_text_encoder: false     # Keep the small adapter trainable; frozen backbone is external.
 freeze_speaker_encoder: false  # Required when initializing speaker conditioning
 freeze_first_n_layers: 0       # Freeze first N DiT layers (0 = none)
 
@@ -29,33 +29,53 @@ finetune_mode: "full"          # Only full SFT is implemented; unsupported modes
 # Model Configuration (must match pretrained model)
 # ============================================================================
 
-# Approximate canonical totals (base text-only / speaker + multilingual + speaker-aware duration):
-# nano 16.3M / 16.8M; tiny 40.5M / 42.7M; small 77.2M / 83.1M
-# medium 169.6M / 186.2M; large 353.9M / 387.9M; xlarge 647.1M / 690.5M
-# The second count requires duration_predictor_use_speaker: true.
 model_preset: "small"  # nano, tiny, small, medium, large, or xlarge; must match the parent
 dacvae_model: "facebook/dacvae-watermarked"  # Must exactly match the parent/data contract.
 dacvae_revision: "8680102d141858a21bd533543966a2eb2e569f92"
-dacvae_filename: "weights.pth"
 dacvae_sha256: "573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4"
 dacvae_backend: "bundled"  # Exact resolved backend: "bundled" or "fast".
 dacvae_latent_dim: 128
 dacvae_sample_rate: 44100
 dacvae_hop_length: 512
 
-text_vocab_size: 100312    # tiktoken cl100k_base (100277) + special tokens (10) + emotion tags (25)
+text_conditioning_mode: "frozen_features"
+conditioning_feature_size: 768
+conditioning_feature_dtype: "float16"
+text_vocab_size: 1969
+pad_token: 1
+frozen_text_encoder_id: "vinai/xphonebert-base"
+frozen_text_encoder_revision: "cf2bc63858dec1c03880fa8f764fe2195accb1ab"
+frozen_text_config_sha256: "afe941f5c081c7b940cdac3458d7caba32c12b14d394834c236c62dcfa5c0a34"
+frozen_text_model_filename: "pytorch_model.bin"
+frozen_text_model_sha256: "3fd746d1348ceff1f7155ae12f06b841bc28f5d83fd6b6eeee640e7177555463"
+frozen_text_tokenizer_id: "vinai/xphonebert-base"
+frozen_text_tokenizer_revision: "cf2bc63858dec1c03880fa8f764fe2195accb1ab"
+frozen_text_tokenizer_filename: "tokenizer.json"
+frozen_text_tokenizer_sha256: "15d43733d44b25d9b3637647c7b790b3ff7346515656d894c8ba7904f5ca33fe"
+frozen_text_hidden_layer: -1
+frozen_text_frontend: "phonemes"
+frozen_text_alignment: "hf_non_special_tokens_v1"
+frozen_text_cache_version: 1
+target_patch_size: 2  # Must match the parent; packing happens outside immutable DACVAE.
 
 speaker_patch_size: 4  # Must match the value stored by the parent checkpoint
-# speaker_id is pairing/split metadata only. The model consumes speaker_latents encoded from
-# non-target reference audio, including for unseen-speaker voice cloning at inference.
-use_speaker_conditioning: false  # Enable only with a validated speaker_latents dataset
+speaker_num_summary_tokens: 8  # Must exactly match the parent checkpoint topology.
+# speaker_id is pairing/split metadata only. Training dynamically selects another cached
+# same-speaker utterance as reference audio; inference accepts an unseen speaker recording.
+use_speaker_conditioning: true
 initialize_speaker_conditioning: false  # Set true when adding it to a text-only checkpoint
+reference_seed: 1337
+min_reference_seconds: 3.0
+short_reference_max_seconds: 8.0
+max_reference_seconds: 12.0
+short_reference_probability: 0.8
+dynamic_reference_strict: true
 
-use_language_conditioning: false  # Enable for a versioned multilingual checkpoint
+use_language_conditioning: true  # Preserve the parent checkpoint's language topology.
 initialize_language_conditioning: false  # Set true when adding languages to monolingual weights
 supported_languages: ["en"]  # Must match training rows and checkpoint metadata
 # Exact [target, reference] pairs; preflight and inference reject undeclared combinations.
-supported_language_pairs: null  # Example: [["en", "en"], ["tr", "tr"], ["tr", "en"]]
+supported_language_pairs: [["en", "en"]]  # Edit only to match the pretrained parent.
 initialize_cross_lingual_capability: false  # Add metadata only while training matching rows
 freeze_language_embedding: false
 
@@ -65,7 +85,7 @@ use_duration_predictor: true
 initialize_duration_predictor: false
 duration_predictor_hidden_size: 256
 duration_predictor_num_layers: 2
-duration_predictor_use_speaker: false
+duration_predictor_use_speaker: true
 duration_loss_weight: 0.1
 duration_huber_delta: 1.0
 # These architecture fields match the canonical scratch pretraining export. Change them only when
@@ -76,6 +96,8 @@ mas_duration_loss_weight: 0.1
 mas_alignment_loss_weight: 0.01
 
 norm_eps: 1.0e-6
+generative_objective: "vp_diffusion_v"
+diffusion_schedule_shift: 1.0
 cfg_dropout: 0.1           # Default text/speaker conditioning dropout probability
 cfg_dropout_text: null     # Optional text-specific override; null inherits cfg_dropout
 cfg_dropout_speaker: null  # Optional speaker-specific override; null inherits cfg_dropout
@@ -91,6 +113,8 @@ batch_size: 4  # Per-device; measure and tune on the target GPU.
 max_frames_per_batch: 4096
 max_examples_per_batch: null  # null uses batch_size as the example-count ceiling.
 frame_bucket_size: 128
+batching_cost: "padded_attention"
+max_attention_cost_per_batch: 24000000  # Tune from measured server memory/throughput.
 allow_legacy_frame_length_inference: false  # Re-prepare old data instead of loading every latent.
 allow_legacy_representation: false  # Require the pretraining codec/frontend contract.
 learning_rate: 1.0e-5
@@ -115,10 +139,6 @@ TTS_dataset_local: "./finetune_data"  # Prepared data with nar_vae_dataset_manif
 # For zero-shot cloning, keep training/validation/test speakers disjoint and
 # prepare same-speaker references that always differ from the target utterance.
 
-# The versioned text frontend fixes all vocabulary and special-token IDs.
-# Only padding is a collator input.
-pad_token: 100286
-
 # ============================================================================
 # Paths and Naming
 # ============================================================================
@@ -139,6 +159,8 @@ torch_compile: false  # Optional; enable only after numerical and shape-bucket v
 dataloader_num_workers: 4
 dataloader_pin_memory: true
 dataloader_drop_last: true
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 2
 
 # ============================================================================
 # Validation
@@ -149,7 +171,7 @@ dataloader_drop_last: true
 do_validation: false
 
 # ============================================================================
-# Flow Matching
+# Diffusion objective weighting
 # ============================================================================
 
 flow_velocity_weighted: false
@@ -166,10 +188,18 @@ ema_update_every: 10
 # Optimizer and Mandatory Experiment Tracking
 # ============================================================================
 
-optimizer: "adamw"
+optimizer: "adamw"  # Or experimental "muon"; AdamW remains the default.
 adam_beta1: 0.9
 adam_beta2: 0.999
 adam_epsilon: 1.0e-8
+# Uncomment these only together with optimizer: "muon".
+# muon_learning_rate: 1.0e-5  # Omit to reuse learning_rate.
+# muon_weight_decay: 0.01     # Omit to reuse weight_decay.
+# muon_momentum: 0.95
+# muon_nesterov: true
+# muon_ns_steps: 5
+# muon_epsilon: 1.0e-7
+# muon_adjust_lr_fn: "match_rms_adamw"
 report_to: "wandb"  # Mandatory; W&B logging is rank-zero-safe under DDP.
 logging_dir: "./logs"
 logging_first_step: true

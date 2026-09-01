@@ -62,6 +62,40 @@ def _prefix_mask(
     return normalized, lengths
 
 
+def _token_mask(
+    mask: torch.Tensor | None,
+    *,
+    batch_size: int,
+    length: int,
+    device: torch.device,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize an arbitrary ordered token mask and return its row counts.
+
+    Unlike acoustic frame masks, alignment masks may exclude control tokens at
+    either edge of the text sequence or between speakable spans.  Their original
+    order still defines the monotonic path; compacting the selected positions is
+    an implementation detail of :func:`monotonic_alignment_search`.
+    """
+    if mask is None:
+        normalized = torch.ones((batch_size, length), dtype=torch.bool, device=device)
+    else:
+        if mask.ndim == 1:
+            if batch_size != 1:
+                raise ValueError(f"{name} must have shape [{batch_size}, {length}].")
+            mask = mask.unsqueeze(0)
+        if tuple(mask.shape) != (batch_size, length):
+            raise ValueError(
+                f"{name} must have shape {(batch_size, length)}; got {tuple(mask.shape)}."
+            )
+        normalized = mask.to(device=device, dtype=torch.bool)
+
+    lengths = normalized.sum(dim=1, dtype=torch.long)
+    if not bool((lengths > 0).all()):
+        raise ValueError(f"Every row in {name} must contain at least one valid position.")
+    return normalized, lengths
+
+
 @torch.no_grad()
 def monotonic_alignment_search(
     log_likelihoods: torch.Tensor,
@@ -77,7 +111,8 @@ def monotonic_alignment_search(
 
     Args:
         log_likelihoods: Token-by-frame scores with shape ``[N, T]`` or ``[B, N, T]``.
-        token_mask: Optional left-aligned valid-token mask with shape ``[N]`` or ``[B, N]``.
+        token_mask: Optional ordered, possibly non-contiguous valid-token mask with shape
+            ``[N]`` or ``[B, N]``.
         frame_mask: Optional left-aligned valid-frame mask with shape ``[T]`` or ``[B, T]``.
 
     Returns:
@@ -87,7 +122,7 @@ def monotonic_alignment_search(
         raise TypeError("log_likelihoods must be a floating-point tensor.")
     scores, squeeze_batch = _as_batched_matrix(log_likelihoods, name="log_likelihoods")
     batch_size, max_tokens, max_frames = scores.shape
-    valid_tokens, token_lengths = _prefix_mask(
+    valid_tokens, token_lengths = _token_mask(
         token_mask,
         batch_size=batch_size,
         length=max_tokens,
@@ -101,62 +136,78 @@ def monotonic_alignment_search(
         device=scores.device,
         name="frame_mask",
     )
-    del valid_tokens, valid_frames
-
-    alignment = torch.zeros_like(scores, dtype=torch.bool)
-    for batch_index in range(batch_size):
-        token_count = int(token_lengths[batch_index].item())
-        frame_count = int(frame_lengths[batch_index].item())
-        if frame_count < token_count:
-            raise ValueError(
-                f"Alignment row {batch_index} has {frame_count} valid frames for "
-                f"{token_count} valid tokens; at least one frame per token is required."
-            )
-
-        row_scores = scores[batch_index, :token_count, :frame_count]
-        if bool(torch.isnan(row_scores).any()) or bool(torch.isposinf(row_scores).any()):
-            raise ValueError(
-                f"Alignment row {batch_index} contains NaN or positive-infinite scores."
-            )
-
-        previous = row_scores.new_full((token_count,), float("-inf"))
-        previous[0] = row_scores[0, 0]
-        advanced = torch.zeros(
-            (token_count, frame_count),
-            dtype=torch.bool,
-            device=row_scores.device,
+    if bool((frame_lengths < token_lengths).any()):
+        raise ValueError(
+            "Every alignment row requires at least one frame per token selected by token_mask."
         )
-        negative_infinity = row_scores.new_full((1,), float("-inf"))
 
-        for frame_index in range(1, frame_count):
-            from_previous_token = torch.cat((negative_infinity, previous[:-1]))
-            # Prefer advancing on exact ties so the result is deterministic.
-            choose_advance = from_previous_token >= previous
-            previous = row_scores[:, frame_index] + torch.where(
-                choose_advance,
-                from_previous_token,
-                previous,
-            )
-            advanced[:, frame_index] = choose_advance
+    valid_region = valid_tokens[:, :, None] & valid_frames[:, None, :]
+    invalid_scores = torch.isnan(scores) | torch.isposinf(scores)
+    if bool((invalid_scores & valid_region).any()):
+        raise ValueError("Valid alignment scores cannot contain NaN or positive-infinite values.")
 
-        if not bool(torch.isfinite(previous[token_count - 1])):
-            raise ValueError(f"Alignment row {batch_index} has no finite monotonic path.")
+    # Compact arbitrary speakable-token masks without transferring token indices
+    # or direction tables to the CPU.  Invalid positions sort behind every valid
+    # position while stable token order is retained within each row.
+    token_positions = torch.arange(max_tokens, device=scores.device).expand(batch_size, -1)
+    sort_keys = torch.where(valid_tokens, token_positions, token_positions + max_tokens)
+    compact_to_original = sort_keys.argsort(dim=1)
+    compact_scores = torch.gather(
+        scores,
+        1,
+        compact_to_original[:, :, None].expand(-1, -1, max_frames),
+    )
+    compact_valid_tokens = (
+        torch.arange(max_tokens, device=scores.device)[None, :] < token_lengths[:, None]
+    )
 
-        # Copy the compact direction table once instead of synchronizing the device
-        # for every scalar decision during backtracking.
-        directions = advanced.detach().cpu()
-        token_path = [0] * frame_count
-        token_index = token_count - 1
-        for frame_index in range(frame_count - 1, -1, -1):
-            token_path[frame_index] = token_index
-            if frame_index > 0 and bool(directions[token_index, frame_index]):
-                token_index -= 1
-        if token_index != 0:
-            raise RuntimeError("Monotonic alignment backtracking did not reach the first token.")
+    negative_infinity = scores.new_full((batch_size, 1), float("-inf"))
+    previous = scores.new_full((batch_size, max_tokens), float("-inf"))
+    previous[:, 0] = compact_scores[:, 0, 0]
+    previous = previous.masked_fill(~compact_valid_tokens, float("-inf"))
+    advanced = torch.zeros_like(scores, dtype=torch.bool)
 
-        frame_indices = torch.arange(frame_count, device=alignment.device)
-        path_indices = torch.tensor(token_path, dtype=torch.long, device=alignment.device)
-        alignment[batch_index, path_indices, frame_indices] = True
+    for frame_index in range(1, max_frames):
+        from_previous_token = torch.cat((negative_infinity, previous[:, :-1]), dim=1)
+        # Prefer advancing on exact ties so the batched implementation preserves
+        # the historical deterministic path rule.
+        choose_advance = from_previous_token >= previous
+        candidate = compact_scores[:, :, frame_index] + torch.where(
+            choose_advance,
+            from_previous_token,
+            previous,
+        )
+        candidate = candidate.masked_fill(~compact_valid_tokens, float("-inf"))
+        active_rows = frame_index < frame_lengths
+        previous = torch.where(active_rows[:, None], candidate, previous)
+        advanced[:, :, frame_index] = choose_advance & active_rows[:, None]
+
+    batch_indices = torch.arange(batch_size, device=scores.device)
+    final_scores = previous[batch_indices, token_lengths - 1]
+    if not bool(torch.isfinite(final_scores).all()):
+        raise ValueError("At least one alignment row has no finite monotonic path.")
+
+    # Backtrack every row together on the original device. Rows whose valid
+    # acoustic sequence has already ended remain untouched until their last frame
+    # is reached. This avoids the former per-row device synchronization and CPU
+    # direction-table copy while producing the same maximum-likelihood paths.
+    alignment = torch.zeros_like(scores, dtype=torch.bool)
+    compact_token_index = token_lengths - 1
+    for frame_index in range(max_frames - 1, -1, -1):
+        active_rows = frame_index < frame_lengths
+        active_batch = batch_indices[active_rows]
+        active_compact_tokens = compact_token_index[active_rows]
+        original_tokens = compact_to_original[active_batch, active_compact_tokens]
+        alignment[active_batch, original_tokens, frame_index] = True
+        if frame_index:
+            took_advance = advanced[
+                batch_indices,
+                compact_token_index,
+                frame_index,
+            ]
+            compact_token_index = compact_token_index - (active_rows & took_advance).to(torch.long)
+    if bool((compact_token_index != 0).any()):
+        raise RuntimeError("Monotonic alignment backtracking did not reach the first valid token.")
 
     return alignment[0] if squeeze_batch else alignment
 
@@ -176,7 +227,7 @@ def durations_from_alignment(
         hard_alignment = hard_alignment.to(dtype=torch.bool)
 
     batch_size, max_tokens, max_frames = hard_alignment.shape
-    valid_tokens, token_lengths = _prefix_mask(
+    valid_tokens, token_lengths = _token_mask(
         token_mask,
         batch_size=batch_size,
         length=max_tokens,
@@ -198,26 +249,22 @@ def durations_from_alignment(
     if not bool((assigned_per_frame[valid_frames] == 1).all()):
         raise ValueError("Every valid frame must be assigned to exactly one valid token.")
 
-    for batch_index in range(batch_size):
-        token_count = int(token_lengths[batch_index].item())
-        frame_count = int(frame_lengths[batch_index].item())
-        token_indices = (
-            hard_alignment[
-                batch_index,
-                :token_count,
-                :frame_count,
-            ]
-            .to(dtype=torch.long)
-            .argmax(dim=0)
-        )
-        if frame_count > 1:
-            transitions = token_indices[1:] - token_indices[:-1]
-            if bool(((transitions < 0) | (transitions > 1)).any()):
-                raise ValueError(
-                    "alignment must be monotonic and may only stay on a token or advance by one token."
-                )
-        if token_indices[0] != 0 or token_indices[-1] != token_count - 1:
-            raise ValueError("alignment must start at the first token and end at the final token.")
+    original_token_indices = hard_alignment.to(dtype=torch.long).argmax(dim=1)
+    compact_ranks = valid_tokens.cumsum(dim=1, dtype=torch.long) - 1
+    token_indices = torch.gather(compact_ranks, 1, original_token_indices)
+    if max_frames > 1:
+        transitions = token_indices[:, 1:] - token_indices[:, :-1]
+        invalid_transition = ((transitions < 0) | (transitions > 1)) & valid_frames[:, 1:]
+        if bool(invalid_transition.any()):
+            raise ValueError(
+                "alignment must be monotonic and may only stay on a token or advance by one token."
+            )
+    batch_indices = torch.arange(batch_size, device=hard_alignment.device)
+    final_token_indices = token_indices[batch_indices, frame_lengths - 1]
+    if bool((token_indices[:, 0] != 0).any()) or bool(
+        (final_token_indices != token_lengths - 1).any()
+    ):
+        raise ValueError("alignment must start at the first token and end at the final token.")
 
     durations = hard_alignment.sum(dim=-1, dtype=torch.long)
     if not bool((durations[valid_tokens] > 0).all()):
@@ -285,7 +332,7 @@ def allocate_integer_durations(
         name="expected_durations",
     )
     batch_size, max_tokens = weights.shape
-    valid_tokens, _ = _prefix_mask(
+    valid_tokens, _ = _token_mask(
         token_mask,
         batch_size=batch_size,
         length=max_tokens,

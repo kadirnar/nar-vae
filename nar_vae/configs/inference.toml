@@ -14,8 +14,8 @@ minimum_seconds = 1.5
 maximum_seconds = 30.0
 
 [profiles.quality]
-num_steps = 50
-solver = "heun"
+num_steps = 32
+solver = "ddim"
 cache_mode = "none"
 cfg_scale = 1.0
 cfg_mode = "joint"
@@ -28,8 +28,8 @@ temporal_rescale_k = 1.0
 temporal_rescale_sigma = 2.5
 
 [profiles.balanced]
-num_steps = 32
-solver = "euler"
+num_steps = 16
+solver = "ddim"
 cache_mode = "none"
 cfg_scale = 1.0
 cfg_mode = "joint"
@@ -42,8 +42,8 @@ temporal_rescale_k = 1.0
 temporal_rescale_sigma = 2.5
 
 [profiles.fast]
-num_steps = 16
-solver = "euler"
+num_steps = 8
+solver = "ddim"
 cache_mode = "none"
 cfg_scale = 1.0
 cfg_mode = "joint"

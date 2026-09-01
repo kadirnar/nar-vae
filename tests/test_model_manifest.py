@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -16,10 +17,15 @@ from nar_vae.checkpoint import (
     MonotonicAlignmentCheckpointInfo,
     ReferenceLanguageCheckpointInfo,
 )
+from nar_vae.dacvae_encoding import DACVAE_POSTERIOR_SAMPLING_POLICY
 from nar_vae.dataset.representation import TEXT_FRONTEND_NAME
+from nar_vae.frozen_text_provider import FROZEN_TEXT_REPRESENTATION_NAME
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.model_manifest import (
+    LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
     MODEL_MANIFEST_FILENAME,
+    MODEL_MANIFEST_SCHEMA_VERSION,
+    PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION,
     ModelManifestError,
     load_model_manifest,
     validate_inference_manifest,
@@ -28,6 +34,17 @@ from nar_vae.model_manifest import (
     validate_sft_parent_manifest,
     write_model_manifest,
 )
+from nar_vae.post_training.nar_vae_stage import model_export_config_from_manifest
+
+
+def canonical_sha256(value) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def model_config(codec_source: str) -> dict:
@@ -39,7 +56,8 @@ def model_config(codec_source: str) -> dict:
         "dacvae_hop_length": 512,
         "dacvae_latent_dim": 128,
         "dacvae_sha256": "c" * 64,
-        "text_vocab_size": 100312,
+        "text_vocab_size": 530,
+        "target_patch_size": 1,
         "speaker_patch_size": 4,
         "norm_eps": 1e-6,
         "use_speaker_conditioning": False,
@@ -76,17 +94,69 @@ class ModelManifestTest(unittest.TestCase):
             self.assertEqual(loaded.raw, written.raw)
             self.assertEqual(loaded.stage, "pretrain")
             self.assertEqual(loaded.architecture["latent_size"], 128)
+            self.assertEqual(loaded.architecture["speaker_num_summary_tokens"], 0)
             self.assertTrue(loaded.capabilities["monotonic_alignment"])
             self.assertEqual(loaded.representation["text_frontend_name"], TEXT_FRONTEND_NAME)
             self.assertEqual(loaded.representation["codec_source"], "./codec/weights.pth")
             self.assertIsNone(loaded.representation["codec_revision"])
+            self.assertEqual(
+                loaded.representation["codec_encoding_policy"],
+                DACVAE_POSTERIOR_SAMPLING_POLICY,
+            )
             validate_manifest_weight(loaded, weights)
 
             weights.write_bytes(b"different model weights")
             with self.assertRaisesRegex(ModelManifestError, "manifest SHA-256"):
                 validate_manifest_weight(loaded, weights)
 
-    def test_manifest_v2_records_exact_language_pairs_authoritatively(self):
+    def test_frozen_export_binds_provider_axis_and_frontend_for_inference(self):
+        config = model_config("./codec/weights.pth")
+        config.update(
+            text_conditioning_mode="frozen_features",
+            text_num_layers=0,
+            text_vocab_size=23,
+            pad_token=1,
+            conditioning_feature_size=4,
+            conditioning_feature_dtype="float16",
+            frozen_text_alignment="hf_non_special_tokens_v1",
+            frozen_text_cache_version=1,
+            frozen_text_config_sha256="a" * 64,
+            frozen_text_encoder_id="example/encoder",
+            frozen_text_encoder_revision="a" * 40,
+            frozen_text_frontend="phonemes",
+            frozen_text_hidden_layer=-1,
+            frozen_text_model_filename="model.safetensors",
+            frozen_text_model_sha256="b" * 64,
+            frozen_text_tokenizer_filename="tokenizer.json",
+            frozen_text_tokenizer_id="example/tokenizer",
+            frozen_text_tokenizer_revision="a" * 40,
+            frozen_text_tokenizer_sha256="c" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            weights, written = self._write(root, config)
+            loaded = load_model_manifest(root / MODEL_MANIFEST_FILENAME)
+
+            self.assertEqual(
+                loaded.representation["text_frontend_name"],
+                FROZEN_TEXT_REPRESENTATION_NAME,
+            )
+            self.assertEqual(loaded.text_conditioning["provider_vocab_size"], 23)
+            self.assertEqual(loaded.text_conditioning["provider_pad_token"], 1)
+            validate_inference_manifest(
+                loaded,
+                checkpoint_path=weights,
+                selected_filename=weights.name,
+                architecture=loaded.architecture,
+                capabilities=loaded.capabilities,
+                generation=loaded.generation,
+                text_conditioning=loaded.text_conditioning,
+                codec_source="./codec/weights.pth",
+                codec_backend="bundled",
+            )
+            self.assertEqual(written.raw, loaded.raw)
+
+    def test_current_manifest_records_exact_language_pairs_authoritatively(self):
         config = model_config("./codec/weights.pth")
         config.update(
             use_speaker_conditioning=True,
@@ -99,7 +169,10 @@ class ModelManifestTest(unittest.TestCase):
             root = Path(directory)
             _, manifest = self._write(root, config)
 
-            self.assertEqual(manifest.raw["schema_version"], 2)
+            self.assertEqual(
+                manifest.raw["schema_version"],
+                MODEL_MANIFEST_SCHEMA_VERSION,
+            )
             self.assertEqual(
                 manifest.capabilities["supported_language_pairs"],
                 [["es", "en"], ["en", "ja"]],
@@ -210,6 +283,262 @@ class ModelManifestTest(unittest.TestCase):
                 validate_sft_parent_manifest(weights, speaker_migration)
             speaker_migration["initialize_speaker_conditioning"] = True
             validate_sft_parent_manifest(weights, speaker_migration)
+            speaker_migration["speaker_num_summary_tokens"] = 8
+            validate_sft_parent_manifest(weights, speaker_migration)
+
+    def test_manifest_binds_fixed_speaker_summary_topology(self):
+        config = model_config("./codec/a.pth")
+        config.update(
+            use_speaker_conditioning=True,
+            speaker_num_summary_tokens=8,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            weights, manifest = self._write(root, config)
+
+            self.assertEqual(manifest.architecture["speaker_num_summary_tokens"], 8)
+
+            changed_topology = dict(config)
+            changed_topology["speaker_num_summary_tokens"] = 4
+            with self.assertRaisesRegex(ModelManifestError, "architecture"):
+                validate_sft_parent_manifest(weights, changed_topology)
+
+    def test_manifest_rejects_invalid_or_unconditioned_summary_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root)
+            manifest_path = root / MODEL_MANIFEST_FILENAME
+
+            for invalid_value in (-1, True, 1.5):
+                raw = json.loads(json.dumps(manifest.raw))
+                raw["architecture"]["speaker_num_summary_tokens"] = invalid_value
+                manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+                with self.subTest(invalid_value=invalid_value):
+                    with self.assertRaisesRegex(ModelManifestError, "non-negative"):
+                        load_model_manifest(manifest_path)
+
+            raw = json.loads(json.dumps(manifest.raw))
+            raw["architecture"]["speaker_num_summary_tokens"] = 8
+            manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ModelManifestError, "speaker-conditioning"):
+                load_model_manifest(manifest_path)
+
+    def test_previous_schema4_manifest_preserves_raw_identity_without_seeded_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root)
+            raw = json.loads(json.dumps(manifest.raw))
+            raw["schema_version"] = PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION
+            raw["representation"]["contract_version"] = 2
+            raw["representation"].pop("codec_encoding_policy")
+            expected_sha256 = canonical_sha256(raw)
+            manifest_path = root / MODEL_MANIFEST_FILENAME
+            manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            loaded = load_model_manifest(manifest_path)
+
+            self.assertEqual(loaded.raw, raw)
+            self.assertEqual(loaded.sha256, expected_sha256)
+            self.assertNotIn("codec_encoding_policy", loaded.representation)
+            self.assertIn("generation", loaded.raw)
+            self.assertIn("text_conditioning", loaded.raw)
+            with self.assertRaisesRegex(ModelManifestError, "cannot be relabeled"):
+                model_export_config_from_manifest(loaded)
+
+    def test_public_sft_writer_cannot_promote_schema3_schema4_or_unbound_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pretrain_dir = root / "pretrain"
+            sft_dir = root / "sft"
+            pretrain_dir.mkdir()
+            sft_dir.mkdir()
+            config = model_config("./codec/weights.pth")
+
+            _, current_pretrain = self._write(pretrain_dir, config)
+            sft_weights = sft_dir / "pytorch_model.bin"
+            sft_weights.write_bytes(b"sft weights")
+
+            for schema_version in (
+                LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
+                PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION,
+            ):
+                legacy_raw = json.loads(json.dumps(current_pretrain.raw))
+                legacy_raw["schema_version"] = schema_version
+                legacy_raw["representation"]["contract_version"] = 2
+                legacy_raw["representation"].pop("codec_encoding_policy")
+                if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+                    legacy_raw["architecture"].pop("speaker_num_summary_tokens")
+                    legacy_raw.pop("generation")
+                    legacy_raw.pop("text_conditioning")
+                (pretrain_dir / MODEL_MANIFEST_FILENAME).write_text(
+                    json.dumps(legacy_raw),
+                    encoding="utf-8",
+                )
+                legacy_pretrain = load_model_manifest(pretrain_dir / MODEL_MANIFEST_FILENAME)
+
+                with (
+                    self.subTest(schema_version=schema_version),
+                    self.assertRaisesRegex(
+                        ModelManifestError,
+                        "codec/frontend representation",
+                    ),
+                ):
+                    write_model_manifest(
+                        sft_dir,
+                        config,
+                        stage="sft",
+                        checkpoint_files=(sft_weights.name,),
+                        parent_manifest=legacy_pretrain,
+                    )
+                self.assertFalse((sft_dir / MODEL_MANIFEST_FILENAME).exists())
+
+            with self.assertRaisesRegex(ModelManifestError, "fully validated pretraining"):
+                write_model_manifest(
+                    sft_dir,
+                    config,
+                    stage="sft",
+                    checkpoint_files=(sft_weights.name,),
+                    parent_manifest={
+                        "manifest_sha256": "a" * 64,
+                        "stage": "pretrain",
+                        "weights_sha256": "b" * 64,
+                        "representation_sha256": "c" * 64,
+                    },
+                )
+            self.assertFalse((sft_dir / MODEL_MANIFEST_FILENAME).exists())
+
+    def test_public_grpo_writer_cannot_relabel_a_schema4_sft_representation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pretrain_dir = root / "pretrain"
+            sft_dir = root / "sft"
+            grpo_dir = root / "grpo"
+            pretrain_dir.mkdir()
+            sft_dir.mkdir()
+            grpo_dir.mkdir()
+            config = model_config("./codec/weights.pth")
+
+            _, pretrain_manifest = self._write(pretrain_dir, config)
+            sft_weights = sft_dir / "pytorch_model.bin"
+            sft_weights.write_bytes(b"sft weights")
+            current_sft = write_model_manifest(
+                sft_dir,
+                config,
+                stage="sft",
+                checkpoint_files=(sft_weights.name,),
+                parent_manifest=pretrain_manifest,
+            )
+            legacy_raw = json.loads(json.dumps(current_sft.raw))
+            legacy_raw["schema_version"] = PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION
+            legacy_raw["representation"]["contract_version"] = 2
+            legacy_raw["representation"].pop("codec_encoding_policy")
+            (sft_dir / MODEL_MANIFEST_FILENAME).write_text(
+                json.dumps(legacy_raw),
+                encoding="utf-8",
+            )
+            legacy_sft = load_model_manifest(sft_dir / MODEL_MANIFEST_FILENAME)
+
+            grpo_weights = grpo_dir / "pytorch_model.bin"
+            grpo_weights.write_bytes(b"grpo weights")
+            with self.assertRaisesRegex(
+                ModelManifestError,
+                "legacy representations cannot be relabeled",
+            ):
+                write_model_manifest(
+                    grpo_dir,
+                    config,
+                    stage="grpo",
+                    checkpoint_files=(grpo_weights.name,),
+                    parent_manifest=legacy_sft,
+                    parent_checkpoint_path=sft_weights,
+                )
+
+            self.assertFalse((grpo_dir / MODEL_MANIFEST_FILENAME).exists())
+
+    def test_public_grpo_writer_cannot_relabel_a_current_sft_representation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pretrain_dir = root / "pretrain"
+            sft_dir = root / "sft"
+            grpo_dir = root / "grpo"
+            pretrain_dir.mkdir()
+            sft_dir.mkdir()
+            grpo_dir.mkdir()
+            config = model_config("./codec/weights.pth")
+
+            _, pretrain_manifest = self._write(pretrain_dir, config)
+            sft_weights = sft_dir / "pytorch_model.bin"
+            sft_weights.write_bytes(b"sft weights")
+            sft_manifest = write_model_manifest(
+                sft_dir,
+                config,
+                stage="sft",
+                checkpoint_files=(sft_weights.name,),
+                parent_manifest=pretrain_manifest,
+            )
+            grpo_weights = grpo_dir / "pytorch_model.bin"
+            grpo_weights.write_bytes(b"grpo weights")
+            changed_config = dict(config)
+            changed_config["dacvae_sha256"] = "d" * 64
+
+            with self.assertRaisesRegex(ModelManifestError, "codec/frontend representation"):
+                write_model_manifest(
+                    grpo_dir,
+                    changed_config,
+                    stage="grpo",
+                    checkpoint_files=(grpo_weights.name,),
+                    parent_manifest=sft_manifest,
+                    parent_checkpoint_path=sft_weights,
+                )
+
+            self.assertFalse((grpo_dir / MODEL_MANIFEST_FILENAME).exists())
+
+    def test_legacy_schema3_manifest_preserves_raw_identity_and_old_topology(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root)
+            raw = json.loads(json.dumps(manifest.raw))
+            raw["schema_version"] = LEGACY_MODEL_MANIFEST_SCHEMA_VERSION
+            raw["representation"]["contract_version"] = 2
+            raw["representation"].pop("codec_encoding_policy")
+            raw["architecture"].pop("speaker_num_summary_tokens")
+            raw.pop("generation")
+            raw.pop("text_conditioning")
+            expected_sha256 = canonical_sha256(raw)
+            manifest_path = root / MODEL_MANIFEST_FILENAME
+            manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            loaded = load_model_manifest(manifest_path)
+
+            self.assertEqual(loaded.architecture["speaker_num_summary_tokens"], 0)
+            self.assertEqual(loaded.raw, raw)
+            self.assertEqual(loaded.sha256, expected_sha256)
+            self.assertNotIn("speaker_num_summary_tokens", loaded.raw["architecture"])
+            self.assertNotIn("codec_encoding_policy", loaded.representation)
+
+    def test_current_manifest_requires_the_exact_seeded_codec_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root)
+            manifest_path = root / MODEL_MANIFEST_FILENAME
+
+            mutations = {
+                "missing": lambda representation: representation.pop("codec_encoding_policy"),
+                "wrong": lambda representation: representation.__setitem__(
+                    "codec_encoding_policy",
+                    "posterior_mean_v1",
+                ),
+                "unknown": lambda representation: representation.__setitem__(
+                    "codec_seed",
+                    1,
+                ),
+            }
+            for name, mutate in mutations.items():
+                raw = json.loads(json.dumps(manifest.raw))
+                mutate(raw["representation"])
+                manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+                with self.subTest(name=name), self.assertRaises(ModelManifestError):
+                    load_model_manifest(manifest_path)
 
     def test_sft_rejects_language_and_cross_lingual_capability_downgrades(self):
         multilingual = model_config("./codec/a.pth")
@@ -272,36 +601,31 @@ class ModelManifestTest(unittest.TestCase):
             raw = json.loads((root / MODEL_MANIFEST_FILENAME).read_text(encoding="utf-8"))
             raw["representation"]["text_frontend_name"] = "another/frontend"
             (root / MODEL_MANIFEST_FILENAME).write_text(json.dumps(raw), encoding="utf-8")
-            incompatible = load_model_manifest(root / MODEL_MANIFEST_FILENAME)
-            with self.assertRaisesRegex(ModelManifestError, "text frontend"):
-                validate_inference_manifest(
-                    incompatible,
-                    checkpoint_path=weights,
-                    selected_filename=weights.name,
-                    architecture=incompatible.architecture,
-                    capabilities=incompatible.capabilities,
-                    codec_source="./codec/a.pth",
-                    codec_backend="bundled",
-                )
+            with self.assertRaisesRegex(
+                ModelManifestError,
+                "representation frontend contradicts",
+            ):
+                load_model_manifest(root / MODEL_MANIFEST_FILENAME)
 
     def test_partial_ema_inference_also_hashes_the_loaded_base(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            base = root / "pytorch_model.bin"
-            ema = root / "pytorch_model_ema.bin"
+            pretrain = root / "pretrain"
+            sft = root / "sft"
+            pretrain.mkdir()
+            sft.mkdir()
+            config = model_config("./codec/a.pth")
+            _, parent_manifest = self._write(pretrain, config)
+            base = sft / "pytorch_model.bin"
+            ema = sft / "pytorch_model_ema.bin"
             base.write_bytes(b"full base")
             ema.write_bytes(b"sparse ema")
             manifest = write_model_manifest(
-                root,
-                model_config("./codec/a.pth"),
+                sft,
+                config,
                 stage="sft",
                 checkpoint_files=(base.name, ema.name),
-                parent_manifest={
-                    "manifest_sha256": "a" * 64,
-                    "stage": "pretrain",
-                    "weights_sha256": "b" * 64,
-                    "representation_sha256": "c" * 64,
-                },
+                parent_manifest=parent_manifest,
             )
             base.write_bytes(b"tampered full base")
 
@@ -355,7 +679,7 @@ class ModelManifestTest(unittest.TestCase):
             manifest_filename=MODEL_MANIFEST_FILENAME,
             manifest_path=Path(MODEL_MANIFEST_FILENAME),
         )
-        checkpoint.infer_text_vocab_size.return_value = 100312
+        checkpoint.infer_text_vocab_size.return_value = 530
         checkpoint.infer_speaker_conditioning.return_value = False
         checkpoint.language_capability.return_value = LanguageCheckpointInfo(False)
         checkpoint.reference_language_capability.return_value = ReferenceLanguageCheckpointInfo(

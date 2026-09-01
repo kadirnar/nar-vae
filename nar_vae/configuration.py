@@ -18,13 +18,22 @@ from numbers import Real
 from pathlib import Path
 from typing import Any
 
+from nar_vae.objectives import (
+    DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
+    RECTIFIED_FLOW_OBJECTIVE,
+    normalize_generative_objective,
+    validate_diffusion_schedule_shift,
+)
+from nar_vae.tokenization import PAD_TOKEN, TOTAL_VOCAB_SIZE
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
     import tomli as tomllib
 
-SOLVERS = ("euler", "midpoint", "heun", "rk4")
+SOLVERS = ("ddim", "euler", "midpoint", "heun", "rk4")
 SOLVER_NFE_PER_STEP = {
+    "ddim": 1,
     "euler": 1,
     "midpoint": 2,
     "heun": 2,
@@ -54,6 +63,7 @@ _PRETRAINED_INITIALIZATION_KEYS = (
 )
 _CHECKPOINT_DIRECTORY = re.compile(r"checkpoint-[0-9]+")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_HUB_COMMIT = re.compile(r"[0-9a-fA-F]{40}")
 _RNG_STATE_ARTIFACT = re.compile(r"rng_state(?:_([0-9]+))?\.pth")
 _UNSUPPORTED_TRAINING_FIELDS = frozenset(
     {
@@ -75,7 +85,6 @@ _UNSUPPORTED_TRAINING_FIELDS = frozenset(
         "initial_ratio",
         "lr_min_ratio",
         "ratio",
-        "text_QA_dataset",
         "use_echodit",
         "validation_cfg_scale",
         "validation_ode_steps",
@@ -90,8 +99,10 @@ _TRAINING_BOOLEAN_FIELDS = frozenset(
         "allow_legacy_representation",
         "dataloader_drop_last",
         "dataloader_pin_memory",
+        "dataloader_persistent_workers",
         "ddp_find_unused_parameters",
         "do_validation",
+        "dynamic_reference_strict",
         "duration_predictor_use_speaker",
         "flow_velocity_weighted",
         "freeze_language_embedding",
@@ -103,6 +114,7 @@ _TRAINING_BOOLEAN_FIELDS = frozenset(
         "initialize_language_conditioning",
         "initialize_speaker_conditioning",
         "logging_first_step",
+        "muon_nesterov",
         "save_safetensors",
         "tf32",
         "torch_compile",
@@ -130,6 +142,7 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "allow_legacy_frame_length_inference",
         "allow_legacy_representation",
         "batch_size",
+        "batching_cost",
         "cfg_dropout",
         "cfg_dropout_speaker",
         "cfg_dropout_text",
@@ -145,9 +158,12 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "dataloader_drop_last",
         "dataloader_num_workers",
         "dataloader_pin_memory",
+        "dataloader_persistent_workers",
+        "dataloader_prefetch_factor",
         "ddp_bucket_cap_mb",
         "ddp_find_unused_parameters",
         "do_validation",
+        "dynamic_reference_strict",
         "duration_alignment_hidden_size",
         "duration_huber_delta",
         "duration_loss_weight",
@@ -157,6 +173,8 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "epochs",
         "flow_sigma_min",
         "flow_velocity_weighted",
+        "generative_objective",
+        "diffusion_schedule_shift",
         "frame_bucket_size",
         "freeze_first_n_layers",
         "freeze_language_embedding",
@@ -175,11 +193,21 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "mas_alignment_loss_weight",
         "mas_duration_loss_weight",
         "max_examples_per_batch",
+        "max_attention_cost_per_batch",
         "max_frames_per_batch",
         "max_grad_norm",
+        "max_reference_seconds",
         "mixed_precision",
+        "min_reference_seconds",
         "model_preset",
         "model_size",
+        "muon_adjust_lr_fn",
+        "muon_epsilon",
+        "muon_learning_rate",
+        "muon_momentum",
+        "muon_nesterov",
+        "muon_ns_steps",
+        "muon_weight_decay",
         "norm_eps",
         "num_heads",
         "num_layers",
@@ -189,6 +217,7 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "pretrained_checkpoint",
         "project_name",
         "report_to",
+        "reference_seed",
         "resume_from_checkpoint",
         "run_name",
         "save_folder",
@@ -196,15 +225,35 @@ _COMMON_TRAINING_FIELDS = frozenset(
         "save_steps",
         "save_total_limit",
         "seed",
+        "short_reference_max_seconds",
+        "short_reference_probability",
         "speaker_intermediate_size",
         "speaker_model_size",
         "speaker_num_heads",
         "speaker_num_layers",
+        "speaker_num_summary_tokens",
         "speaker_patch_size",
         "supported_languages",
         "supported_language_pairs",
         "supported_reference_languages",
+        "target_patch_size",
         "text_intermediate_size",
+        "text_conditioning_mode",
+        "conditioning_feature_size",
+        "conditioning_feature_dtype",
+        "frozen_text_alignment",
+        "frozen_text_cache_version",
+        "frozen_text_config_sha256",
+        "frozen_text_encoder_id",
+        "frozen_text_encoder_revision",
+        "frozen_text_frontend",
+        "frozen_text_hidden_layer",
+        "frozen_text_model_filename",
+        "frozen_text_model_sha256",
+        "frozen_text_tokenizer_filename",
+        "frozen_text_tokenizer_id",
+        "frozen_text_tokenizer_revision",
+        "frozen_text_tokenizer_sha256",
         "text_model_size",
         "text_num_heads",
         "text_num_layers",
@@ -961,6 +1010,19 @@ class AdamWSettings:
 
 
 @dataclass(frozen=True)
+class MuonSettings:
+    """Validated native-Muon hyperparameters for hidden linear weights."""
+
+    learning_rate: float
+    weight_decay: float
+    momentum: float
+    nesterov: bool
+    ns_steps: int
+    epsilon: float
+    adjust_lr_fn: str
+
+
+@dataclass(frozen=True)
 class CFGDropoutSettings:
     """Resolved training-time conditioning dropout probabilities."""
 
@@ -1009,6 +1071,8 @@ def resolve_frame_budget_batching(
             minimum=0,
         )
         max_frames = max_frames_value or None
+    if config.get("batching_cost", "frames") == "padded_attention" and max_frames is None:
+        raise ValueError("batching_cost: padded_attention requires max_frames_per_batch > 0.")
 
     raw_max_examples = config.get("max_examples_per_batch")
     if raw_max_examples is None:
@@ -1115,12 +1179,15 @@ def resolve_training_reporters(value: Any) -> tuple[str, ...]:
 
 
 def resolve_adamw_settings(config: Mapping[str, Any]) -> AdamWSettings:
-    """Validate the AdamW settings that are passed to ``TrainingArguments``."""
+    """Validate AdamW, including the auxiliary branch used with Muon."""
     optimizer = str(config.get("optimizer", "adamw")).strip().lower()
     implementations = {
         "adamw": "adamw_torch",
         "adamw_torch": "adamw_torch",
         "adamw_torch_fused": "adamw_torch_fused",
+        # Transformers 4.x does not recognize Muon. This valid sentinel is
+        # replaced by MuonTrainerMixin before Trainer constructs an optimizer.
+        "muon": "adamw_torch",
     }
     if optimizer not in implementations:
         choices = ", ".join(implementations)
@@ -1146,6 +1213,76 @@ def resolve_adamw_settings(config: Mapping[str, Any]) -> AdamWSettings:
         beta1=beta1,
         beta2=beta2,
         epsilon=epsilon,
+    )
+
+
+_MUON_CONFIG_FIELDS = frozenset(
+    {
+        "muon_adjust_lr_fn",
+        "muon_epsilon",
+        "muon_learning_rate",
+        "muon_momentum",
+        "muon_nesterov",
+        "muon_ns_steps",
+        "muon_weight_decay",
+    }
+)
+
+
+def resolve_muon_settings(config: Mapping[str, Any]) -> MuonSettings | None:
+    """Validate opt-in Muon controls and reject silently ignored Muon keys."""
+    optimizer = str(config.get("optimizer", "adamw")).strip().lower()
+    configured_fields = sorted(_MUON_CONFIG_FIELDS.intersection(config))
+    if optimizer != "muon":
+        if configured_fields:
+            raise ValueError(f"Muon-only fields require optimizer: muon: {configured_fields}.")
+        return None
+
+    raw_learning_rate = config.get("muon_learning_rate", config.get("learning_rate"))
+    raw_weight_decay = config.get("muon_weight_decay", config.get("weight_decay", 0.01))
+    raw_momentum = config.get("muon_momentum", 0.95)
+    raw_epsilon = config.get("muon_epsilon", 1e-7)
+    numerical = {
+        "muon_learning_rate": raw_learning_rate,
+        "muon_weight_decay": raw_weight_decay,
+        "muon_momentum": raw_momentum,
+        "muon_epsilon": raw_epsilon,
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value))
+        for value in numerical.values()
+    ):
+        raise ValueError("Muon learning rate, weight decay, momentum, and epsilon must be finite.")
+    learning_rate = float(raw_learning_rate)
+    weight_decay = float(raw_weight_decay)
+    momentum = float(raw_momentum)
+    epsilon = float(raw_epsilon)
+    if learning_rate <= 0.0:
+        raise ValueError("muon_learning_rate must be positive.")
+    if weight_decay < 0.0:
+        raise ValueError("muon_weight_decay must be non-negative.")
+    if not 0.0 <= momentum < 1.0:
+        raise ValueError("muon_momentum must be in [0, 1).")
+    if epsilon <= 0.0:
+        raise ValueError("muon_epsilon must be positive.")
+
+    nesterov = config.get("muon_nesterov", True)
+    if not isinstance(nesterov, bool):
+        raise ValueError("muon_nesterov must be a boolean.")
+    ns_steps = config.get("muon_ns_steps", 5)
+    if isinstance(ns_steps, bool) or not isinstance(ns_steps, int) or not 1 <= ns_steps < 100:
+        raise ValueError("muon_ns_steps must be an integer in [1, 100).")
+    adjust_lr_fn = config.get("muon_adjust_lr_fn", "match_rms_adamw")
+    if adjust_lr_fn not in {"original", "match_rms_adamw"}:
+        raise ValueError("muon_adjust_lr_fn must be 'original' or 'match_rms_adamw'.")
+    return MuonSettings(
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        momentum=momentum,
+        nesterov=nesterov,
+        ns_steps=ns_steps,
+        epsilon=epsilon,
+        adjust_lr_fn=adjust_lr_fn,
     )
 
 
@@ -1299,6 +1436,7 @@ def build_training_argument_overrides(config: Mapping[str, Any]) -> dict[str, An
         raise ValueError("warmup_steps must be non-negative and warmup_ratio must be in [0, 1).")
     if warmup_steps and warmup_ratio:
         raise ValueError("Set only one of warmup_steps and warmup_ratio.")
+    resolve_muon_settings(config)
     if config.get("use_fsdp", False):
         raise ValueError("use_fsdp is not implemented by this training entry point.")
     if config.get("use_flash_attention", False):
@@ -1341,7 +1479,13 @@ def build_training_argument_overrides(config: Mapping[str, Any]) -> dict[str, An
             overrides["torch_compile_mode"] = str(config["torch_compile_mode"])
     elif config.get("torch_compile_backend") or config.get("torch_compile_mode"):
         raise ValueError("torch_compile_backend/torch_compile_mode require torch_compile: true.")
-    for option in ("logging_dir", "logging_first_step", "tf32"):
+    for option in (
+        "dataloader_persistent_workers",
+        "dataloader_prefetch_factor",
+        "logging_dir",
+        "logging_first_step",
+        "tf32",
+    ):
         if option in config:
             overrides[option] = config[option]
     return overrides
@@ -1384,6 +1528,7 @@ def _validate_training_config_contract(config: Mapping[str, Any]) -> None:
 
     integer_options = {
         "batch_size": 1,
+        "dataloader_prefetch_factor": 1,
         "dataloader_num_workers": 0,
         "ddp_bucket_cap_mb": 1,
         "epochs": 1,
@@ -1391,12 +1536,81 @@ def _validate_training_config_contract(config: Mapping[str, Any]) -> None:
         "gradient_accumulation_steps": 1,
         "logging_steps": 1,
         "num_strata": 1,
+        "reference_seed": 0,
         "save_steps": 1,
         "save_total_limit": 1,
+        "speaker_num_summary_tokens": 0,
+        "target_patch_size": 1,
     }
     for name, minimum in integer_options.items():
         if name in config:
             _config_integer(config[name], name=name, minimum=minimum)
+    if config.get("speaker_num_summary_tokens", 0) > 0 and not config.get(
+        "use_speaker_conditioning", False
+    ):
+        raise ValueError("speaker_num_summary_tokens requires use_speaker_conditioning: true.")
+
+    batching_cost = config.get("batching_cost", "frames")
+    if batching_cost not in {"frames", "padded_attention"}:
+        raise ValueError("batching_cost must be 'frames' or 'padded_attention'.")
+    if "max_attention_cost_per_batch" in config:
+        _config_integer(
+            config["max_attention_cost_per_batch"],
+            name="max_attention_cost_per_batch",
+            minimum=1,
+        )
+    if batching_cost == "padded_attention" and "max_attention_cost_per_batch" not in config:
+        raise ValueError("batching_cost: padded_attention requires max_attention_cost_per_batch.")
+
+    workers = int(config.get("dataloader_num_workers", 0))
+    if workers == 0 and config.get("dataloader_persistent_workers", False):
+        raise ValueError("dataloader_persistent_workers requires dataloader_num_workers > 0.")
+    if workers == 0 and "dataloader_prefetch_factor" in config:
+        raise ValueError("dataloader_prefetch_factor requires dataloader_num_workers > 0.")
+
+    reference_seconds = {
+        "min_reference_seconds": config.get("min_reference_seconds", 3.0),
+        "short_reference_max_seconds": config.get("short_reference_max_seconds", 8.0),
+        "max_reference_seconds": config.get("max_reference_seconds", 12.0),
+    }
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+        for value in reference_seconds.values()
+    ):
+        raise ValueError("Dynamic reference durations must be finite positive numbers.")
+    minimum_reference = float(reference_seconds["min_reference_seconds"])
+    short_reference_maximum = float(reference_seconds["short_reference_max_seconds"])
+    maximum_reference = float(reference_seconds["max_reference_seconds"])
+    if not minimum_reference <= short_reference_maximum <= maximum_reference:
+        raise ValueError(
+            "Reference durations must satisfy min_reference_seconds <= "
+            "short_reference_max_seconds <= max_reference_seconds."
+        )
+    short_probability = config.get("short_reference_probability", 0.8)
+    if (
+        isinstance(short_probability, bool)
+        or not isinstance(short_probability, Real)
+        or not math.isfinite(float(short_probability))
+        or not 0.0 <= float(short_probability) <= 1.0
+    ):
+        raise ValueError("short_reference_probability must be a finite number in [0, 1].")
+    reference_options = {
+        "dynamic_reference_strict",
+        "max_reference_seconds",
+        "min_reference_seconds",
+        "reference_seed",
+        "short_reference_max_seconds",
+        "short_reference_probability",
+    }
+    configured_reference_options = sorted(reference_options.intersection(config))
+    if configured_reference_options and not config.get("use_speaker_conditioning", False):
+        raise ValueError(
+            "Dynamic reference options require use_speaker_conditioning: true: "
+            f"{configured_reference_options}."
+        )
 
     distribution = config.get("timestep_distribution", "stratified_logit_normal")
     if distribution not in {"uniform", "logit_normal", "stratified_logit_normal"}:
@@ -1406,6 +1620,16 @@ def _validate_training_config_contract(config: Mapping[str, Any]) -> None:
     flow_velocity_weighted = config.get("flow_velocity_weighted", False)
     if not isinstance(flow_velocity_weighted, bool):
         raise ValueError("flow_velocity_weighted must be a boolean.")
+    objective = normalize_generative_objective(
+        config.get("generative_objective", RECTIFIED_FLOW_OBJECTIVE)
+    )
+    schedule_shift = validate_diffusion_schedule_shift(
+        config.get("diffusion_schedule_shift", DEFAULT_DIFFUSION_SCHEDULE_SHIFT)
+    )
+    if objective == RECTIFIED_FLOW_OBJECTIVE and schedule_shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT:
+        raise ValueError(
+            "diffusion_schedule_shift is only meaningful with generative_objective: vp_diffusion_v."
+        )
     logit_fields = {
         "logit_normal_loc": config.get("logit_normal_loc", 0.0),
         "logit_normal_scale": config.get("logit_normal_scale", 1.0),
@@ -1449,6 +1673,116 @@ def _validate_training_config_contract(config: Mapping[str, Any]) -> None:
     allow_legacy_representation = config.get("allow_legacy_representation", False)
     if not isinstance(allow_legacy_representation, bool):
         raise ValueError("allow_legacy_representation must be a boolean.")
+    text_conditioning_mode = config.get("text_conditioning_mode", "scratch_tokens")
+    if text_conditioning_mode not in {"scratch_tokens", "frozen_features"}:
+        raise ValueError("text_conditioning_mode must be 'scratch_tokens' or 'frozen_features'.")
+    if text_conditioning_mode == "frozen_features":
+        _config_integer(
+            config.get("conditioning_feature_size"),
+            name="conditioning_feature_size",
+            minimum=1,
+        )
+        if config.get("text_num_layers", 0) != 0:
+            raise ValueError("frozen_features text conditioning requires text_num_layers: 0.")
+        if config.get("freeze_text_encoder", False):
+            raise ValueError(
+                "freeze_text_encoder would freeze the small trainable feature adapter; the "
+                "pretrained backbone is already external and frozen."
+            )
+        required_frozen_fields = {
+            "conditioning_feature_dtype",
+            "frozen_text_alignment",
+            "frozen_text_cache_version",
+            "frozen_text_config_sha256",
+            "frozen_text_encoder_id",
+            "frozen_text_encoder_revision",
+            "frozen_text_frontend",
+            "frozen_text_hidden_layer",
+            "frozen_text_model_filename",
+            "frozen_text_model_sha256",
+            "frozen_text_tokenizer_filename",
+            "frozen_text_tokenizer_id",
+            "frozen_text_tokenizer_revision",
+            "frozen_text_tokenizer_sha256",
+        }
+        missing_frozen = sorted(name for name in required_frozen_fields if config.get(name) is None)
+        if missing_frozen:
+            raise ValueError(
+                "frozen_features requires an immutable conditioner contract; missing: "
+                f"{missing_frozen}."
+            )
+        for name in ("frozen_text_encoder_id", "frozen_text_tokenizer_id"):
+            value = config[name]
+            if not isinstance(value, str) or value.count("/") != 1 or not all(value.split("/")):
+                raise ValueError(f"{name} must use the non-empty 'owner/name' Hub format.")
+        for name in ("frozen_text_encoder_revision", "frozen_text_tokenizer_revision"):
+            value = config[name]
+            if not isinstance(value, str) or not _HUB_COMMIT.fullmatch(value):
+                raise ValueError(f"{name} must be a full 40-character Hub commit.")
+        for name in (
+            "frozen_text_config_sha256",
+            "frozen_text_model_sha256",
+            "frozen_text_tokenizer_sha256",
+        ):
+            value = config[name]
+            if not isinstance(value, str) or not _SHA256.fullmatch(value):
+                raise ValueError(f"{name} must be a lowercase 64-character SHA-256.")
+        for name in ("frozen_text_model_filename", "frozen_text_tokenizer_filename"):
+            value = config[name]
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or Path(value).is_absolute()
+                or ".." in Path(value).parts
+            ):
+                raise ValueError(f"{name} must be a non-empty repository-relative filename.")
+        if config["conditioning_feature_dtype"] not in {"float16", "float32"}:
+            raise ValueError(
+                "conditioning_feature_dtype must be float16 or float32; prepared Arrow "
+                "datasets do not losslessly preserve bfloat16."
+            )
+        if config["frozen_text_frontend"] not in {"phonemes", "raw_text"}:
+            raise ValueError("frozen_text_frontend must be 'phonemes' or 'raw_text'.")
+        if config["frozen_text_alignment"] != "hf_non_special_tokens_v1":
+            raise ValueError(
+                "frozen_text_alignment must be the versioned hf_non_special_tokens_v1 policy."
+            )
+        _config_integer(
+            config["frozen_text_cache_version"],
+            name="frozen_text_cache_version",
+            minimum=1,
+        )
+        hidden_layer = config["frozen_text_hidden_layer"]
+        if isinstance(hidden_layer, bool) or not isinstance(hidden_layer, int):
+            raise ValueError("frozen_text_hidden_layer must be an integer layer index.")
+    else:
+        if config.get("conditioning_feature_size") not in (None, 0):
+            raise ValueError(
+                "conditioning_feature_size is only valid for frozen_features text conditioning."
+            )
+        unexpected_frozen = sorted(name for name in config if name.startswith("frozen_text_"))
+        if unexpected_frozen:
+            raise ValueError(
+                "Frozen text conditioner fields require text_conditioning_mode: "
+                f"frozen_features: {unexpected_frozen}."
+            )
+
+    if "text_vocab_size" in config or "pad_token" in config:
+        text_vocab_size = _config_integer(
+            config.get("text_vocab_size"),
+            name="text_vocab_size",
+            minimum=1,
+        )
+        pad_token = _config_integer(config.get("pad_token"), name="pad_token", minimum=0)
+        if (
+            text_conditioning_mode == "scratch_tokens"
+            and not allow_legacy_representation
+            and (text_vocab_size != TOTAL_VOCAB_SIZE or pad_token != PAD_TOKEN)
+        ):
+            raise ValueError(
+                "Current prepared data requires the versioned compact frontend contract: "
+                f"text_vocab_size={TOTAL_VOCAB_SIZE} and pad_token={PAD_TOKEN}."
+            )
     resolve_training_cfg_dropout(config)
 
 
@@ -1783,6 +2117,7 @@ __all__ = [
     "GenerationConfig",
     "InferenceSettings",
     "MixedPrecisionSettings",
+    "MuonSettings",
     "build_training_argument_overrides",
     "bind_training_dataset_identity",
     "cfg_guidance_active",
@@ -1793,6 +2128,7 @@ __all__ = [
     "resolve_adamw_settings",
     "resolve_frame_budget_batching",
     "resolve_mixed_precision",
+    "resolve_muon_settings",
     "resolve_same_run_resume",
     "resolve_training_cfg_dropout",
     "resolve_training_reporters",

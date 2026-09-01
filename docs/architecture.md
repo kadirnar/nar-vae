@@ -1,253 +1,200 @@
-# NAR-VAE Architecture and Training Plan
+# Architecture
 
-NAR-VAE is a non-autoregressive diffusion and flow-matching TTS library. Its model-training path
-starts from random initialization. It must not import a third-party TTS checkpoint, silently adapt
-the legacy Echo checkpoint, or claim multilingual, speaker, duration, or streaming capability
-before the corresponding weights and evaluation evidence exist.
+The current NAR-VAE architecture is a non-autoregressive conditional latent-diffusion TTS model.
+New checkpoints train a cosine variance-preserving process with v-prediction. A separately supplied DACVAE maps audio to
+and from continuous latents and remains frozen and unchanged during preparation, pretraining, SFT,
+GRPO compatibility checks, and inference.
 
-This document separates implemented software contracts from research that requires server-side
-training. No architecture choice by itself guarantees natural speech or low word-error rate.
+No architecture guarantees high quality by construction. All quality and speed claims require a
+trained export plus held-out evaluation.
+
+## End-to-end data flow
+
+```text
+                                       +-- duration / MAS -------------------+
+                                       |                                     |
+phones -> frozen XPhoneBERT -> adapter +-- text K/V ------------------------+|
+                                                                             vv
+noise / noisy DACVAE target ----------------------------------------------> EchoDiT -> latent
+                                                                             ^
+reference audio -> unchanged DACVAE -> bidirectional reference encoder       |
+                                      -> learned-query resampler ------------+
+
+generated latent -> unchanged DACVAE decoder -> waveform
+```
+
+The heavyweight text backbone and DACVAE are dependencies, not acoustic checkpoint parameters.
+Only the feature adapter, reference path, alignment/duration modules, language state, and DiT are
+optimized in canonical pretraining.
+
+## Strict VP diffusion
+
+The library uses generation-direction time: `t=0` is noise and `t=1` is clean data. For clean
+latent `x`, noise `epsilon`, and `phi=pi*t/2`:
+
+```text
+alpha = sin(phi)
+sigma = cos(phi)
+x_t = alpha * x + sigma * epsilon
+v = sigma * x - alpha * epsilon
+```
+
+This is a variance-preserving path because `alpha^2 + sigma^2 = 1`. The optional positive
+schedule shift modifies log-SNR and renormalizes both coefficients. Generic Euler, midpoint,
+Heun, and RK4 sampling convert predicted v to the probability-flow derivative with the exact
+shift-dependent chain factor. Deterministic DDIM instead reconstructs clean/noise and advances
+analytically between schedule points.
+
+DDIM rejects options that would silently change the trained prior or terminal distribution:
+non-unit initial noise scale, post-hoc target standard deviation, temporal score rescaling, and
+unvalidated step-cache extrapolation. The 32/16/8 profiles are evaluation candidates, not quality
+guarantees.
+
+The checkpoint stores the objective code and schedule shift atomically. Absence of objective
+metadata has one legacy meaning: the old straight rectified-flow path. A VP checkpoint missing its
+shift, or a flow checkpoint carrying diffusion metadata, is rejected.
+
+## Frozen multilingual text states
+
+Canonical training does not learn a text Transformer from token IDs. A pinned XPhoneBERT provider
+runs outside the acoustic model and returns, on one shared token axis:
+
+- provider token IDs;
+- contextual hidden states;
+- attention and MAS-alignment masks;
+- per-token language IDs;
+- cache version and full provider-contract digest.
+
+The acoustic checkpoint contains only a `768 -> text_model_size` adapter plus optional learned
+language embeddings. Input features are detached at the adapter boundary. The provider is absent
+from the module tree, optimizer, DDP state, and acoustic checkpoint.
+
+Canonical `phonemes` mode follows XPhoneBERT's native word-segmented phoneme input. Every language
+needs reviewed phones or a separately pinned and evaluated normalization/G2P pipeline. Provider
+unknown tokens, invented style/control phones, changed artifact bytes, and cache-contract mismatch
+fail closed. Code-switched spans may carry independent language IDs only when tokenizer offsets
+preserve their boundaries.
+
+The legacy compact token frontend and scratch text Transformer remain available only for legacy
+checkpoint compatibility. They are not the canonical new-training topology.
+
+## Reference-audio voice cloning
+
+Prepared storage keeps one target DACVAE latent per utterance. During training, the dynamic
+reference wrapper chooses another recording with the same namespaced speaker ID and a different
+utterance ID/audio hash. It crops a deterministic patch-aligned reference, normally 3–12 seconds,
+and never passes the speaker ID into the model.
+
+The reference encoder:
+
+1. patches codec latents in time;
+2. applies bidirectional self-attention;
+3. includes a learned global timbre state;
+4. uses eight learned cross-attention queries to resample arbitrary reference length to a fixed
+   speaker context.
+
+Eight is checkpointed architecture, not an inference knob. Null speaker CFG uses the same fixed
+token shape and an explicit mask, so conditional/unconditional branches cannot drift in topology.
+Set the count to zero only to construct a legacy checkpoint with its original uncompressed state.
+
+The bottleneck bounds DiT cross-attention cost and discourages direct transcript copying, but it
+does not prove content leakage is gone. Release evaluation must include same/different transcript,
+short/long, same/cross-language, shuffled-reference, and multi-reference probes.
+
+## Duration and monotonic alignment
+
+Canonical pretraining jointly learns duration with exact monotonic alignment search (MAS):
+
+1. a text prior predicts diagonal-Gaussian statistics for alignable text states;
+2. a fixed orthonormal projection maps detached clean DACVAE frames to the alignment space;
+3. batched dynamic programming finds a maximum-likelihood monotonic path;
+4. the hard path supplies per-token duration targets and exact frame-level text expansion;
+5. a speaker-aware predictor learns token contributions and total frame count.
+
+Only pronunciation-bearing provider tokens own acoustic frames. BOS/EOS, padding, boundaries,
+punctuation, and non-alignable marks remain visible to contextual attention but receive zero
+duration. Training and inference use the cached frozen state for duration, MAS, DiT text K/V, and
+CFG; the provider is not rerun inside the diffusion trajectory.
+
+## EchoDiT
+
+EchoDiT operates on packed continuous DACVAE targets and combines:
+
+- latent self-attention and joint text/reference K/V attention;
+- RMSNorm, RoPE, QK normalization, gated attention/MLP outputs, and low-rank AdaLN-Zero;
+- global target-language conditioning in the timestep/AdaLN path;
+- per-token language state in the text adapter;
+- MAS-expanded frame text added to the latent stream;
+- learned null text and fixed-shape null speaker states for CFG;
+- exact target packing/unpacking stored as `target_patch_size`.
+
+`P2` is the canonical efficiency candidate and shortens the target attention sequence by two.
+`P1` is the quality control; `P4` must remain an explicit ablation until WER, speaker similarity,
+and listening tests justify it. Packing happens after codec encoding and never modifies DACVAE.
+
+## Parameter and compute accounting
+
+For the canonical frozen-text, multilingual, voice-conditioned, duration/MAS topology with eight
+speaker summaries, trainable counts range from 3.60M (`nano`) to 556.22M (`xlarge`); `small` is
+44.85M. Counts exclude:
+
+- the frozen 88M-class XPhoneBERT, used offline during preparation and once per inference request;
+- the immutable DACVAE codec;
+- optimizer state and activation memory.
+
+These categories must be reported separately. Saying "44.85M" does not mean the entire inference
+process has only 44.85M resident parameters.
+
+Cost-reduction paths that preserve the declared objective include cached text states, target P2
+packing, fixed speaker summaries, BF16, non-reentrant activation checkpointing, deterministic cost
+buckets, exact global valid-element normalization, persistent workers, DDP, and one invariant
+conditioning encode per trajectory.
+
+Optional experiments include fused AdamW, Muon, compilation, TF32, alternate attention kernels,
+larger target patches, distillation, and calibrated branch/temporal skipping. Each needs numerical
+and quality parity tests on the target hardware/checkpoint.
+
+## Manifests and compatibility
+
+An exported model manifest binds:
+
+- all tensor-shaping architecture, including target patch and speaker-summary count;
+- VP/flow objective and diffusion schedule;
+- frozen text provider revisions, filenames, hashes, feature layer/dtype, alignment and cache
+  versions;
+- language and target/reference-pair capability;
+- duration and MAS topology;
+- DACVAE source, revision, filename, byte hash, backend, sample rate, hop length, latent width, and
+  the content-seeded sampled-posterior encoding policy;
+- stage lineage and exact weight hashes.
+
+Checkpoint inspectors validate topology before constructing a model. Inference authenticates the
+manifest and weights before deserialization when using the built-in loader. Missing or conflicting
+new metadata is not inferred from tensor shapes when doing so would be ambiguous.
+
+Current exports use model-manifest schema 5 and prepared-representation contract 3. Schema-3 and
+schema-4 manifests remain readable without adding fields to their raw representation mappings, so
+their canonical hashes do not change. They are inference compatibility inputs only: GRPO/current
+export refuses to relabel their legacy unbound posterior sampling as the seeded v1 policy.
 
 ## Training stages
 
-Codec training is not implemented. Every current stage requires a separately trained DACVAE
-artifact, verifies its exact identity, and keeps it outside the acoustic optimizer. Consequently,
-the current pipeline is acoustic-model scratch training, not end-to-end codec-plus-TTS training.
+1. **Pretraining** randomly initializes the acoustic adapter, speaker/resampler, language,
+   duration/MAS, and DiT parameters. It consumes frozen cached text states and accepts no external
+   TTS checkpoint.
+2. **SFT** continues one manifest-bound NAR-VAE pretraining export with identical objective,
+   provider, codec, and tensor topology unless an explicitly supported versioned expansion path is
+   selected.
+3. **GRPO** currently implements rectified-flow SDE ratios only and therefore rejects VP
+   checkpoints. A diffusion-native policy objective must be derived and tested before canonical
+   VP models can use that stage.
 
-1. **Acoustic pretraining** initializes every NAR-VAE text, duration, speaker, language, and flow
-   parameter randomly and optimizes paired text/audio latents. This is the required first model
-   stage and never accepts a pretrained TTS checkpoint.
-2. **SFT** continues only a NAR-VAE checkpoint produced by the pretraining stage. Full-parameter
-   SFT is the reference path; parameter-efficient adapters are optional experiments.
-3. **Future few-step distillation** may use only the project's own converged teacher. Quality,
-   balanced, and turbo students would be different trained checkpoints, not runtime switches that
-   invent quality; this repository does not yet provide a distillation trainer.
-4. **Preference/RL post-training** is optional and the implemented GRPO entry point follows only a
-   converged, hash-bound SFT export descended from this project's scratch pretraining stage.
-   Flow-native GRPO needs stochastic trajectories, a frozen reference, KL/flow-loss anchoring,
-   supervised replay, and independent evaluation. It is not a conventional supervised loss.
+## Evaluation gates
 
-Resuming an interrupted pretraining or SFT run is fail closed. Rank zero atomically creates an
-immutable `run_manifest.json`, then synchronizes its run UUID, stage, library, and normalized
-configuration identity across ranks. Dataset preparation writes
-`nar_vae_dataset_manifest.json`, an exact SHA-256 inventory of the materialized prepared dataset;
-it deliberately does not crawl the raw-audio source tree. A local training run verifies that
-inventory, row metadata, and the persisted Dataset state fingerprint before run creation. A remote
-run requires a full Hub commit SHA, rejects executable dataset builders, and verifies that same
-byte manifest in the commit-contained prepared snapshot. That
-resolved data identity is part of both the normalized configuration hash and run manifest. Only
-`resume_from_checkpoint` is excluded from the configuration hash. Each completed `checkpoint-N`
-seals the full Trainer/flow artifact set in `checkpoint_manifest.json`; `true` scans newest first
-and selects the latest completely validated checkpoint, skipping incomplete or invalid candidates
-from that immutable run. An explicitly named `checkpoint-N` remains fail closed. Resume
-re-resolves the data identity first, so modified local artifacts or a different Hub identity cannot
-reach Trainer checkpoint loading. SFT additionally requires its original pretraining lineage and,
-when configured, both resumable and export EMA artifacts. Resume is distinct from initializing
-pretraining with another model.
+Every trained preset and language pair should report WER/CER, insertion/deletion/substitution
+rates, seen/unseen speaker similarity, cross-language similarity, duration error, repetition,
+truncation, silence and clipping rates, perceptual metrics, and blinded listening comparisons.
+Also report data hours, speaker/language balance, GPU and precision, trainable/resident parameter
+counts, GPU-hours, peak memory, throughput, real-time factor, and latency percentiles.
 
-## Target architecture
-
-### Compact latent space
-
-The current bundled DACVAE produces 128-dimensional latents at about 86 frames per second. That
-makes global attention and every ODE evaluation expensive. Server experiments should compare
-continuous waveform-VAE latents at 32 and 64 dimensions and approximately 12 and 24 frames per
-second. Codec reconstruction alone is not the selection metric: every candidate must be evaluated
-through downstream TTS WER/CER, speaker similarity, naturalness, and artifact rates.
-
-[SimpleSpeech 2](https://arxiv.org/abs/2408.13893) and
-[LongCat-AudioDiT](https://arxiv.org/abs/2603.29339) motivate compact-latent ablations, but their
-chosen dimensions are hypotheses rather than universal constants.
-
-### Small and base flow models
-
-The intended small zero-shot model is a hierarchical one-dimensional OT-CFM transformer rather
-than a flat, full-resolution DiT. The training experiments should combine:
-
-- multiscale temporal stages or temporal patching;
-- local/depthwise convolution before global attention;
-- text cross-attention plus temporal reference-prompt tokens;
-- rotary position embeddings and QK normalization;
-- adaLN-Zero conditioning on timestep, target language, and style;
-- a 40–80M small target and an approximately 120M base target.
-
-[ZipVoice](https://arxiv.org/abs/2506.13053) provides direct evidence for a hierarchical,
-multilingual, few-step speech model, while [P-Flow](https://research.nvidia.com/labs/adlr/projects/pflow/)
-supports data-efficient prompt-conditioned flow matching. Results from those systems are not
-quality claims for NAR-VAE until reproduced on NAR-VAE data and checkpoints.
-
-For constrained single-speaker deployments, a separate 10–25M convolution/transformer U-Net
-preset should be evaluated. [Matcha-TTS](https://arxiv.org/abs/2309.03199) reports an 18.2M
-acoustic model with strong low-NFE results, and [LightGrad](https://arxiv.org/abs/2308.16569)
-reports a smaller diffusion model. Those experiments do not establish multilingual zero-shot
-quality.
-
-### Text and language conditioning
-
-The frontend is versioned with the checkpoint:
-
-- single-language models may use a compact grapheme or phoneme vocabulary;
-- multilingual models use normalized multilingual subwords with an optional IPA/phoneme channel;
-- target language is encoded both per token and globally;
-- reference-audio language remains separate and cannot drive target pronunciation;
-- batches are balanced by language, then speaker/domain and approximate frame count.
-
-Evaluation is split by language, speaker, text length, reference language, and seen/unseen pair.
-A configuration list cannot create multilingual capability without trained tensors and metadata.
-
-### Artifact and representation binding
-
-Every new acoustic export carries `nar_vae_manifest.json`. It binds all weight files actually used
-at inference (including the full base under a sparse EMA overlay), active architecture topology,
-trained capability declarations, frontend version, codec source/backend, pinned Hub commit and
-filename where applicable, codec byte SHA-256, sample rate, hop length, and latent width. Prepared
-rows carry the same representation contract. Fresh SFT preserves it exactly; the only permitted
-speaker-topology change is an explicit text-only to speaker-conditioned initialization. Inference
-hashes the selected acoustic artifact and any required EMA base before checkpoint deserialization,
-then hashes codec bytes before codec deserialization. A same-width replacement codec is therefore
-not considered compatible.
-
-### Duration and alignment
-
-There is no universally best duration method. Canonical new scratch pretraining enables an optional,
-independently versioned MAS capability for the small and low-resource baseline. A compact text prior
-scores a fixed projection of clean target latents; a detached monotonic search supplies hard paths,
-while selected likelihoods and positive per-token `log1p` duration predictions remain
-differentiable. Stable largest-remainder allocation gives every valid token at least one frame and
-exactly matches a requested utterance total. Checkpoint tensors and metadata gate the capability;
-SFT must match its parent and configuration alone cannot add it.
-
-This implementation treats every unmasked conditioning token, including boundary tokens, as an
-alignable token. Dataset preflight therefore requires at least as many valid codec frames as tokens.
-The flow DiT keeps global cross-attention to unexpanded token states and adds a learned projection of
-the MAS-expanded text state to each latent frame. Training computes one hard path from clean-latent
-likelihoods and reuses it for both the duration objective and velocity conditioning. Inference
-allocates predicted token contributions to the exact requested frame total, expands once, and reuses
-that prepared frame state across the ODE trajectory and every CFG branch.
-
-Online MAS is correct but sequential over rows and frames, so it is not a fast or fully parallel
-training path. The
-[official Matcha-TTS extraction guidance](https://github.com/shivammehta25/Matcha-TTS/wiki/Extracting-phoneme-alignments-and-improving-GPU-utilisation)
-recommends fixing extracted alignments once they stabilize to improve utilization. Persisted
-duration ingestion is not implemented yet and remains a measured follow-up rather than a current
-speed claim. Duration evaluation includes insertions, deletions, truncation, long-form stability,
-and duration error.
-
-An alignment-free DiT may retain a learned utterance-length distribution for high-data
-experiments. Prompt text/audio ratios are only a fallback: [F5-TTS](https://arxiv.org/abs/2410.06885)
-documents that its inference duration estimate is heuristic, whereas
-[Matcha-TTS](https://arxiv.org/abs/2309.03199) uses monotonic alignment and a learned duration
-predictor. Neither the compatibility heuristic nor a learned predictor is allowed to truncate at
-the inference ceiling: an over-limit estimate fails so the caller can split or reject the request.
-Batch `max_duration` is likewise a validation limit, never a clipping operation.
-
-## Efficient DiT pretraining
-
-The portable training contract supports CPU construction and server-side CUDA execution. The
-first implementation priorities are correctness and reproducibility:
-
-- DDP with one process per GPU when the model fits;
-- real non-reentrant activation checkpointing around text, speaker, and DiT blocks;
-- BF16, FP16 with scaling, and FP32 modes selected explicitly;
-- deterministic frame-budget buckets and distributed sampler epochs;
-- global valid-frame loss normalization across ranks;
-- AdamW as the supported baseline, with fused AdamW only after runtime capability checks;
-- optional compilation on stable model regions and length buckets;
-- PyTorch SDPA by default, with a pinned, optional
-  [Hugging Face Flash Attention 3 kernel](https://huggingface.co/kernels-community/flash-attn3)
-  only on compatible CUDA servers and only after numerical parity checks;
-- EMA updated after successful optimizer steps, not per microbatch;
-- mandatory rank-zero-only W&B logging, with offline mode available for isolated servers;
-- FSDP as a later option after DDP parity, with block-level wrapping and distributed checkpoints.
-
-The current Trainer entry points optimize training batches only. They do not construct a held-out
-dataset or decode generated audio during training, so `do_validation: true` is rejected instead of
-loading a codec and silently reporting no validation metrics. Server runs must evaluate each
-exported checkpoint with explicit, versioned ASR, acoustic, speaker, and listening evaluators.
-
-PyTorch documents the relevant behavior for
-[DDP](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html),
-[activation checkpointing](https://docs.pytorch.org/docs/stable/checkpoint.html),
-[AMP](https://docs.pytorch.org/docs/stable/amp.html), and
-[FSDP](https://docs.pytorch.org/docs/stable/fsdp.html). W&B recommends rank-zero-only logging for
-the common DDP setup in its [distributed training guide](https://docs.wandb.ai/models/track/log/distributed-training).
-
-Architecture-training ablations include OT pairing, uniform versus logit-normal timesteps,
-temporal patch size, local/global attention ratios, and project-trained or self-distilled auxiliary
-representation alignment. External pretrained representation encoders are excluded by the
-from-scratch contract. The current scratch initializer uses shape-compatible adaLN-Zero gates and
-condition projections; strict checkpoint loading overwrites that initialization. Ablations are never
-enabled solely because they improved image generation.
-
-## Inference profiles
-
-The packaged profile names are compatibility labels for exact numerical contracts, not evidence of
-quality or speed. They do not select or imply a checkpoint. The current uncalibrated starting points
-are:
-
-- **quality:** 50 Heun steps (100 neural-function evaluations), uncached;
-- **balanced:** 32 Euler steps, uncached;
-- **fast:** 16 Euler steps, uncached;
-- **turbo:** the same 16 Euler steps with experimental Cache-DiT reuse.
-
-Every packaged profile uses neutral conditional inference (`cfg_scale=1`, joint mode) and no
-independent text- or speaker-guidance contribution. Non-neutral guidance, fewer steps, altered
-noise, and temporal or latent rescaling require checkpoint-specific acoustic evaluation before
-deployment. In particular, a profile label does not turn a teacher into a distilled student.
-
-Solver, schedule, precision, initial-noise scale, guidance behavior, and checkpoint identity are
-part of the evaluation key. Distillation uses only a NAR-VAE teacher created by the project's own
-pretraining stage. [FlashSpeech](https://arxiv.org/abs/2404.14700) and
-[CoMoSpeech](https://arxiv.org/abs/2305.06908) motivate few-step experiments, but do not justify
-changing a teacher checkpoint's step count without retraining.
-
-Prepared text and reference conditioning are computed once per request and reused at every ODE
-evaluation. Compatible requests may share a tensor batch; incompatible shape, checkpoint,
-language, precision, CFG, or solver state must not be mixed.
-
-Cache-DiT remains an optional, fail-closed accelerator for calibrated multi-step models. Cache
-state is request-local, conditional and unconditional branches remain separate, and state resets
-on every utterance, shape, language, speaker, CFG, precision, solver, or checkpoint change. It is
-unlikely to help an already distilled one- to four-step student and it does not create true
-streaming. See the [official Cache-DiT repository](https://github.com/vipshop/cache-dit).
-
-True streaming requires a separately trained blockwise/local generator and causal codec. The
-current global ODE plus full-utterance decode reports complete-waveform latency only.
-
-## SFT and GRPO
-
-SFT is supervised continuation of a compatible NAR-VAE pretraining checkpoint. It must validate
-the architecture, codec, text frontend, language registry, speaker layout, and training stage
-before loading weights.
-
-GRPO is experimental because a deterministic flow ODE does not expose a stochastic policy
-likelihood. [F5R-TTS](https://arxiv.org/abs/2504.02407) defines a probabilistic flow policy during
-training; [FlowTTS-GRPO](https://arxiv.org/abs/2606.23190) instead constructs stochastic
-trajectories for an already pretrained deterministic flow. A NAR-VAE implementation must include:
-
-- groups with identical text, reference, target language, and duration constraints;
-- stochastic rollouts and trajectory log-probabilities;
-- clipped ratios, a frozen reference, KL limits, and flow-loss replay;
-- language-appropriate ASR WER/CER, speaker similarity, and perceptual-quality rewards;
-- penalties for silence, clipping, truncation, repetition, nonfinite audio, and pathological
-  duration;
-- independent held-out evaluators and human listening tests to detect reward hacking.
-
-Published flow-TTS GRPO is compute-intensive. It is a post-training option, not a prerequisite for
-a low-cost baseline.
-
-## Release gates
-
-No checkpoint is described as high quality, low WER, multilingual, zero-shot, fast, or streaming
-until a server run records:
-
-- dataset and license/provenance manifests;
-- checkpoint, codec, frontend, and evaluator hashes;
-- parameter count, GPU type, precision, batch/frame budget, and training compute;
-- held-out WER or CER by language, including insertion/deletion/substitution rates;
-- speaker similarity, intelligibility, perceptual metrics, and human A/B results;
-- quality-versus-NFE and quality-versus-cache curves;
-- peak allocated/reserved memory, throughput, latency percentiles, and failure rates.
-
-The software can make these experiments reproducible; only trained artifacts and measurements can
-establish their results.
+See [research_2025_2026.md](research_2025_2026.md) for the evidence and ablation plan.

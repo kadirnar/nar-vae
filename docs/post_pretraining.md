@@ -104,7 +104,6 @@ prepare_finetune_dataset(
     split="train",
     dacvae_model="facebook/dacvae-watermarked",
     dacvae_revision="8680102d141858a21bd533543966a2eb2e569f92",
-    dacvae_filename="weights.pth",
     dacvae_sha256="573cf4770ea4a25507f26965d05ae720bcd34295a9f60c06ef3c3805826b68e4",
     dacvae_backend="bundled",
     speaker_id_column="speaker_id",
@@ -191,10 +190,17 @@ That is evidence for an experiment, not permission to adopt its exact data scale
 unconsented voices, or relabel Echo as transcript-free. Synthetic prompts must preserve split
 isolation and pass license, identity, and artifact audits.
 
-### Stage 5 — Optional flow-native GRPO and human preference refinement
+### Stage 5 — Flow-checkpoint-only GRPO experiment
 
-Start only from a converged, hash-bound NAR-VAE SFT export whose manifest retains its NAR-VAE
-scratch-pretraining parent. Distilled, third-party, legacy, pretraining-only, and already-GRPO
+The implemented GRPO likelihood and rollout equations are rectified-flow-specific. They reject
+the canonical `vp_diffusion_v` checkpoints described in this repository; changing a config label
+does not make the policy objective diffusion-native. Do not schedule this stage for the new VP
+model until its transition density, timestep weighting, replay contract, and tests have been
+derived for VP diffusion.
+
+For a separately maintained legacy rectified-flow experiment, start only from a converged,
+hash-bound NAR-VAE SFT export whose manifest retains its NAR-VAE
+scratch-pretraining parent. Third-party, legacy, pretraining-only, and already-GRPO
 weights are not accepted as a fresh reference. Copy the packaged
 `nar_vae.post_training.DEFAULT_GRPO_CONFIG_PATH`, point `parent_checkpoint` at the SFT
 `final/flow_model/pytorch_model.bin`, and call `grpo_post_train(config_path, reward=...)` from a

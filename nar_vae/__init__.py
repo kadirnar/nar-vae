@@ -22,6 +22,19 @@ _LAZY_EXPORTS = {
     "FlowMatchingEchoDiT": ("nar_vae.models", "FlowMatchingEchoDiT"),
     "FlowMatchingLoss": ("nar_vae.losses", "FlowMatchingLoss"),
     "FlowMatchingTTSInference": ("nar_vae.inference", "FlowMatchingTTSInference"),
+    "FrozenTextConditioning": (
+        "nar_vae.frozen_text_provider",
+        "FrozenTextConditioning",
+    ),
+    "FrozenTextProvider": ("nar_vae.frozen_text_provider", "FrozenTextProvider"),
+    "FrozenTextProviderSpec": (
+        "nar_vae.frozen_text_provider",
+        "FrozenTextProviderSpec",
+    ),
+    "resolve_frozen_text_provider": (
+        "nar_vae.frozen_text_provider",
+        "resolve_frozen_text_provider",
+    ),
     "FlowGRPOConfig": ("nar_vae.post_training", "FlowGRPOConfig"),
     "FlowGRPOTrainer": ("nar_vae.post_training", "FlowGRPOTrainer"),
     "GRPOStageConfig": ("nar_vae.post_training", "GRPOStageConfig"),

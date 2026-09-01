@@ -7,11 +7,21 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from nar_vae.dacvae.loader import HubDACVAESource, describe_dacvae_source
+from nar_vae.dacvae_encoding import DACVAE_POSTERIOR_SAMPLING_POLICY
+from nar_vae.tokenization import (
+    TEXT_FRONTEND_NAME as ACTIVE_TEXT_FRONTEND_NAME,
+)
+from nar_vae.tokenization import (
+    TEXT_FRONTEND_VERSION as ACTIVE_TEXT_FRONTEND_VERSION,
+)
 
 REPRESENTATION_CONTRACT_COLUMN = "representation_contract"
-REPRESENTATION_CONTRACT_VERSION = 2
-TEXT_FRONTEND_NAME = "nar_vae.encode_tts_text/cl100k_base"
-TEXT_FRONTEND_VERSION = 1
+REPRESENTATION_CONTRACT_VERSION = 3
+PREPARED_ROW_VERSION_COLUMN = "prepared_row_version"
+PREPARED_ROW_VERSION = 2
+TEXT_FRONTEND_NAME = ACTIVE_TEXT_FRONTEND_NAME
+TEXT_FRONTEND_VERSION = ACTIVE_TEXT_FRONTEND_VERSION
+LEGACY_TEXT_FRONTENDS = frozenset({("nar_vae.encode_tts_text/cl100k_base", 1)})
 
 
 class RepresentationContractError(ValueError):
@@ -30,6 +40,7 @@ class RepresentationContract:
     codec_revision: str | None
     codec_filename: str | None
     codec_sha256: str
+    codec_encoding_policy: str
     sample_rate: int
     hop_length: int
     latent_width: int
@@ -65,11 +76,23 @@ def build_representation_contract(
     codec: Any,
     *,
     codec_source: str | os.PathLike[str] | HubDACVAESource,
+    text_frontend_name: str = TEXT_FRONTEND_NAME,
+    text_frontend_version: int = TEXT_FRONTEND_VERSION,
 ) -> RepresentationContract:
     """Build a contract from the codec instance actually used for preparation."""
     source = describe_dacvae_source(codec_source)
     if not source.identifier.strip():
         raise RepresentationContractError("codec_source must be non-empty.")
+    if (
+        not isinstance(text_frontend_name, str)
+        or not text_frontend_name.strip()
+        or text_frontend_name != text_frontend_name.strip()
+    ):
+        raise RepresentationContractError("text_frontend_name must be a normalized string.")
+    text_frontend_version = _positive_integer(
+        text_frontend_version,
+        name="text_frontend_version",
+    )
 
     backend = getattr(codec, "nar_vae_backend", None)
     if not isinstance(backend, str) or not backend.strip():
@@ -96,13 +119,14 @@ def build_representation_contract(
 
     return RepresentationContract(
         contract_version=REPRESENTATION_CONTRACT_VERSION,
-        text_frontend_name=TEXT_FRONTEND_NAME,
-        text_frontend_version=TEXT_FRONTEND_VERSION,
+        text_frontend_name=text_frontend_name,
+        text_frontend_version=text_frontend_version,
         codec_source=source.identifier,
         codec_backend=backend.strip(),
         codec_revision=source.revision,
         codec_filename=source.filename,
         codec_sha256=artifact_sha256,
+        codec_encoding_policy=DACVAE_POSTERIOR_SAMPLING_POLICY,
         sample_rate=_positive_integer(getattr(codec, "sample_rate", None), name="sample_rate"),
         hop_length=_positive_integer(getattr(codec, "hop_length", None), name="hop_length"),
         latent_width=_codec_latent_width(codec),
@@ -147,18 +171,41 @@ def attach_representation_contract(
             contract,
             field_name="speaker_latents",
         )
+    row[PREPARED_ROW_VERSION_COLUMN] = PREPARED_ROW_VERSION
     row[REPRESENTATION_CONTRACT_COLUMN] = contract.to_dict()
     return row
+
+
+def is_supported_text_frontend(
+    name: Any,
+    version: Any,
+    *,
+    allow_legacy: bool = False,
+) -> bool:
+    """Return whether a row frontend can be interpreted by the selected loader.
+
+    Legacy cl100k rows remain identifiable but are never silently mixed with
+    v2 hybrid rows. Callers must opt in and synthesize their missing parallel
+    masks explicitly.
+    """
+    identity = (name, version)
+    if identity == (TEXT_FRONTEND_NAME, TEXT_FRONTEND_VERSION):
+        return True
+    return allow_legacy and identity in LEGACY_TEXT_FRONTENDS
 
 
 __all__ = [
     "REPRESENTATION_CONTRACT_COLUMN",
     "REPRESENTATION_CONTRACT_VERSION",
+    "PREPARED_ROW_VERSION",
+    "PREPARED_ROW_VERSION_COLUMN",
     "TEXT_FRONTEND_NAME",
     "TEXT_FRONTEND_VERSION",
+    "LEGACY_TEXT_FRONTENDS",
     "RepresentationContract",
     "RepresentationContractError",
     "attach_representation_contract",
     "build_representation_contract",
+    "is_supported_text_frontend",
     "validate_latent_representation",
 ]

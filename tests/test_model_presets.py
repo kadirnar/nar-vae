@@ -19,12 +19,21 @@ from nar_vae.models.flow_matching import create_flow_matching_echodit
 ROOT = Path(__file__).resolve().parents[1]
 
 EXPECTED_PARAMETER_COUNTS = {
-    "nano": (16_267_393, 16_805_313),
-    "tiny": (40_514_049, 42_708_097),
-    "small": (77_210_945, 83_118_849),
-    "medium": (169_604_353, 186_234_369),
-    "large": (353_931_137, 387_900_161),
-    "xlarge": (647_064_065, 690_472_705),
+    "nano": (3_495_425, 4_034_753),
+    "tiny": (14_970_113, 17_166_977),
+    "small": (45_281_025, 51_193_089),
+    "medium": (118_516_481, 135_152_129),
+    "large": (290_071_297, 324_046_209),
+    "xlarge": (570_432_257, 613_846_785),
+}
+
+EXPECTED_CANONICAL_FROZEN_PARAMETER_COUNTS = {
+    "nano": 3_604_113,
+    "tiny": 15_316_385,
+    "small": 44_854_209,
+    "medium": 109_660_097,
+    "large": 284_411_521,
+    "xlarge": 556_217_217,
 }
 
 
@@ -110,7 +119,12 @@ class ModelPresetTest(unittest.TestCase):
             for name in list_model_presets():
                 with self.subTest(filename=filename, preset=name):
                     switched = dict(config, model_preset=name)
-                    self.assertEqual(resolve_model_architecture(switched), get_model_preset(name))
+                    resolved = resolve_model_architecture(switched)
+                    expected = get_model_preset(name)
+                    self.assertEqual(resolved.text_num_layers, 0)
+                    for field in ARCHITECTURE_FIELDS:
+                        if field != "text_num_layers":
+                            self.assertEqual(getattr(resolved, field), getattr(expected, field))
 
     def test_every_preset_constructs_with_documented_parameter_counts(self):
         for name, (expected_base, expected_full) in EXPECTED_PARAMETER_COUNTS.items():
@@ -118,7 +132,8 @@ class ModelPresetTest(unittest.TestCase):
             with self.subTest(preset=name, topology="base"), torch.device("meta"):
                 model = create_flow_matching_echodit(
                     latent_size=128,
-                    text_vocab_size=100312,
+                    text_vocab_size=530,
+                    target_patch_size=1,
                     use_duration_predictor=True,
                     use_mas_duration=True,
                     **preset_kwargs,
@@ -128,7 +143,8 @@ class ModelPresetTest(unittest.TestCase):
             with self.subTest(preset=name, topology="fully_conditioned"), torch.device("meta"):
                 model = create_flow_matching_echodit(
                     latent_size=128,
-                    text_vocab_size=100312,
+                    text_vocab_size=530,
+                    target_patch_size=1,
                     use_speaker_conditioning=True,
                     use_language_conditioning=True,
                     supported_languages=("en", "tr"),
@@ -139,6 +155,31 @@ class ModelPresetTest(unittest.TestCase):
                     **preset_kwargs,
                 )
                 self.assertEqual(model.get_num_params()["total"], expected_full)
+
+    def test_canonical_frozen_multilingual_clone_counts_match_documentation(self):
+        for name, expected in EXPECTED_CANONICAL_FROZEN_PARAMETER_COUNTS.items():
+            preset_kwargs = get_model_preset(name).model_kwargs()
+            # The external provider replaces the preset's scratch text stack.
+            preset_kwargs["text_num_layers"] = 0
+            with self.subTest(preset=name), torch.device("meta"):
+                model = create_flow_matching_echodit(
+                    latent_size=128,
+                    text_vocab_size=1969,
+                    text_conditioning_mode="frozen_features",
+                    conditioning_feature_size=768,
+                    target_patch_size=2,
+                    use_speaker_conditioning=True,
+                    speaker_num_summary_tokens=8,
+                    use_language_conditioning=True,
+                    supported_languages=("en", "tr"),
+                    supported_language_pairs=(("en", "en"), ("tr", "tr"), ("tr", "en")),
+                    use_duration_predictor=True,
+                    duration_predictor_use_speaker=True,
+                    use_mas_duration=True,
+                    **preset_kwargs,
+                )
+
+            self.assertEqual(model.get_num_params()["total"], expected)
 
     def test_inference_factory_passes_the_complete_preset(self):
         class RecordingInference(FlowMatchingTTSInference):

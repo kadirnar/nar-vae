@@ -22,6 +22,7 @@ from nar_vae.configuration import (
 )
 from nar_vae.dataset.data_collator import FlowMatchingDataCollator
 from nar_vae.dataset.identity import resolve_local_prepared_dataset_identity
+from nar_vae.dataset.utterance_store import DynamicReferenceDataset
 from nar_vae.distributed import (
     distributed_cleanup_guard,
     initialize_distributed,
@@ -31,6 +32,7 @@ from nar_vae.distributed import (
     resolve_node_consistent_value,
     run_distributed_operation,
 )
+from nar_vae.frozen_text_provider import FrozenTextProviderSpec
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
 from nar_vae.model_manifest import (
     ModelManifest,
@@ -42,7 +44,9 @@ from nar_vae.model_manifest import (
 )
 from nar_vae.model_presets import resolve_model_architecture
 from nar_vae.models.flow_matching import create_flow_matching_echodit
+from nar_vae.train import _materialize_flow_model_weights
 from nar_vae.training_data import FrameBudgetTrainerMixin
+from nar_vae.training_optimizers import MuonTrainerMixin
 from nar_vae.training_utils import (
     freeze_layers,
     resolve_duration_training_options,
@@ -186,7 +190,7 @@ class EMACallback(TrainerCallback):
         return control
 
 
-class EchoDiTFineTuner(FrameBudgetTrainerMixin, Trainer):
+class EchoDiTFineTuner(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
     """
     Trainer for fine-tuning EchoDiT flow matching TTS.
 
@@ -219,6 +223,8 @@ class EchoDiTFineTuner(FrameBudgetTrainerMixin, Trainer):
         # Flow matching loss with stratified logit-normal timestep distribution
         self.flow_loss_fn = FlowMatchingLoss(
             sigma_min=config.get("flow_sigma_min", 1e-4),
+            generative_objective=config.get("generative_objective", "rectified_flow"),
+            diffusion_schedule_shift=config.get("diffusion_schedule_shift", 1.0),
             velocity_weighted=config.get("flow_velocity_weighted", False),
             timestep_distribution=config.get("timestep_distribution", "stratified_logit_normal"),
             logit_normal_loc=config.get("logit_normal_loc", 0.0),
@@ -239,12 +245,18 @@ class EchoDiTFineTuner(FrameBudgetTrainerMixin, Trainer):
         speaker_latent = inputs.get("speaker_latents", None)
         speaker_mask = inputs.get("speaker_mask", None)
         language_ids = inputs.get("language_ids", None)
+        token_language_ids = inputs.get("token_language_ids", None)
+        alignment_mask = inputs.get("alignment_mask", None)
+        conditioning_features = inputs.get("conditioning_features", None)
 
         loss = self.flow_loss_fn(
             model=model,
             latents=latents,
             conditioning_ids=conditioning_ids,
             conditioning_mask=conditioning_mask,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+            conditioning_features=conditioning_features,
             latent_mask=latent_mask,
             speaker_latent=speaker_latent,
             speaker_mask=speaker_mask,
@@ -264,14 +276,13 @@ class EchoDiTFineTuner(FrameBudgetTrainerMixin, Trainer):
         if self.is_world_process_zero():
             flow_model_dir = os.path.join(output_dir, "flow_model")
             os.makedirs(flow_model_dir, exist_ok=True)
-            # Get the underlying model
-            model_to_save = unwrap_training_model(self.flow_model)
-
-            # Save main model
-            cpu_state_dict = {
-                key: value.detach().cpu() for key, value in model_to_save.state_dict().items()
-            }
-            torch.save(cpu_state_dict, os.path.join(flow_model_dir, "pytorch_model.bin"))
+            # Reuse Trainer's exact non-EMA state dict when it emitted the
+            # inference-compatible PyTorch artifact. This avoids serializing
+            # and storing a second full model while retaining the flow-model
+            # path bound by SFT lineage and model manifests. Safetensors and
+            # backend-specific saves retain the exact CPU serialization
+            # fallback used by pretraining.
+            _materialize_flow_model_weights(output_dir, flow_model_dir, self.flow_model)
 
             # Save EMA model if available
             if self.ema_model is not None:
@@ -702,6 +713,31 @@ def _finetune(
         ),
         description="SFT reference-language resolution",
     )
+    if use_speaker_conditioning:
+        ds_tts = run_distributed_operation(
+            process,
+            lambda: DynamicReferenceDataset(
+                ds_tts,
+                supported_language_pairs=supported_language_pairs or None,
+                seed=config.get(
+                    "reference_seed",
+                    config.get("data_seed", config.get("seed", 1337)),
+                ),
+                min_reference_seconds=config.get("min_reference_seconds", 3.0),
+                short_reference_max_seconds=config.get(
+                    "short_reference_max_seconds",
+                    8.0,
+                ),
+                max_reference_seconds=config.get("max_reference_seconds", 12.0),
+                short_reference_probability=config.get(
+                    "short_reference_probability",
+                    0.8,
+                ),
+                speaker_patch_size=speaker_patch_size,
+                strict=config.get("dynamic_reference_strict", True),
+            ),
+            description="SFT dynamic speaker-reference dataset construction",
+        )
     architecture = run_distributed_operation(
         process,
         lambda: resolve_model_architecture(config),
@@ -712,7 +748,11 @@ def _finetune(
         lambda: create_flow_matching_echodit(
             latent_size=config["dacvae_latent_dim"],
             text_vocab_size=config["text_vocab_size"],
+            text_conditioning_mode=config.get("text_conditioning_mode", "scratch_tokens"),
+            conditioning_feature_size=config.get("conditioning_feature_size"),
             speaker_patch_size=speaker_patch_size,
+            speaker_num_summary_tokens=config.get("speaker_num_summary_tokens", 0),
+            target_patch_size=config.get("target_patch_size", 1),
             **architecture.model_kwargs(),
             norm_eps=config.get("norm_eps", 1e-6),
             cfg_dropout=config.get("cfg_dropout", 0.1),
@@ -729,6 +769,8 @@ def _finetune(
             duration_predictor_use_speaker=duration_options.uses_speaker,
             use_mas_duration=duration_options.uses_mas,
             duration_alignment_hidden_size=duration_options.alignment_hidden_size,
+            generative_objective=config.get("generative_objective", "rectified_flow"),
+            diffusion_schedule_shift=config.get("diffusion_schedule_shift", 1.0),
         ),
         description="SFT model construction",
     )
@@ -827,6 +869,15 @@ def _finetune(
             supported_language_pairs=supported_language_pairs or None,
             require_language_coverage=True,
             use_mas_duration=duration_options.uses_mas,
+            text_conditioning_mode=config.get("text_conditioning_mode", "scratch_tokens"),
+            conditioning_feature_size=config.get("conditioning_feature_size"),
+            frozen_text_provider_spec=(
+                FrozenTextProviderSpec.from_config(config)
+                if config.get("text_conditioning_mode", "scratch_tokens") == "frozen_features"
+                else None
+            ),
+            text_vocab_size=config.get("text_vocab_size"),
+            text_pad_token=config.get("pad_token"),
             allow_legacy_representation=config.get("allow_legacy_representation", False),
             expected_codec_source=config.get("dacvae_model"),
             expected_codec_backend=config.get("dacvae_backend"),

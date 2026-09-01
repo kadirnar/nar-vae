@@ -84,7 +84,7 @@ timestep_embed_size = 256
 adaln_rank = 128
 
 [presets.xlarge]
-description = "Approximately 650-700M-parameter compatibility preset, depending on conditioning."
+description = "Highest-capacity research preset; the canonical conditioned topology is about 556.22M trainable parameters."
 model_size = 1024
 num_layers = 24
 num_heads = 16
