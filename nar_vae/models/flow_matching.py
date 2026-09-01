@@ -40,6 +40,7 @@ from .dit import EchoDiT
 from .duration import (
     DURATION_PREDICTOR_VERSION,
     ECHODIT_ARCHITECTURE_VERSION,
+    LEGACY_ECHODIT_ARCHITECTURE_VERSION,
     MONOTONIC_ALIGNMENT_VERSION,
     DurationAlignmentOutput,
     EchoDurationAlignment,
@@ -206,7 +207,7 @@ class EncodedCFGConditioning:
 
 class FlowMatchingEchoDiT(nn.Module):
     """
-    Flow Matching TTS with EchoDiT architecture.
+    Versioned continuous-velocity TTS with the EchoDiT architecture.
 
     Wraps EchoDiT to work with flow matching training and inference.
     """
@@ -257,10 +258,29 @@ class FlowMatchingEchoDiT(nn.Module):
         generative_objective: str = RECTIFIED_FLOW_OBJECTIVE,
         diffusion_schedule_shift: float = DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
         speaker_num_summary_tokens: int = 0,
+        architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
     ):
         super().__init__()
 
+        if architecture_version not in {
+            LEGACY_ECHODIT_ARCHITECTURE_VERSION,
+            ECHODIT_ARCHITECTURE_VERSION,
+        }:
+            raise ValueError(f"Unsupported EchoDiT architecture version: {architecture_version}.")
+        if architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION and (
+            text_conditioning_mode != SCRATCH_TOKEN_TEXT_CONDITIONING
+            or target_patch_size != 1
+            or speaker_num_summary_tokens != 0
+            or generative_objective != RECTIFIED_FLOW_OBJECTIVE
+            or diffusion_schedule_shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT
+        ):
+            raise ValueError(
+                "EchoDiT architecture v3 is an inference-only rectified-flow scratch-token "
+                "topology with target_patch_size=1 and no speaker resampler."
+            )
+
         self.latent_size = latent_size
+        self.architecture_version = architecture_version
         self.text_conditioning = resolve_text_conditioning_metadata(
             text_conditioning_mode,
             conditioning_feature_size,
@@ -389,16 +409,18 @@ class FlowMatchingEchoDiT(nn.Module):
             num_languages=LANGUAGE_COUNT if use_language_conditioning else 0,
             use_speaker_conditioning=use_speaker_conditioning,
             use_duration_alignment=use_mas_duration,
+            architecture_version=architecture_version,
         )
         self.speaker_num_summary_tokens = self.dit.speaker_num_summary_tokens
-        self.register_buffer(
-            "echodit_architecture_version",
-            torch.tensor(ECHODIT_ARCHITECTURE_VERSION, dtype=torch.int32),
-        )
-        self.register_buffer(
-            "target_patch_size_metadata",
-            torch.tensor(self.dit.target_patch_size, dtype=torch.int32),
-        )
+        if architecture_version >= ECHODIT_ARCHITECTURE_VERSION:
+            self.register_buffer(
+                "echodit_architecture_version",
+                torch.tensor(ECHODIT_ARCHITECTURE_VERSION, dtype=torch.int32),
+            )
+            self.register_buffer(
+                "target_patch_size_metadata",
+                torch.tensor(self.dit.target_patch_size, dtype=torch.int32),
+            )
         if use_duration_predictor:
             self.duration_predictor = EchoDurationPredictor(
                 text_size=text_model_size,
@@ -406,6 +428,11 @@ class FlowMatchingEchoDiT(nn.Module):
                 num_layers=duration_predictor_num_layers,
                 speaker_size=(speaker_model_size if duration_predictor_use_speaker else None),
             )
+            if architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+                self.register_buffer(
+                    "echodit_architecture_version",
+                    torch.tensor(architecture_version, dtype=torch.int32),
+                )
             self.register_buffer(
                 "duration_predictor_version",
                 torch.tensor(DURATION_PREDICTOR_VERSION, dtype=torch.int32),
@@ -437,10 +464,13 @@ class FlowMatchingEchoDiT(nn.Module):
                     torch.tensor(duration_alignment_hidden_size, dtype=torch.int32),
                 )
 
-        # Learned encoder-level null states make classifier-free branches explicit.
-        # Reusing the historical null_text_embed key keeps old state dictionaries
-        # loadable even though the tensor is now trainable and actually consumed.
-        self.null_text_embed = nn.Parameter(torch.zeros(1, 1, text_model_size))
+        if architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            self.register_buffer("null_text_embed", torch.zeros(1, 1, text_model_size))
+        else:
+            # Learned encoder-level null states make classifier-free branches explicit.
+            # Reusing the historical null_text_embed key keeps old state dictionaries
+            # loadable even though the tensor is now trainable and actually consumed.
+            self.null_text_embed = nn.Parameter(torch.zeros(1, 1, text_model_size))
 
         if use_speaker_conditioning:
             # Retain the historical raw-latent sentinel as checkpoint metadata, but
@@ -448,7 +478,8 @@ class FlowMatchingEchoDiT(nn.Module):
             self.register_buffer(
                 "null_speaker_embed", torch.zeros(1, latent_size, speaker_patch_size)
             )
-            self.null_speaker_state = nn.Parameter(torch.zeros(1, 1, speaker_model_size))
+            if architecture_version >= ECHODIT_ARCHITECTURE_VERSION:
+                self.null_speaker_state = nn.Parameter(torch.zeros(1, 1, speaker_model_size))
             self.register_buffer(
                 "speaker_conditioning_version",
                 torch.tensor(SPEAKER_CONDITIONING_VERSION, dtype=torch.int32),
@@ -526,6 +557,13 @@ class FlowMatchingEchoDiT(nn.Module):
         uses_language_conditioning = getattr(self, "use_language_conditioning", False)
         if language_ids is None:
             if uses_language_conditioning:
+                if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+                    return torch.full(
+                        (batch_size,),
+                        language_id(DEFAULT_LANGUAGE),
+                        dtype=torch.long,
+                        device=device,
+                    )
                 raise ValueError(
                     "language_ids are required by a language-conditioned NAR-VAE checkpoint."
                 )
@@ -607,6 +645,49 @@ class FlowMatchingEchoDiT(nn.Module):
         if not bool(alignment_mask.any(dim=1).all()):
             raise ValueError("Every alignment_mask row must select at least one token.")
         return alignment_mask
+
+    def _validate_legacy_v3_parallel_text_axes(
+        self,
+        *,
+        conditioning_ids: torch.Tensor,
+        text_mask: torch.Tensor | None,
+        language_ids: torch.Tensor | None,
+        token_language_ids: torch.Tensor | None,
+        alignment_mask: torch.Tensor | None,
+    ) -> None:
+        """Authenticate modern compatibility axes as exact v3 semantic no-ops."""
+        if token_language_ids is not None:
+            prepared_token_languages = self._prepare_token_language_ids(
+                token_language_ids,
+                conditioning_ids=conditioning_ids,
+            )
+            if prepared_token_languages is not None and language_ids is not None:
+                expected_languages = language_ids[:, None].expand_as(prepared_token_languages)
+                valid_text = (
+                    text_mask
+                    if text_mask is not None
+                    else torch.ones_like(conditioning_ids, dtype=torch.bool)
+                )
+                if bool(((prepared_token_languages != expected_languages) & valid_text).any()):
+                    raise ValueError(
+                        "EchoDiT architecture v3 token_language_ids must broadcast the "
+                        "utterance-level language across every valid text token."
+                    )
+        if alignment_mask is not None:
+            prepared_alignment = self._prepare_alignment_mask(
+                alignment_mask,
+                conditioning_ids=conditioning_ids,
+                text_mask=text_mask,
+            )
+            expected_alignment = (
+                text_mask
+                if text_mask is not None
+                else torch.ones_like(conditioning_ids, dtype=torch.bool)
+            )
+            if not torch.equal(prepared_alignment, expected_alignment):
+                raise ValueError(
+                    "EchoDiT architecture v3 alignment_mask must select every valid text token."
+                )
 
     @staticmethod
     def _materialize_mask(
@@ -776,6 +857,18 @@ class FlowMatchingEchoDiT(nn.Module):
         """Encode the real conditions once, then assemble learned-null CFG branches."""
         if cfg_mode not in {None, "joint", "independent", "alternating"}:
             raise ValueError(f"Unknown CFG mode: {cfg_mode}")
+        if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            return self._encode_legacy_v3_inference_conditioning(
+                conditioning_ids,
+                attention_mask,
+                speaker_latent,
+                cfg_mode=cfg_mode,
+                speaker_mask=speaker_mask,
+                language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
+                conditioning_features=conditioning_features,
+            )
         batch_size = conditioning_ids.shape[0]
         device = conditioning_ids.device
         text_mask = attention_mask.bool() if attention_mask is not None else None
@@ -948,6 +1041,164 @@ class FlowMatchingEchoDiT(nn.Module):
             conditional=conditional,
         )
 
+    def _encode_legacy_v3_inference_conditioning(
+        self,
+        conditioning_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        speaker_latent: torch.Tensor | None,
+        *,
+        cfg_mode: str | None,
+        speaker_mask: torch.Tensor | None,
+        language_ids: torch.Tensor | None,
+        token_language_ids: torch.Tensor | None,
+        alignment_mask: torch.Tensor | None,
+        conditioning_features: torch.Tensor | None,
+    ) -> EncodedCFGConditioning:
+        """Reproduce the authenticated architecture-v3 encoder/CFG graph exactly."""
+        if conditioning_features is not None:
+            raise ValueError("EchoDiT architecture v3 does not accept frozen text features.")
+        batch_size = conditioning_ids.shape[0]
+        device = conditioning_ids.device
+        text_mask = attention_mask.bool() if attention_mask is not None else None
+        language_ids = self._prepare_language_ids(
+            language_ids,
+            batch_size=batch_size,
+            device=device,
+        )
+        # The schema-2 runtime supplies parallel compatibility axes so modern batch
+        # assembly remains shape-safe. Architecture v3 itself conditioned text only
+        # with the utterance-level language ID and treated every non-padding token as
+        # alignable, so validate those facts and deliberately keep them out of the
+        # historical encoder graph.
+        self._validate_legacy_v3_parallel_text_axes(
+            conditioning_ids=conditioning_ids,
+            text_mask=text_mask,
+            language_ids=language_ids,
+            token_language_ids=token_language_ids,
+            alignment_mask=alignment_mask,
+        )
+
+        def null_speaker_like(reference: torch.Tensor | None) -> torch.Tensor | None:
+            if not self.use_speaker_conditioning or reference is None:
+                return None
+            null_speaker = self.null_speaker_embed.to(
+                device=reference.device,
+                dtype=reference.dtype,
+            ).expand(batch_size, -1, -1)
+            reference_frames = reference.shape[-1]
+            if null_speaker.shape[-1] < reference_frames:
+                null_speaker = torch.nn.functional.pad(
+                    null_speaker,
+                    (0, reference_frames - null_speaker.shape[-1]),
+                )
+            return null_speaker[..., :reference_frames]
+
+        conditional = (conditioning_ids, speaker_latent, language_ids)
+        if cfg_mode is None:
+            branch_count = 1
+            branch_variants = ((conditional,),)
+        else:
+            null_ids = torch.zeros_like(conditioning_ids)
+            null_language_ids = torch.zeros_like(language_ids) if language_ids is not None else None
+            null_speaker = null_speaker_like(speaker_latent)
+            if cfg_mode == "joint":
+                branch_count = 2
+                branch_variants = (
+                    (
+                        conditional,
+                        (null_ids, null_speaker, null_language_ids),
+                    ),
+                )
+            elif cfg_mode == "independent":
+                branch_count = 3
+                branch_variants = (
+                    (
+                        conditional,
+                        (null_ids, speaker_latent, null_language_ids),
+                        (conditioning_ids, null_speaker, language_ids),
+                    ),
+                )
+            else:
+                branch_count = 2
+                branch_variants = (
+                    (
+                        conditional,
+                        (null_ids, speaker_latent, null_language_ids),
+                    ),
+                    (
+                        conditional,
+                        (conditioning_ids, null_speaker, language_ids),
+                    ),
+                )
+
+        flat_branches = tuple(branch for variant in branch_variants for branch in variant)
+        flat_conditioning_ids = torch.cat([branch[0] for branch in flat_branches], dim=0)
+        flat_text_mask = (
+            torch.cat([text_mask] * len(flat_branches), dim=0) if text_mask is not None else None
+        )
+        flat_language_ids = (
+            torch.cat([branch[2] for branch in flat_branches], dim=0)
+            if all(branch[2] is not None for branch in flat_branches)
+            else None
+        )
+        flat_text_state = self.dit.encode_text(
+            flat_conditioning_ids,
+            flat_text_mask,
+            flat_language_ids,
+        )
+
+        flat_speaker_latent = None
+        if any(branch[1] is not None for branch in flat_branches):
+            if not all(branch[1] is not None for branch in flat_branches):
+                raise ValueError("Speaker CFG branches must either all be tensors or all be None.")
+            flat_speaker_latent = torch.cat(
+                [branch[1] for branch in flat_branches if branch[1] is not None],
+                dim=0,
+            )
+        flat_speaker_mask = (
+            torch.cat([speaker_mask] * len(flat_branches), dim=0)
+            if speaker_mask is not None
+            else None
+        )
+        flat_speaker_latent, flat_speaker_mask = self._prepare_speaker_inputs(
+            flat_speaker_latent,
+            flat_speaker_mask,
+            batch_size=batch_size * len(flat_branches),
+            device=device,
+        )
+        flat_speaker_state = self.dit.encode_speaker(
+            flat_speaker_latent,
+            flat_speaker_mask,
+        )
+
+        variant_size = branch_count * batch_size
+        variants = tuple(
+            EncodedConditioning(
+                text_mask=(
+                    flat_text_mask[offset : offset + variant_size]
+                    if flat_text_mask is not None
+                    else None
+                ),
+                alignment_mask=None,
+                speaker_mask=(
+                    flat_speaker_mask[offset : offset + variant_size]
+                    if flat_speaker_mask is not None
+                    else None
+                ),
+                text_state=flat_text_state[offset : offset + variant_size],
+                speaker_state=flat_speaker_state[offset : offset + variant_size],
+                global_language_state=None,
+                text_is_null=None,
+            )
+            for offset in range(0, len(flat_branches) * batch_size, variant_size)
+        )
+        return EncodedCFGConditioning(
+            mode=cfg_mode,
+            branch_count=branch_count,
+            variants=variants,
+            conditional=variants[0].slice_batch(0, batch_size),
+        )
+
     def finalize_inference_conditioning(
         self,
         encoded: EncodedCFGConditioning,
@@ -1058,6 +1309,20 @@ class FlowMatchingEchoDiT(nn.Module):
                     )
             return speaker_latent, speaker_attention_mask
 
+        if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            if speaker_mask is not None:
+                raise ValueError("speaker_mask requires speaker_latent.")
+            speaker_encoder = self.dit.speaker_encoder
+            if speaker_encoder is None:
+                raise RuntimeError("EchoDiT v3 speaker state is internally inconsistent.")
+            return (
+                self.null_speaker_embed.to(
+                    device=device,
+                    dtype=speaker_encoder.in_proj.weight.dtype,
+                ).expand(batch_size, -1, -1),
+                None,
+            )
+
         raise ValueError(
             "speaker_latent is required here; use learned null_speaker_state for an "
             "unconditional speaker branch."
@@ -1081,7 +1346,7 @@ class FlowMatchingEchoDiT(nn.Module):
                 device=device,
                 dtype=self.dit.in_proj.weight.dtype,
             )
-        if speaker_latent is None:
+        if speaker_latent is None and self.architecture_version >= ECHODIT_ARCHITECTURE_VERSION:
             if speaker_mask is not None:
                 raise ValueError("speaker_mask requires speaker_latent.")
             return self._null_speaker_conditioning(
@@ -1169,7 +1434,7 @@ class FlowMatchingEchoDiT(nn.Module):
         conditioning_features: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
@@ -1187,6 +1452,41 @@ class FlowMatchingEchoDiT(nn.Module):
             batch_size=batch_size,
             device=device,
         )
+        if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            if conditioning_features is not None:
+                raise ValueError("EchoDiT architecture v3 does not accept frozen text features.")
+            self._validate_legacy_v3_parallel_text_axes(
+                conditioning_ids=conditioning_ids,
+                text_mask=text_mask,
+                language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
+            )
+            # Origin architecture v3 ran the duration and MAS heads over every
+            # cl100k/control token. Never apply v4 alignment compaction here.
+            text_state = self.dit.encode_text(conditioning_ids, text_mask, language_ids)
+            full_alignment_mask = self._materialize_mask(
+                text_mask,
+                batch_size=batch_size,
+                length=conditioning_ids.shape[1],
+                device=device,
+            )
+            speaker_state = None
+            speaker_attention_mask = None
+            if self.duration_predictor_use_speaker:
+                speaker_state, speaker_attention_mask = self._encode_speaker_conditioning(
+                    speaker_latent,
+                    speaker_mask,
+                    batch_size=batch_size,
+                    device=device,
+                )
+            return (
+                text_state,
+                text_mask,
+                full_alignment_mask,
+                speaker_state,
+                speaker_attention_mask,
+            )
         token_language_ids = self._prepare_token_language_ids(
             token_language_ids,
             conditioning_ids=conditioning_ids,
@@ -1274,6 +1574,8 @@ class FlowMatchingEchoDiT(nn.Module):
             speaker_state,
             speaker_attention_mask,
         )
+        if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            return token_durations
         return self._scatter_compact_rows(token_durations, full_alignment_mask)
 
     def _predict_log_duration_from_encoded(
@@ -1335,6 +1637,23 @@ class FlowMatchingEchoDiT(nn.Module):
         conditional = encoded.conditional
         speaker_state = conditional.speaker_state if self.duration_predictor_use_speaker else None
         speaker_mask = conditional.speaker_mask if self.duration_predictor_use_speaker else None
+        if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            if getattr(self, "use_mas_duration", False):
+                log_frames, token_weights = self._predict_duration_components_from_encoded(
+                    conditional.text_state,
+                    conditional.text_mask,
+                    speaker_state,
+                    speaker_mask,
+                )
+            else:
+                log_frames = self._predict_log_duration_from_encoded(
+                    conditional.text_state,
+                    conditional.text_mask,
+                    speaker_state,
+                    speaker_mask,
+                )
+                token_weights = None
+            return self._duration_frames_from_log(log_frames), token_weights
         alignment_mask = (
             conditional.alignment_mask
             if conditional.alignment_mask is not None
@@ -1559,6 +1878,20 @@ class FlowMatchingEchoDiT(nn.Module):
         Returns:
             Predicted velocity, optionally paired with predicted log-frame count
         """
+        if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            if self.training:
+                raise RuntimeError(
+                    "EchoDiT architecture v3 is authenticated for inference only; "
+                    "legacy training is unsupported."
+                )
+            if (
+                return_duration_prediction
+                or return_duration_alignment
+                or duration_target_latents is not None
+            ):
+                raise RuntimeError(
+                    "EchoDiT architecture v3 does not expose current training-return paths."
+                )
         B = latents.shape[0]
         device = latents.device
         if return_duration_alignment and not return_duration_prediction:
@@ -1587,15 +1920,30 @@ class FlowMatchingEchoDiT(nn.Module):
             batch_size=B,
             device=device,
         )
-        token_language_ids = self._prepare_token_language_ids(
-            token_language_ids,
-            conditioning_ids=conditioning_ids,
-        )
-        alignment_mask = self._prepare_alignment_mask(
-            alignment_mask,
-            conditioning_ids=conditioning_ids,
-            text_mask=text_mask,
-        )
+        if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            if conditioning_features is not None:
+                raise ValueError("EchoDiT architecture v3 does not accept frozen text features.")
+            self._validate_legacy_v3_parallel_text_axes(
+                conditioning_ids=conditioning_ids,
+                text_mask=text_mask,
+                language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=alignment_mask,
+            )
+            # Compatibility axes are deliberately excluded from the origin v3
+            # encoder/duration graph after exact no-op validation.
+            token_language_ids = None
+            alignment_mask = None
+        else:
+            token_language_ids = self._prepare_token_language_ids(
+                token_language_ids,
+                conditioning_ids=conditioning_ids,
+            )
+            alignment_mask = self._prepare_alignment_mask(
+                alignment_mask,
+                conditioning_ids=conditioning_ids,
+                text_mask=text_mask,
+            )
         effective_alignment_mask = (
             alignment_mask
             if alignment_mask is not None
@@ -1959,10 +2307,22 @@ class FlowMatchingEchoDiT(nn.Module):
             batch_size=conditioning_ids.shape[0],
             device=conditioning_ids.device,
         )
-        token_language_ids = self._prepare_token_language_ids(
-            token_language_ids,
-            conditioning_ids=conditioning_ids,
-        )
+        if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+            if conditioning_features is not None:
+                raise ValueError("EchoDiT architecture v3 does not accept frozen text features.")
+            self._validate_legacy_v3_parallel_text_axes(
+                conditioning_ids=conditioning_ids,
+                text_mask=attention_mask,
+                language_ids=language_ids,
+                token_language_ids=token_language_ids,
+                alignment_mask=None,
+            )
+            token_language_ids = None
+        else:
+            token_language_ids = self._prepare_token_language_ids(
+                token_language_ids,
+                conditioning_ids=conditioning_ids,
+            )
         return self.dit.get_kv_cache_text(
             conditioning_ids,
             attention_mask,
@@ -2056,6 +2416,7 @@ def create_flow_matching_echodit(
     generative_objective: str = RECTIFIED_FLOW_OBJECTIVE,
     diffusion_schedule_shift: float = DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
     speaker_num_summary_tokens: int = 0,
+    architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
     **kwargs,
 ) -> FlowMatchingEchoDiT:
     """
@@ -2076,6 +2437,7 @@ def create_flow_matching_echodit(
         cfg_dropout_speaker: Optional speaker-specific override of ``cfg_dropout``
         use_speaker_conditioning: Enable speaker conditioning
         speaker_num_summary_tokens: Fixed speaker-summary token count; zero keeps legacy topology
+        architecture_version: Exact authenticated EchoDiT topology version
         use_language_conditioning: Enable a learned target-language embedding
         supported_languages: Canonical codes or aliases represented by training data
         supported_reference_languages: Languages represented by speaker-reference audio
@@ -2105,6 +2467,7 @@ def create_flow_matching_echodit(
         cfg_dropout_speaker=cfg_dropout_speaker,
         use_speaker_conditioning=use_speaker_conditioning,
         speaker_num_summary_tokens=speaker_num_summary_tokens,
+        architecture_version=architecture_version,
         use_language_conditioning=use_language_conditioning,
         supported_languages=supported_languages,
         supported_reference_languages=supported_reference_languages,

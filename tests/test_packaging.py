@@ -36,8 +36,8 @@ class PackagingMetadataTest(unittest.TestCase):
                 "Issues": "https://github.com/kadirnar/nar-vae/issues",
             },
         )
-        self.assertIn("torch>=2.9", project["dependencies"])
-        self.assertIn("torchaudio>=2.9", project["dependencies"])
+        self.assertIn("torch>=2.7.1", project["dependencies"])
+        self.assertIn("torchaudio>=2.7.1", project["dependencies"])
 
     def test_pyproject_is_the_single_dependency_manifest(self):
         dependencies = set(self.metadata["project"]["dependencies"])
@@ -53,6 +53,7 @@ class PackagingMetadataTest(unittest.TestCase):
             "kernels>=0.16,<0.17",
             "PyYAML",
             "ruff",
+            "tiktoken>=0.14,<0.15",
             "torchcodec",
             "transformers>=4.49,<5",
             "wandb",

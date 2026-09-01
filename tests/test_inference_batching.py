@@ -9,8 +9,8 @@ import torch
 
 from nar_vae.configuration import load_inference_settings
 from nar_vae.inference import FlowMatchingTTSInference
-from nar_vae.languages import MultilingualUnsupportedError
-from nar_vae.tokenization import TextSpan
+from nar_vae.languages import MultilingualUnsupportedError, language_id
+from nar_vae.tokenization import LEGACY_CL100K_PAD_TOKEN, TextSpan
 
 
 class FakeTokenizer:
@@ -36,6 +36,17 @@ def make_runtime() -> FlowMatchingTTSInference:
     runtime.checkpoint_path = Path("checkpoint.bin")
     runtime.flow_model = object()
     runtime._decode = lambda latents: latents[:, :1, :]
+    return runtime
+
+
+def make_legacy_runtime() -> FlowMatchingTTSInference:
+    import tiktoken
+
+    runtime = make_runtime()
+    runtime.legacy_cl100k_frontend = True
+    runtime.legacy_tokenizer = tiktoken.get_encoding("cl100k_base")
+    runtime.text_vocab_size = 100312
+    runtime.text_pad_token = LEGACY_CL100K_PAD_TOKEN
     return runtime
 
 
@@ -81,6 +92,44 @@ class FakeMASFlowModel:
 
 
 class InferenceBatchingTest(unittest.TestCase):
+    def test_schema2_single_and_batch_use_only_cl100k_ids_and_legacy_padding(self):
+        runtime = make_legacy_runtime()
+        prepared = runtime._prepare_conditioning("Hello, world!", "en")
+        self.assertEqual(
+            prepared.conditioning_ids.tolist(),
+            [[100282, 9906, 11, 1917, 0, 100283, 100284, 100280]],
+        )
+        self.assertEqual(
+            prepared.token_language_ids.unique().tolist(),
+            [language_id("en")],
+        )
+        self.assertTrue(bool(prepared.alignment_mask.all()))
+        with self.assertRaisesRegex(ValueError, "raw text only"):
+            runtime._prepare_conditioning("ignored", "en", phonemes="h ə l oʊ")
+
+        calls = []
+
+        def fake_sample(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros(kwargs["latent_shape"])
+
+        with patch("nar_vae.inference.ODESolver.sample", side_effect=fake_sample):
+            runtime.synthesize_batch(["Hello", "Hello, world!"], num_steps=1)
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["conditioning_mask"].sum(dim=1).tolist(), [5, 8])
+        self.assertEqual(call["alignment_mask"].sum(dim=1).tolist(), [5, 8])
+        self.assertEqual(
+            call["conditioning_ids"][0, 5:].tolist(),
+            [LEGACY_CL100K_PAD_TOKEN] * 3,
+        )
+        self.assertEqual(
+            call["token_language_ids"][0, :5].unique().tolist(),
+            [language_id("en")],
+        )
+        self.assertEqual(call["token_language_ids"][0, 5:].tolist(), [0, 0, 0])
+
     def test_single_and_batch_reject_undeclared_code_switch_token_languages(self):
         runtime = make_runtime()
         spans = [TextSpan(text="merhaba", language="tr")]

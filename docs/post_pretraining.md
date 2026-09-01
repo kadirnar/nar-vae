@@ -145,8 +145,10 @@ speaker similarity, duration/truncation, and human-listening baselines.
 
 ### Stage 1 — High-quality supervised continuation
 
-Continue flow-matching and learned-duration training on the reviewed multilingual, multi-speaker
-subset. Retain representative broad-pretraining replay to detect and limit catastrophic forgetting.
+Continue the checkpoint's versioned generative objective and learned-duration training on the
+reviewed multilingual, multi-speaker subset. For the canonical model this is VP v-prediction, not
+flow matching. Retain representative broad-pretraining replay to detect and limit catastrophic
+forgetting.
 Balance language and speaker sampling, keep text/language/speaker CFG dropout active, and update the
 shared model rather than installing identities for individual speakers.
 
@@ -198,10 +200,10 @@ does not make the policy objective diffusion-native. Do not schedule this stage 
 model until its transition density, timestep weighting, replay contract, and tests have been
 derived for VP diffusion.
 
-For a separately maintained legacy rectified-flow experiment, start only from a converged,
-hash-bound NAR-VAE SFT export whose manifest retains its NAR-VAE
-scratch-pretraining parent. Third-party, legacy, pretraining-only, and already-GRPO
-weights are not accepted as a fresh reference. Copy the packaged
+For a separately maintained rectified-flow experiment, start only from a converged, hash-bound,
+current schema-5 NAR-VAE SFT export whose manifest retains its NAR-VAE pretraining parent.
+Schemas 2–4 are legacy inference inputs and are not accepted here; neither are third-party,
+pretraining-only, or already-GRPO weights. Copy the packaged
 `nar_vae.post_training.DEFAULT_GRPO_CONFIG_PATH`, point `parent_checkpoint` at the SFT
 `final/flow_model/pytorch_model.bin`, and call `grpo_post_train(config_path, reward=...)` from a
 guarded Python module. Launch that same module directly for one GPU or with `torchrun` for DDP; the

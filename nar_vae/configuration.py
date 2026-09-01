@@ -21,6 +21,7 @@ from typing import Any
 from nar_vae.objectives import (
     DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
     RECTIFIED_FLOW_OBJECTIVE,
+    VP_DIFFUSION_OBJECTIVE,
     normalize_generative_objective,
     validate_diffusion_schedule_shift,
 )
@@ -1795,6 +1796,17 @@ def validate_pretraining_config(config: Mapping[str, Any]) -> None:
     if config.get("model_initialization") != "random":
         raise ValueError("Pretraining requires model_initialization: random.")
     _validate_training_config_contract(config)
+    if config.get("text_conditioning_mode", "scratch_tokens") != "frozen_features":
+        raise ValueError(
+            "Fresh pretraining requires text_conditioning_mode: frozen_features; "
+            "scratch-token text encoders are supported only for authenticated legacy inference."
+        )
+    if config.get("generative_objective") != VP_DIFFUSION_OBJECTIVE:
+        raise ValueError(
+            "Fresh pretraining requires generative_objective: vp_diffusion_v; "
+            "rectified flow is supported only for authenticated checkpoint continuation "
+            "and inference."
+        )
 
     external = [key for key in _PRETRAINED_INITIALIZATION_KEYS if config.get(key)]
     if external:
@@ -1814,7 +1826,8 @@ def validate_pretraining_config(config: Mapping[str, Any]) -> None:
             )
     if config.get("freeze_text_encoder", False) or int(config.get("freeze_first_n_layers", 0)):
         raise ValueError(
-            "From-scratch pretraining cannot freeze randomly initialized text/DiT layers."
+            "Fresh pretraining cannot use legacy text-freezing controls or freeze randomly "
+            "initialized DiT layers."
         )
     if config.get("use_language_conditioning", False) and config.get(
         "freeze_language_embedding", False

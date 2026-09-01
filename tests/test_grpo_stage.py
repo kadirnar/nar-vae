@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -31,13 +32,19 @@ from nar_vae.languages import LanguagePair, language_id
 from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
 from nar_vae.model_manifest import (
     MODEL_MANIFEST_FILENAME,
+    MODEL_MANIFEST_SCHEMA_VERSION,
     ModelManifestError,
+    architecture_from_config,
+    capabilities_from_config,
+    generation_from_config,
     load_model_manifest,
+    representation_from_config,
+    text_conditioning_from_config,
     validate_grpo_parent_manifest,
     write_model_manifest,
 )
 from nar_vae.models.duration import MONOTONIC_ALIGNMENT_VERSION
-from nar_vae.objectives import RECTIFIED_FLOW_OBJECTIVE
+from nar_vae.objectives import RECTIFIED_FLOW_OBJECTIVE, VP_DIFFUSION_OBJECTIVE
 from nar_vae.post_training import (
     DEFAULT_GRPO_CONFIG_PATH,
     FlowGRPOConfig,
@@ -114,6 +121,42 @@ def frozen_model_config(codec_source: str = "./codec/weights.pth") -> dict:
         frozen_text_tokenizer_sha256="c" * 64,
     )
     return config
+
+
+def current_pretrain_model_config(codec_source: str = "./codec/weights.pth") -> dict:
+    config = frozen_model_config(codec_source)
+    config["generative_objective"] = VP_DIFFUSION_OBJECTIVE
+    return config
+
+
+def _write_grandfathered_rf_pretrain_manifest_for_test(
+    directory: Path,
+    config: dict,
+    *,
+    checkpoint_filename: str,
+):
+    """Write a historical schema-5 RF fixture without weakening production writer gates."""
+    checkpoint = directory / checkpoint_filename
+    generation = generation_from_config(config)
+    if generation["objective"] != RECTIFIED_FLOW_OBJECTIVE:
+        raise AssertionError("The grandfathered fixture helper accepts rectified flow only.")
+    raw = {
+        "schema_version": MODEL_MANIFEST_SCHEMA_VERSION,
+        "library": "nar-vae",
+        "stage": "pretrain",
+        "weights": {
+            checkpoint_filename: hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        },
+        "architecture": architecture_from_config(config),
+        "capabilities": capabilities_from_config(config),
+        "representation": representation_from_config(config),
+        "generation": generation,
+        "text_conditioning": text_conditioning_from_config(config),
+        "parent": None,
+    }
+    manifest_path = directory / MODEL_MANIFEST_FILENAME
+    manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+    return load_model_manifest(manifest_path)
 
 
 class ToyPromptDataset:
@@ -279,11 +322,10 @@ def write_sft_parent(root: Path, *, export_config: dict | None = None):
         stage="pretrain",
         checkpoint_file=pretrain_weights.name,
     )
-    pretrain_manifest = write_model_manifest(
+    pretrain_manifest = _write_grandfathered_rf_pretrain_manifest_for_test(
         pretrain,
         export_config,
-        stage="pretrain",
-        checkpoint_files=(pretrain_weights.name,),
+        checkpoint_filename=pretrain_weights.name,
     )
 
     sft = root / "sft"
@@ -1654,7 +1696,7 @@ class GRPOStageTest(unittest.TestCase):
             root = Path(directory)
             weights = root / "pytorch_model.bin"
             weights.write_bytes(b"weights")
-            invalid = model_config()
+            invalid = current_pretrain_model_config()
             for norm_eps, message in ((0.0, "norm_eps must be positive"), (True, "finite number")):
                 invalid["norm_eps"] = norm_eps
                 with (
@@ -1667,7 +1709,7 @@ class GRPOStageTest(unittest.TestCase):
                         stage="pretrain",
                         checkpoint_files=(weights.name,),
                     )
-            invalid = model_config()
+            invalid = current_pretrain_model_config()
             invalid["use_language_conditioning"] = 1
             with self.assertRaisesRegex(ModelManifestError, "must be a boolean"):
                 write_model_manifest(

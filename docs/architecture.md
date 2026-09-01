@@ -172,10 +172,17 @@ Checkpoint inspectors validate topology before constructing a model. Inference a
 manifest and weights before deserialization when using the built-in loader. Missing or conflicting
 new metadata is not inferred from tensor shapes when doing so would be ambiguous.
 
-Current exports use model-manifest schema 5 and prepared-representation contract 3. Schema-3 and
-schema-4 manifests remain readable without adding fields to their raw representation mappings, so
-their canonical hashes do not change. They are inference compatibility inputs only: GRPO/current
-export refuses to relabel their legacy unbound posterior sampling as the seeded v1 policy.
+Current exports use model-manifest schema 5 and prepared-representation contract 3. Authenticated
+schema-2 manifests load only through the exact origin compatibility lane: EchoDiT architecture v3,
+the original `cl100k_base` token/control-ID envelope, and the historical global-RNG DACVAE
+posterior call for reference audio. Schema-3 and schema-4 manifests also remain readable. None of
+these compatibility manifests is mutated or supplemented in its raw representation mapping, so
+its canonical hash stays unchanged.
+
+Schemas 2–4 are inference inputs only. Current training and export refuse to relabel their unbound
+posterior sampling as the schema-5 content-seeded policy. This exception preserves old checkpoint
+behavior; new schema-5 preparation and inference continue to use call-local, content-seeded
+posterior sampling.
 
 ## Training stages
 
@@ -186,8 +193,9 @@ export refuses to relabel their legacy unbound posterior sampling as the seeded 
    provider, codec, and tensor topology unless an explicitly supported versioned expansion path is
    selected.
 3. **GRPO** currently implements rectified-flow SDE ratios only and therefore rejects VP
-   checkpoints. A diffusion-native policy objective must be derived and tested before canonical
-   VP models can use that stage.
+   checkpoints. Its accepted parent is a current schema-5 rectified-flow NAR-VAE SFT export;
+   schemas 2–4 are inference-only and cannot enter training or export. A diffusion-native policy
+   objective must be derived and tested before canonical VP models can use that stage.
 
 ## Evaluation gates
 

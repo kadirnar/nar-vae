@@ -23,6 +23,7 @@ from nar_vae.configuration import (
 from nar_vae.dacvae import HubDACVAESource, load_dacvae, normalize_dacvae_source
 from nar_vae.dacvae_encoding import (
     derive_dacvae_posterior_seed,
+    encode_dacvae_posterior_legacy_global_rng,
     encode_dacvae_posterior_seeded,
 )
 from nar_vae.frozen_text_provider import FrozenTextProvider, FrozenTextProviderSpec
@@ -37,6 +38,8 @@ from nar_vae.languages import (
 )
 from nar_vae.model_manifest import (
     MODEL_MANIFEST_FILENAME,
+    MODEL_MANIFEST_SCHEMA_VERSION,
+    ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION,
     load_model_manifest,
     validate_inference_manifest,
     validate_loaded_codec,
@@ -54,11 +57,15 @@ from nar_vae.objectives import (
 )
 from nar_vae.solvers.ode_solver import ODESolver
 from nar_vae.tokenization import (
+    LEGACY_CL100K_PAD_TOKEN,
+    LEGACY_CL100K_TOKENIZER_NAME,
     PAD_TOKEN,
     TOKENIZER_NAME,
     TOTAL_VOCAB_SIZE,
     TextSpan,
+    encode_legacy_cl100k_text,
     encode_tts_conditioning,
+    validate_legacy_cl100k_tokenizer,
 )
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
@@ -69,6 +76,13 @@ _ACOUSTIC_DTYPE_ALIASES = {
     "fp32": torch.float32,
     "bfloat16": torch.bfloat16,
     "bf16": torch.bfloat16,
+}
+
+_RECTIFIED_FLOW_PROFILE_OVERRIDES = {
+    "quality": {"num_steps": 50, "solver": "heun", "cache_mode": "none"},
+    "balanced": {"num_steps": 32, "solver": "euler", "cache_mode": "none"},
+    "fast": {"num_steps": 16, "solver": "euler", "cache_mode": "none"},
+    "turbo": {"num_steps": 16, "solver": "euler", "cache_mode": "cache_dit"},
 }
 
 
@@ -97,6 +111,18 @@ def _cast_acoustic_parameters(model: torch.nn.Module, dtype: torch.dtype) -> Non
                     device=parameter.device,
                     dtype=dtype,
                 )
+
+
+def _manifest_schema_version(manifest: object) -> int:
+    """Read authenticated schema identity with a current-only protocol fallback."""
+    raw = getattr(manifest, "raw", None)
+    if not isinstance(raw, Mapping):
+        # Lightweight custom/test manifests predate the public ``raw`` attribute.
+        # They can exercise only current behavior; legacy routing always requires a
+        # real hash-authenticated ModelManifest from load_model_manifest().
+        return MODEL_MANIFEST_SCHEMA_VERSION
+    value = raw.get("schema_version", MODEL_MANIFEST_SCHEMA_VERSION)
+    return int(value)
 
 
 def _runtime_generation_contract(runtime: object) -> tuple[str, float]:
@@ -252,14 +278,35 @@ class FlowMatchingTTSInference:
             prefer_ema=prefer_ema,
             preload_validator=validate_before_deserialization,
         )
-        checkpoint.validate_architecture()
+        expected_architecture_version = ECHODIT_ARCHITECTURE_VERSION
+        allow_missing_legacy_metadata = False
+        if preloaded_manifest is not None:
+            expected_architecture_version = int(
+                preloaded_manifest.architecture["architecture_version"]
+            )
+            allow_missing_legacy_metadata = (
+                _manifest_schema_version(preloaded_manifest) == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION
+            )
+        if expected_architecture_version == ECHODIT_ARCHITECTURE_VERSION:
+            checkpoint.validate_architecture()
+        else:
+            checkpoint.validate_architecture(
+                expected_version=expected_architecture_version,
+                allow_missing_legacy_metadata=allow_missing_legacy_metadata,
+            )
         checkpoint_objective = checkpoint.generative_objective()
         checkpoint_schedule_shift = checkpoint.diffusion_schedule_shift()
         checkpoint_text_conditioning = checkpoint.text_conditioning()
         self.generative_objective = checkpoint_objective
         self.diffusion_schedule_shift = checkpoint_schedule_shift
         self.text_conditioning_mode = checkpoint_text_conditioning.mode
-        checkpoint_target_patch_size = checkpoint.infer_target_patch_size()
+        if expected_architecture_version == ECHODIT_ARCHITECTURE_VERSION:
+            checkpoint_target_patch_size = checkpoint.infer_target_patch_size()
+        else:
+            checkpoint_target_patch_size = checkpoint.infer_target_patch_size(
+                expected_version=expected_architecture_version,
+                allow_missing_legacy_metadata=allow_missing_legacy_metadata,
+            )
         if target_patch_size is None:
             target_patch_size = checkpoint_target_patch_size
         elif target_patch_size != checkpoint_target_patch_size:
@@ -332,7 +379,13 @@ class FlowMatchingTTSInference:
         self.text_vocab_size = text_vocab_size
         self.supports_voice_cloning = bool(use_speaker_conditioning)
 
-        checkpoint_language = checkpoint.language_capability()
+        checkpoint_language = (
+            checkpoint.language_capability()
+            if expected_architecture_version == ECHODIT_ARCHITECTURE_VERSION
+            else checkpoint.language_capability(
+                expected_architecture_version=expected_architecture_version
+            )
+        )
         if use_language_conditioning is None:
             use_language_conditioning = checkpoint_language.enabled
         elif use_language_conditioning and not checkpoint_language.enabled:
@@ -366,7 +419,13 @@ class FlowMatchingTTSInference:
         self.uses_language_conditioning = bool(use_language_conditioning)
         self.supported_languages = resolved_languages
         self.supports_multilingual = len(resolved_languages) > 1
-        checkpoint_duration = checkpoint.duration_capability()
+        checkpoint_duration = (
+            checkpoint.duration_capability()
+            if expected_architecture_version == ECHODIT_ARCHITECTURE_VERSION
+            else checkpoint.duration_capability(
+                expected_architecture_version=expected_architecture_version
+            )
+        )
         if use_duration_predictor is None:
             use_duration_predictor = checkpoint_duration.enabled
         elif use_duration_predictor and not checkpoint_duration.enabled:
@@ -378,9 +437,21 @@ class FlowMatchingTTSInference:
                 "Learned duration cannot be disabled for an EchoDiT v2 duration checkpoint."
             )
         self.uses_learned_duration = bool(use_duration_predictor)
-        checkpoint_alignment = checkpoint.monotonic_alignment_capability()
+        checkpoint_alignment = (
+            checkpoint.monotonic_alignment_capability()
+            if expected_architecture_version == ECHODIT_ARCHITECTURE_VERSION
+            else checkpoint.monotonic_alignment_capability(
+                expected_architecture_version=expected_architecture_version
+            )
+        )
         self.uses_mas_duration = checkpoint_alignment.enabled
-        reference_language_capability = checkpoint.reference_language_capability()
+        reference_language_capability = (
+            checkpoint.reference_language_capability()
+            if expected_architecture_version == ECHODIT_ARCHITECTURE_VERSION
+            else checkpoint.reference_language_capability(
+                expected_architecture_version=expected_architecture_version
+            )
+        )
         self.supported_reference_languages = reference_language_capability.supported_languages
         checkpoint_language_pairs = reference_language_capability.supported_pairs
         self.supported_language_pairs = (
@@ -428,7 +499,7 @@ class FlowMatchingTTSInference:
             codec_source = normalize_dacvae_source(dacvae_model)
         self.dacvae_source = codec_source
         inference_architecture = {
-            "architecture_version": ECHODIT_ARCHITECTURE_VERSION,
+            "architecture_version": expected_architecture_version,
             "latent_size": latent_size,
             "model_size": model_size,
             "num_layers": num_layers,
@@ -530,13 +601,34 @@ class FlowMatchingTTSInference:
                     "frozen_text_provider cannot be supplied to a scratch-token checkpoint."
                 )
             self.frozen_text_provider = None
-            self.text_pad_token = PAD_TOKEN
+            self.legacy_cl100k_frontend = (
+                _manifest_schema_version(self.model_manifest)
+                == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION
+            )
+            if self.legacy_cl100k_frontend:
+                try:
+                    import tiktoken
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Authenticated schema-2 checkpoints require the cl100k runtime "
+                        "dependency 'tiktoken'."
+                    ) from exc
+                self.legacy_tokenizer = tiktoken.get_encoding(LEGACY_CL100K_TOKENIZER_NAME)
+                validate_legacy_cl100k_tokenizer(self.legacy_tokenizer)
+                self.text_pad_token = LEGACY_CL100K_PAD_TOKEN
+            else:
+                self.legacy_tokenizer = None
+                self.text_pad_token = PAD_TOKEN
         print(
             "Loading text frontend: "
             + (
                 str(self.model_manifest.text_conditioning["encoder_id"])
                 if self.text_conditioning_mode == "frozen_features"
-                else TOKENIZER_NAME
+                else (
+                    LEGACY_CL100K_TOKENIZER_NAME
+                    if getattr(self, "legacy_cl100k_frontend", False)
+                    else TOKENIZER_NAME
+                )
             )
         )
 
@@ -592,6 +684,7 @@ class FlowMatchingTTSInference:
             duration_alignment_hidden_size=checkpoint_alignment.hidden_size or 64,
             generative_objective=checkpoint_objective,
             diffusion_schedule_shift=checkpoint_schedule_shift,
+            architecture_version=expected_architecture_version,
         )
 
         # Load checkpoint
@@ -664,7 +757,11 @@ class FlowMatchingTTSInference:
 
     def generation_profile(self, name: str = "quality") -> GenerationConfig:
         """Return one of the packaged, validated inference profiles."""
-        return self.settings.profile(name)
+        profile = self.settings.profile(name)
+        objective, _ = _runtime_generation_contract(self)
+        if objective == RECTIFIED_FLOW_OBJECTIVE:
+            return profile.with_overrides(**_RECTIFIED_FLOW_PROFILE_OVERRIDES[name])
+        return profile
 
     def _prepare_conditioning(
         self,
@@ -706,6 +803,36 @@ class FlowMatchingTTSInference:
                 )[None, :, :],
                 token_language_ids=prepared.token_language_ids.to(self.device)[None, :],
                 alignment_mask=prepared.alignment_mask.to(self.device)[None, :],
+            )
+        if getattr(self, "legacy_cl100k_frontend", False):
+            if normalized_text is not None or phonemes is not None or language_spans is not None:
+                raise ValueError(
+                    "Authenticated schema-2 cl100k checkpoints accept raw text only; "
+                    "normalized_text, phonemes, and language_spans use newer frontend semantics."
+                )
+            tokenizer = getattr(self, "legacy_tokenizer", None)
+            if tokenizer is None:
+                raise RuntimeError("The authenticated schema-2 cl100k tokenizer is unavailable.")
+            conditioning_ids = encode_legacy_cl100k_text(
+                text.strip(),
+                tokenizer,
+                vocab_size=getattr(self, "text_vocab_size", None),
+                language=language,
+            )
+            target_language_id = language_id(language)
+            token_language_ids = [target_language_id] * len(conditioning_ids)
+            alignment_mask = [True] * len(conditioning_ids)
+            self._validate_token_language_capability(token_language_ids)
+            return _PreparedText(
+                conditioning_ids=torch.tensor(
+                    [conditioning_ids], dtype=torch.long, device=self.device
+                ),
+                conditioning_mask=None,
+                conditioning_features=None,
+                token_language_ids=torch.tensor(
+                    [token_language_ids], dtype=torch.long, device=self.device
+                ),
+                alignment_mask=torch.tensor([alignment_mask], dtype=torch.bool, device=self.device),
             )
         prepared = encode_tts_conditioning(
             text.strip(),
@@ -1098,15 +1225,25 @@ class FlowMatchingTTSInference:
         if waveform.shape[-1] < self.hop_length:
             waveform = F.pad(waveform, (0, self.hop_length - waveform.shape[-1]))
 
-        seed = derive_dacvae_posterior_seed(
-            waveform,
-            codec_sha256=self.model_manifest.representation["codec_sha256"],
-        )
-        speaker_latent = encode_dacvae_posterior_seeded(
-            self.dacvae,
-            waveform.unsqueeze(0).to(self.device),
-            seed=seed,
-        )
+        codec_input = waveform.unsqueeze(0).to(self.device)
+        if getattr(self, "legacy_cl100k_frontend", False):
+            # Schema 2 predates the seeded posterior policy and trained speaker
+            # conditioning against DACVAE's global-RNG posterior sample. Preserve
+            # that authenticated reference distribution without changing DACVAE.
+            speaker_latent = encode_dacvae_posterior_legacy_global_rng(
+                self.dacvae,
+                codec_input,
+            )
+        else:
+            seed = derive_dacvae_posterior_seed(
+                waveform,
+                codec_sha256=self.model_manifest.representation["codec_sha256"],
+            )
+            speaker_latent = encode_dacvae_posterior_seeded(
+                self.dacvae,
+                codec_input,
+                seed=seed,
+            )
         return self._align_speaker_latent(speaker_latent)
 
     def _resolve_speaker_latent(

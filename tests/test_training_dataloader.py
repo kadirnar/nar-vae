@@ -84,6 +84,20 @@ class AttentionMetadataDataset(MetadataDataset):
         return super().__getitem__(key)
 
 
+class PretrainingContractLinear(torch.nn.Linear):
+    text_conditioning_mode = "frozen_features"
+    generative_objective = "vp_diffusion_v"
+
+
+class TrainingModelWrapper(torch.nn.Module):
+    text_conditioning_mode = "frozen_features"
+    generative_objective = "vp_diffusion_v"
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+
 class CapturingAccelerator:
     def __init__(self):
         self.input_loader = None
@@ -351,10 +365,18 @@ class TrainingDataLoaderTest(unittest.TestCase):
                     dataloader_pin_memory=False,
                     report_to=[],
                 )
+                trainer_config = dict(config)
+                model = nn.Linear(1, 1)
+                if trainer_type is EchoDiTTrainer:
+                    trainer_config.update(
+                        text_conditioning_mode="frozen_features",
+                        generative_objective="vp_diffusion_v",
+                    )
+                    model = PretrainingContractLinear(1, 1)
                 trainer = trainer_type(
                     **{
-                        config_key: config,
-                        "model": nn.Linear(1, 1),
+                        config_key: trainer_config,
+                        "model": model,
                         "args": arguments,
                         "train_dataset": MetadataDataset([3, 4]),
                         "data_collator": collate_ids,
@@ -370,6 +392,57 @@ class TrainingDataLoaderTest(unittest.TestCase):
                     trainer._frame_budget_batch_sampler,
                     FrameBudgetBatchSampler,
                 )
+
+    def test_pretraining_trainer_rejects_config_or_unwrapped_model_contract_mismatch(self):
+        with TemporaryDirectory() as directory:
+            arguments = TrainingArguments(
+                output_dir=directory,
+                per_device_train_batch_size=1,
+                remove_unused_columns=False,
+                report_to=[],
+            )
+            valid_config = {
+                "text_conditioning_mode": "frozen_features",
+                "generative_objective": "vp_diffusion_v",
+            }
+            valid_model = PretrainingContractLinear(1, 1)
+            rectified_model = PretrainingContractLinear(1, 1)
+            rectified_model.generative_objective = "rectified_flow"
+            cases = (
+                (
+                    {**valid_config, "text_conditioning_mode": "scratch_tokens"},
+                    valid_model,
+                    "requires text_conditioning_mode: frozen_features",
+                ),
+                (
+                    {**valid_config, "generative_objective": "rectified_flow"},
+                    valid_model,
+                    "requires generative_objective: vp_diffusion_v",
+                ),
+                (
+                    valid_config,
+                    TrainingModelWrapper(nn.Linear(1, 1)),
+                    "cannot relabel a scratch-token model",
+                ),
+                (
+                    valid_config,
+                    TrainingModelWrapper(rectified_model),
+                    "cannot relabel a rectified-flow model",
+                ),
+            )
+
+            for config, model, message in cases:
+                with (
+                    self.subTest(message=message),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    EchoDiTTrainer(
+                        training_config=config,
+                        model=model,
+                        args=arguments,
+                        train_dataset=MetadataDataset([1]),
+                        data_collator=collate_ids,
+                    )
 
     def test_builder_uses_metadata_and_constructs_one_global_batch_plan(self):
         trainer, dataset, accelerator = self._trainer([7, 5, 4, 3, 2])

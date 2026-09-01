@@ -19,6 +19,7 @@ from nar_vae.dacvae_encoding import (
     DACVAEEncodingError,
     canonical_mono_float32_pcm,
     derive_dacvae_posterior_seed,
+    encode_dacvae_posterior_legacy_global_rng,
     encode_dacvae_posterior_seeded,
     validate_torch_seed,
 )
@@ -83,8 +84,16 @@ class SeedContractTest(unittest.TestCase):
         self.assertEqual(DACVAE_POSTERIOR_SAMPLING_POLICY, "posterior_sample_seeded_v1")
 
     def test_canonical_pcm_rejects_invalid_shape_empty_and_nonfinite(self):
+        audio = np.asarray([-0.0, 0.5], dtype="<f4")
+        original_bits = audio.view(np.uint32).copy()
         expected = np.asarray([0.0, 0.5], dtype="<f4").tobytes()
-        self.assertEqual(canonical_mono_float32_pcm([-0.0, 0.5]), expected)
+        self.assertEqual(canonical_mono_float32_pcm(audio), expected)
+        np.testing.assert_array_equal(audio.view(np.uint32), original_bits)
+
+        tensor = torch.tensor([-0.0, 0.5], dtype=torch.float32)
+        tensor_bits = tensor.view(torch.int32).clone()
+        self.assertEqual(canonical_mono_float32_pcm(tensor), expected)
+        torch.testing.assert_close(tensor.view(torch.int32), tensor_bits)
         for invalid in ([], np.zeros((1, 1, 2)), [0.0, float("nan")]):
             with self.subTest(shape=np.asarray(invalid).shape):
                 with self.assertRaises(DACVAEEncodingError):
@@ -108,6 +117,21 @@ class SeededPosteriorEncodingTest(unittest.TestCase):
 
         actual = encode_dacvae_posterior_seeded(self.codec, self.audio, seed=1729)
         self.assertTrue(torch.equal(actual, expected))
+
+    def test_legacy_helper_matches_origin_global_rng_and_consumes_the_same_state(self):
+        prior_state = torch.random.get_rng_state()
+        try:
+            torch.manual_seed(1729)
+            expected = self.codec.encode(self.audio)
+            expected_state = torch.random.get_rng_state().clone()
+            torch.manual_seed(1729)
+            actual = encode_dacvae_posterior_legacy_global_rng(self.codec, self.audio)
+            actual_state = torch.random.get_rng_state().clone()
+        finally:
+            torch.random.set_rng_state(prior_state)
+
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.equal(actual_state, expected_state))
 
     def test_posterior_formula_oracle_and_seed_sensitivity(self):
         encoded = self.codec.encoder(self.codec._pad(self.audio))
@@ -170,9 +194,10 @@ class SeededPosteriorEncodingTest(unittest.TestCase):
 
 
 class ProductionCallSiteTest(unittest.TestCase):
-    def test_all_production_dacvae_encodes_use_the_seeded_helper(self):
+    def test_production_dacvae_encodes_use_only_versioned_boundary_helpers(self):
         package = Path(__file__).resolve().parents[1] / "nar_vae"
-        helper_calls = Counter()
+        seeded_calls = Counter()
+        legacy_calls = Counter()
         raw_calls = []
         for path in package.rglob("*.py"):
             relative = path.relative_to(package).as_posix()
@@ -182,22 +207,32 @@ class ProductionCallSiteTest(unittest.TestCase):
             if ".dacvae.encode(" in source:
                 raw_calls.append(relative)
             tree = ast.parse(source, filename=str(path))
-            helper_calls[relative] = sum(
+            seeded_calls[relative] = sum(
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "encode_dacvae_posterior_seeded"
                 for node in ast.walk(tree)
             )
+            legacy_calls[relative] = sum(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "encode_dacvae_posterior_legacy_global_rng"
+                for node in ast.walk(tree)
+            )
 
         self.assertEqual(raw_calls, [])
         self.assertEqual(
-            {name: count for name, count in helper_calls.items() if count},
+            {name: count for name, count in seeded_calls.items() if count},
             {
                 "dataset/finetune_prepare.py": 2,
                 "dataset/prepare.py": 2,
                 "dataset/prepare_dataset.py": 3,
                 "inference.py": 1,
             },
+        )
+        self.assertEqual(
+            {name: count for name, count in legacy_calls.items() if count},
+            {"inference.py": 1},
         )
 
 

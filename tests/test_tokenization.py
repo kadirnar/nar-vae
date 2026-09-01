@@ -102,6 +102,57 @@ class TokenizationTest(unittest.TestCase):
         self.assertIsInstance(ids, list)
         self.assertEqual(ids, tokenization.encode_tts_conditioning("Merhaba", language="tr")[0])
 
+    def test_authenticated_legacy_cl100k_envelope_matches_golden_vectors(self):
+        import tiktoken
+
+        encoder = tiktoken.get_encoding("cl100k_base")
+        tokenization.validate_legacy_cl100k_tokenizer(encoder)
+        golden = {
+            "Hello, world!": [9906, 11, 1917, 0],
+            "Merhaba dünya!": [27814, 10796, 64, 52119, 23741, 0],
+            "こんにちは世界": [90115, 3574, 244, 98220],
+            "İstanbul’da yağmur.": [48880, 46216, 529, 3315, 13835, 11257, 66206, 13],
+        }
+        for text, inner_ids in golden.items():
+            with self.subTest(text=text):
+                self.assertEqual(
+                    tokenization.encode_legacy_cl100k_text(text, encoder),
+                    [100282, *inner_ids, 100283, 100284, 100280],
+                )
+        self.assertEqual(
+            tokenization.encode_legacy_cl100k_text("<laugh> hello", encoder),
+            [100282, 100287, 24748, 100283, 100284, 100280],
+        )
+
+    def test_legacy_emotion_falls_back_to_literal_bpe_when_vocab_omits_emotions(self):
+        import tiktoken
+
+        encoder = tiktoken.get_encoding("cl100k_base")
+        self.assertEqual(
+            tokenization.encode_legacy_cl100k_text(
+                "<laugh> hello",
+                encoder,
+                vocab_size=100287,
+            ),
+            [100282, 27, 4355, 7595, 29, 24748, 100283, 100284, 100280],
+        )
+        self.assertEqual(
+            tokenization.encode_legacy_cl100k_text(
+                "<laugh> hello",
+                encoder,
+                vocab_size=100312,
+            ),
+            [100282, 100287, 24748, 100283, 100284, 100280],
+        )
+
+    def test_compact_public_encoder_never_uses_a_supplied_cl100k_tokenizer(self):
+        class ExplodingTokenizer:
+            def encode(self, text):
+                raise AssertionError(f"compact path leaked into cl100k for {text!r}")
+
+        ids = tokenization.encode_tts_text("hello", ExplodingTokenizer(), language="en")
+        self.assertLess(max(ids), tokenization.TOTAL_VOCAB_SIZE)
+
     def test_checkpoint_vocab_and_unknown_language_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "exceed the checkpoint vocabulary"):
             tokenization.encode_tts_text("Hi", vocab_size=2)

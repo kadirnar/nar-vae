@@ -1,10 +1,11 @@
 """Reproducible DACVAE posterior sampling without codec-side changes.
 
 The bundled DACVAE's public ``encode`` method samples from its learned
-posterior even in evaluation mode.  This module preserves that sampling
-contract while using a call-local :class:`torch.Generator`, so dataset
-preparation and reference encoding do not consume or rewind process-global
-random state.
+posterior even in evaluation mode. Current representation contracts preserve
+that distribution with a call-local :class:`torch.Generator`, so dataset
+preparation and current reference encoding do not consume or rewind process-
+global random state. Authenticated schema-2 inference is the explicit exception:
+its compatibility helper retains the historical global-RNG ``DACVAE.encode`` call.
 
 Nothing in this module changes DACVAE parameters or source.  In particular,
 posterior-mean encoding is intentionally not offered: a mean-only latent has a
@@ -84,7 +85,9 @@ def canonical_mono_float32_pcm(audio: Any) -> bytes:
         )
     if not np.isfinite(samples).all():
         raise DACVAEEncodingError("audio must contain only finite samples.")
-    samples = np.ascontiguousarray(samples, dtype="<f4")
+    # Copy before canonicalizing signed zero: a CPU float32 Tensor's NumPy view
+    # otherwise aliases its storage, and a content-identity helper must be pure.
+    samples = np.array(samples, dtype="<f4", order="C", copy=True)
     # Canonicalize the otherwise observable sign bit of IEEE-754 zero.
     samples[samples == 0] = 0.0
     return samples.tobytes()
@@ -179,6 +182,34 @@ def encode_dacvae_posterior_seeded(
     return noise * stdev + mean
 
 
+@torch.inference_mode()
+def encode_dacvae_posterior_legacy_global_rng(
+    codec: Any,
+    audio_data: torch.Tensor,
+) -> torch.Tensor:
+    """Call the unchanged global-RNG posterior used by schema-2 speaker cloning.
+
+    This deliberately consumes the process RNG exactly like the historical
+    ``DACVAE.encode`` boundary. Current representation contracts must use
+    :func:`encode_dacvae_posterior_seeded` instead.
+    """
+    if not isinstance(audio_data, torch.Tensor):
+        raise TypeError("audio_data must be a torch.Tensor.")
+    if audio_data.ndim != 3 or audio_data.shape[0] != 1 or audio_data.shape[1] != 1:
+        raise DACVAEEncodingError("audio_data must have shape [1, 1, T].")
+    if audio_data.shape[-1] <= 0:
+        raise DACVAEEncodingError("audio_data must contain at least one sample.")
+    if not torch.is_floating_point(audio_data) or not torch.isfinite(audio_data).all():
+        raise DACVAEEncodingError("audio_data must contain finite floating-point samples.")
+    try:
+        latent = codec.encode(audio_data)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise DACVAEEncodingError("codec must expose a compatible DACVAE encode() API.") from exc
+    if not isinstance(latent, torch.Tensor):
+        raise DACVAEEncodingError("DACVAE encode() must return a torch.Tensor.")
+    return latent
+
+
 __all__ = [
     "DACVAEEncodingError",
     "DACVAE_POSTERIOR_SAMPLING_POLICY",
@@ -186,6 +217,7 @@ __all__ = [
     "TORCH_UINT64_SEED_MAX",
     "canonical_mono_float32_pcm",
     "derive_dacvae_posterior_seed",
+    "encode_dacvae_posterior_legacy_global_rng",
     "encode_dacvae_posterior_seeded",
     "validate_torch_seed",
 ]

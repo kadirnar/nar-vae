@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from .alignment import allocate_integer_durations
 
+LEGACY_ECHODIT_ARCHITECTURE_VERSION = 3
 ECHODIT_ARCHITECTURE_VERSION = 4
 DURATION_PREDICTOR_VERSION = 1
 MONOTONIC_ALIGNMENT_VERSION = 1
@@ -360,6 +361,7 @@ __all__ = [
     "DURATION_PREDICTOR_VERSION",
     "DurationAlignmentOutput",
     "ECHODIT_ARCHITECTURE_VERSION",
+    "LEGACY_ECHODIT_ARCHITECTURE_VERSION",
     "EchoDurationAlignment",
     "EchoDurationPredictor",
     "MONOTONIC_ALIGNMENT_VERSION",

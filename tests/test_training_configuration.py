@@ -56,6 +56,26 @@ class TrainingConfigurationTest(unittest.TestCase):
             "report_to": "wandb",
             "gradient_checkpointing": True,
             "seed": 17,
+            "generative_objective": "vp_diffusion_v",
+            "text_conditioning_mode": "frozen_features",
+            "text_num_layers": 0,
+            "text_vocab_size": 1969,
+            "pad_token": 1,
+            "conditioning_feature_size": 768,
+            "conditioning_feature_dtype": "float16",
+            "frozen_text_alignment": "hf_non_special_tokens_v1",
+            "frozen_text_cache_version": 1,
+            "frozen_text_config_sha256": "a" * 64,
+            "frozen_text_encoder_id": "vinai/xphonebert-base",
+            "frozen_text_encoder_revision": "a" * 40,
+            "frozen_text_frontend": "phonemes",
+            "frozen_text_hidden_layer": -1,
+            "frozen_text_model_filename": "model.safetensors",
+            "frozen_text_model_sha256": "b" * 64,
+            "frozen_text_tokenizer_filename": "tokenizer.json",
+            "frozen_text_tokenizer_id": "vinai/xphonebert-base",
+            "frozen_text_tokenizer_revision": "a" * 40,
+            "frozen_text_tokenizer_sha256": "c" * 64,
         }
 
     def test_pretraining_is_random_and_rejects_external_tts_weights(self):
@@ -77,6 +97,27 @@ class TrainingConfigurationTest(unittest.TestCase):
                         ValueError,
                         "cannot initialize from external TTS weights",
                     ),
+                ):
+                    validate_pretraining_config(invalid)
+
+            scratch = {
+                "training_stage": "pretrain",
+                "model_initialization": "random",
+                "save_folder": str(Path(directory) / "scratch"),
+                "learning_rate": 3e-4,
+            }
+            with self.assertRaisesRegex(ValueError, "requires text_conditioning_mode"):
+                validate_pretraining_config(scratch)
+
+            for name, objective in (("omitted", None), ("rectified_flow", "rectified_flow")):
+                invalid = self._pretraining_config(Path(directory) / name)
+                if objective is None:
+                    invalid.pop("generative_objective")
+                else:
+                    invalid["generative_objective"] = objective
+                with (
+                    self.subTest(objective=name),
+                    self.assertRaisesRegex(ValueError, "generative_objective: vp_diffusion_v"),
                 ):
                     validate_pretraining_config(invalid)
 

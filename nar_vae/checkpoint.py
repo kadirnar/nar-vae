@@ -23,6 +23,7 @@ from nar_vae.languages import (
 from nar_vae.models.duration import (
     DURATION_PREDICTOR_VERSION,
     ECHODIT_ARCHITECTURE_VERSION,
+    LEGACY_ECHODIT_ARCHITECTURE_VERSION,
     MONOTONIC_ALIGNMENT_VERSION,
 )
 from nar_vae.objectives import (
@@ -374,6 +375,8 @@ def _monotonic_alignment_state_keys(state_dict: Mapping[str, torch.Tensor]) -> s
 
 def inspect_duration_capability(
     state_dict: Mapping[str, torch.Tensor],
+    *,
+    expected_architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
 ) -> DurationCheckpointInfo:
     """Validate EchoDiT v2 duration tensors without inferring capability from config."""
     parameter_keys = {key for key in state_dict if key.startswith(DURATION_PARAMETER_PREFIX)}
@@ -417,9 +420,10 @@ def inspect_duration_capability(
         "duration_predictor_uses_speaker_metadata",
         LegacyDurationCheckpointError,
     )
-    if architecture_version != ECHODIT_ARCHITECTURE_VERSION:
+    if architecture_version != expected_architecture_version:
         raise LegacyDurationCheckpointError(
-            f"Unsupported EchoDiT architecture version: {architecture_version}."
+            "Duration predictor architecture metadata does not match the authenticated "
+            f"EchoDiT topology: {architecture_version} != {expected_architecture_version}."
         )
     if predictor_version != DURATION_PREDICTOR_VERSION:
         raise LegacyDurationCheckpointError(
@@ -495,21 +499,79 @@ def inspect_duration_capability(
     )
 
 
-def inspect_architecture_version(state_dict: Mapping[str, torch.Tensor]) -> int:
-    """Require the topology version carried by every current NAR-VAE checkpoint."""
+def _validate_expected_architecture_version(expected_version: int) -> None:
+    if expected_version not in {
+        LEGACY_ECHODIT_ARCHITECTURE_VERSION,
+        ECHODIT_ARCHITECTURE_VERSION,
+    }:
+        raise LegacyArchitectureCheckpointError(
+            f"Unsupported expected NAR-VAE architecture version: {expected_version}."
+        )
+
+
+def _reject_v4_state_in_legacy_v3(state_dict: Mapping[str, torch.Tensor]) -> None:
+    """Reject additive v4 topology state on the authenticated schema-2 lane."""
+    forbidden_keys = {
+        TARGET_PATCH_SIZE_METADATA_KEY,
+        "null_speaker_state",
+        "dit.speaker_encoder.global_timbre_token",
+        GLOBAL_LANGUAGE_EMBEDDING_KEY,
+        "speaker_resampler_version",
+        "speaker_num_summary_tokens_metadata",
+    }
+    present = forbidden_keys.intersection(state_dict)
+    present.update(key for key in state_dict if key.startswith(SPEAKER_RESAMPLER_PARAMETER_PREFIX))
+    if present:
+        raise LegacyArchitectureCheckpointError(
+            "Authenticated EchoDiT architecture v3 weights contain v4-only state: "
+            f"{sorted(present)}."
+        )
+
+
+def inspect_architecture_version(
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    expected_version: int = ECHODIT_ARCHITECTURE_VERSION,
+    allow_missing_legacy_metadata: bool = False,
+) -> int:
+    """Validate checkpoint topology against an already authenticated manifest identity.
+
+    Version 3 omitted the architecture scalar only when its duration head was disabled.
+    That omission is accepted solely when a schema-2 manifest has already authenticated
+    the artifact and the caller explicitly supplies both legacy arguments.
+    """
+    _validate_expected_architecture_version(expected_version)
+    if allow_missing_legacy_metadata and expected_version != LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+        raise LegacyArchitectureCheckpointError(
+            "Missing architecture metadata can be allowed only for authenticated version 3."
+        )
     if ARCHITECTURE_METADATA_KEY not in state_dict:
-        raise LegacyArchitectureCheckpointError(
-            "Checkpoint weights do not contain versioned NAR-VAE architecture metadata."
+        if not allow_missing_legacy_metadata:
+            raise LegacyArchitectureCheckpointError(
+                "Checkpoint weights do not contain versioned NAR-VAE architecture metadata."
+            )
+        version = LEGACY_ECHODIT_ARCHITECTURE_VERSION
+    else:
+        version = _scalar_metadata(
+            state_dict,
+            ARCHITECTURE_METADATA_KEY,
+            LegacyArchitectureCheckpointError,
         )
-    version = _scalar_metadata(
-        state_dict,
-        ARCHITECTURE_METADATA_KEY,
-        LegacyArchitectureCheckpointError,
-    )
-    if version != ECHODIT_ARCHITECTURE_VERSION:
+    if version != expected_version:
         raise LegacyArchitectureCheckpointError(
-            f"Unsupported NAR-VAE architecture version: {version}."
+            "Checkpoint architecture metadata does not match the authenticated manifest: "
+            f"{version} != {expected_version}."
         )
+    if version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+        _reject_v4_state_in_legacy_v3(state_dict)
+        has_duration_state = any(key.startswith(DURATION_PARAMETER_PREFIX) for key in state_dict)
+        has_architecture_metadata = ARCHITECTURE_METADATA_KEY in state_dict
+        if has_architecture_metadata != has_duration_state:
+            raise LegacyArchitectureCheckpointError(
+                "EchoDiT architecture v3 metadata must be present exactly when the "
+                "duration predictor is present."
+            )
+        return version
     if TARGET_PATCH_SIZE_METADATA_KEY not in state_dict:
         raise LegacyArchitectureCheckpointError(
             "Checkpoint weights do not declare the target-latent patch size."
@@ -526,9 +588,20 @@ def inspect_architecture_version(state_dict: Mapping[str, torch.Tensor]) -> int:
     return version
 
 
-def inspect_target_patch_size(state_dict: Mapping[str, torch.Tensor]) -> int:
-    """Return the exact temporal packing factor after validating the v4 contract."""
-    inspect_architecture_version(state_dict)
+def inspect_target_patch_size(
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    expected_version: int = ECHODIT_ARCHITECTURE_VERSION,
+    allow_missing_legacy_metadata: bool = False,
+) -> int:
+    """Return the exact temporal packing factor for an authenticated topology."""
+    version = inspect_architecture_version(
+        state_dict,
+        expected_version=expected_version,
+        allow_missing_legacy_metadata=allow_missing_legacy_metadata,
+    )
+    if version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+        return 1
     return _scalar_metadata(
         state_dict,
         TARGET_PATCH_SIZE_METADATA_KEY,
@@ -695,6 +768,8 @@ def inspect_text_conditioning(
 
 def inspect_monotonic_alignment_capability(
     state_dict: Mapping[str, torch.Tensor],
+    *,
+    expected_architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
 ) -> MonotonicAlignmentCheckpointInfo:
     """Validate the independently versioned MAS head from checkpoint tensors."""
     parameter_keys = {
@@ -719,7 +794,10 @@ def inspect_monotonic_alignment_capability(
             "MAS weights require complete monotonic-alignment metadata. "
             f"Missing: {sorted(missing_metadata)}."
         )
-    duration = inspect_duration_capability(state_dict)
+    duration = inspect_duration_capability(
+        state_dict,
+        expected_architecture_version=expected_architecture_version,
+    )
     if not duration.enabled:
         raise LegacyMonotonicAlignmentCheckpointError(
             "MAS capability requires a versioned learned-duration predictor."
@@ -863,10 +941,23 @@ def _language_pair_id_metadata(
 
 def inspect_language_conditioning(
     state_dict: Mapping[str, torch.Tensor],
+    *,
+    expected_architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
 ) -> LanguageCheckpointInfo:
     """Validate versioned language metadata and return supported codes."""
+    _validate_expected_architecture_version(expected_architecture_version)
     embedding = state_dict.get(LANGUAGE_EMBEDDING_KEY)
-    metadata_keys = LANGUAGE_STATE_KEYS - {LANGUAGE_EMBEDDING_KEY}
+    if expected_architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+        if GLOBAL_LANGUAGE_EMBEDDING_KEY in state_dict:
+            raise LegacyLanguageCheckpointError(
+                "EchoDiT architecture v3 cannot contain a global language embedding."
+            )
+        metadata_keys = LANGUAGE_STATE_KEYS - {
+            LANGUAGE_EMBEDDING_KEY,
+            GLOBAL_LANGUAGE_EMBEDDING_KEY,
+        }
+    else:
+        metadata_keys = LANGUAGE_STATE_KEYS - {LANGUAGE_EMBEDDING_KEY}
     present_metadata = metadata_keys.intersection(state_dict)
     if embedding is None:
         if present_metadata:
@@ -884,8 +975,10 @@ def inspect_language_conditioning(
         )
     if not isinstance(embedding, torch.Tensor) or embedding.ndim != 2:
         raise LegacyLanguageCheckpointError("Language embedding must be a rank-2 tensor.")
-    global_embedding = state_dict[GLOBAL_LANGUAGE_EMBEDDING_KEY]
-    if not isinstance(global_embedding, torch.Tensor) or global_embedding.ndim != 2:
+    global_embedding = state_dict.get(GLOBAL_LANGUAGE_EMBEDDING_KEY)
+    if expected_architecture_version >= ECHODIT_ARCHITECTURE_VERSION and (
+        not isinstance(global_embedding, torch.Tensor) or global_embedding.ndim != 2
+    ):
         raise LegacyLanguageCheckpointError("Global language embedding must be a rank-2 tensor.")
 
     conditioning_version = _scalar_metadata(
@@ -911,10 +1004,15 @@ def inspect_language_conditioning(
         raise LegacyLanguageCheckpointError(
             f"Unsupported language registry version: {registry_version}."
         )
+    global_count_mismatch = (
+        expected_architecture_version >= ECHODIT_ARCHITECTURE_VERSION
+        and isinstance(global_embedding, torch.Tensor)
+        and global_embedding.shape[0] != LANGUAGE_COUNT + 1
+    )
     if (
         language_count != LANGUAGE_COUNT
         or embedding.shape[0] != LANGUAGE_COUNT + 1
-        or global_embedding.shape[0] != LANGUAGE_COUNT + 1
+        or global_count_mismatch
     ):
         raise LegacyLanguageCheckpointError(
             "Checkpoint language count does not match this library's stable registry."
@@ -925,17 +1023,22 @@ def inspect_language_conditioning(
         raise LegacyLanguageCheckpointError(
             "Language and text embedding widths do not match in this checkpoint."
         )
-    conditioning_projection = state_dict.get("dit.cond_module.0.weight")
-    if not isinstance(conditioning_projection, torch.Tensor) or conditioning_projection.ndim != 2:
-        raise LegacyLanguageCheckpointError(
-            "Language-conditioned checkpoints must include the rank-2 timestep "
-            "conditioning projection."
-        )
-    if global_embedding.shape[1] != conditioning_projection.shape[1]:
-        raise LegacyLanguageCheckpointError(
-            "Global language embedding width does not match the timestep conditioning "
-            "width in this checkpoint."
-        )
+    if expected_architecture_version >= ECHODIT_ARCHITECTURE_VERSION:
+        conditioning_projection = state_dict.get("dit.cond_module.0.weight")
+        if (
+            not isinstance(conditioning_projection, torch.Tensor)
+            or conditioning_projection.ndim != 2
+        ):
+            raise LegacyLanguageCheckpointError(
+                "Language-conditioned checkpoints must include the rank-2 timestep "
+                "conditioning projection."
+            )
+        assert isinstance(global_embedding, torch.Tensor)
+        if global_embedding.shape[1] != conditioning_projection.shape[1]:
+            raise LegacyLanguageCheckpointError(
+                "Global language embedding width does not match the timestep conditioning "
+                "width in this checkpoint."
+            )
 
     supported_ids = _language_id_metadata(
         state_dict,
@@ -954,6 +1057,8 @@ def inspect_language_conditioning(
 
 def inspect_reference_language_capability(
     state_dict: Mapping[str, torch.Tensor],
+    *,
+    expected_architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
 ) -> ReferenceLanguageCheckpointInfo:
     """Validate explicit source-reference language coverage without inferring it."""
     present = CROSS_LINGUAL_STATE_KEYS.intersection(state_dict)
@@ -973,7 +1078,10 @@ def inspect_reference_language_capability(
             "Reference-language metadata requires versioned target-language conditioning."
         )
     infer_speaker_conditioning_from_state_dict(state_dict, False)
-    target_capability = inspect_language_conditioning(state_dict)
+    target_capability = inspect_language_conditioning(
+        state_dict,
+        expected_architecture_version=expected_architecture_version,
+    )
 
     capability_version = _scalar_metadata(
         state_dict,
@@ -1549,7 +1657,7 @@ def load_pretrained_checkpoint(
         if not checkpoint_alignment.enabled:
             raise RuntimeError(
                 "The model enables MAS duration, but the parent checkpoint does not contain "
-                "versioned monotonic-alignment state. MAS must be scratch-pretrained or match "
+                "versioned monotonic-alignment state. MAS must be present from pretraining or match "
                 "the parent architecture."
             )
         if model_alignment != checkpoint_alignment:
@@ -1649,13 +1757,31 @@ class FlowCheckpoint:
         """Return the validated scratch-token or frozen-feature text topology."""
         return inspect_text_conditioning(self.architecture_state_dict)
 
-    def validate_architecture(self) -> int:
+    def validate_architecture(
+        self,
+        *,
+        expected_version: int = ECHODIT_ARCHITECTURE_VERSION,
+        allow_missing_legacy_metadata: bool = False,
+    ) -> int:
         """Validate and return the checkpoint's exact NAR-VAE topology version."""
-        return inspect_architecture_version(self.architecture_state_dict)
+        return inspect_architecture_version(
+            self.architecture_state_dict,
+            expected_version=expected_version,
+            allow_missing_legacy_metadata=allow_missing_legacy_metadata,
+        )
 
-    def infer_target_patch_size(self) -> int:
+    def infer_target_patch_size(
+        self,
+        *,
+        expected_version: int = ECHODIT_ARCHITECTURE_VERSION,
+        allow_missing_legacy_metadata: bool = False,
+    ) -> int:
         """Return the exact versioned temporal target-latent packing factor."""
-        return inspect_target_patch_size(self.architecture_state_dict)
+        return inspect_target_patch_size(
+            self.architecture_state_dict,
+            expected_version=expected_version,
+            allow_missing_legacy_metadata=allow_missing_legacy_metadata,
+        )
 
     def generative_objective(self) -> str:
         """Return the objective encoded by the selected checkpoint weights."""
@@ -1685,21 +1811,49 @@ class FlowCheckpoint:
         """Return zero for legacy references or the authenticated fixed token count."""
         return inspect_speaker_num_summary_tokens(self.architecture_state_dict)
 
-    def language_capability(self) -> LanguageCheckpointInfo:
+    def language_capability(
+        self,
+        *,
+        expected_architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
+    ) -> LanguageCheckpointInfo:
         """Return validated language support stored with the architecture weights."""
-        return inspect_language_conditioning(self.architecture_state_dict)
+        return inspect_language_conditioning(
+            self.architecture_state_dict,
+            expected_architecture_version=expected_architecture_version,
+        )
 
-    def reference_language_capability(self) -> ReferenceLanguageCheckpointInfo:
+    def reference_language_capability(
+        self,
+        *,
+        expected_architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
+    ) -> ReferenceLanguageCheckpointInfo:
         """Return validated reference-audio language coverage from architecture weights."""
-        return inspect_reference_language_capability(self.architecture_state_dict)
+        return inspect_reference_language_capability(
+            self.architecture_state_dict,
+            expected_architecture_version=expected_architecture_version,
+        )
 
-    def duration_capability(self) -> DurationCheckpointInfo:
+    def duration_capability(
+        self,
+        *,
+        expected_architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
+    ) -> DurationCheckpointInfo:
         """Return the strictly versioned learned-duration architecture facts."""
-        return inspect_duration_capability(self.architecture_state_dict)
+        return inspect_duration_capability(
+            self.architecture_state_dict,
+            expected_architecture_version=expected_architecture_version,
+        )
 
-    def monotonic_alignment_capability(self) -> MonotonicAlignmentCheckpointInfo:
+    def monotonic_alignment_capability(
+        self,
+        *,
+        expected_architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
+    ) -> MonotonicAlignmentCheckpointInfo:
         """Return the strictly versioned MAS architecture facts."""
-        return inspect_monotonic_alignment_capability(self.architecture_state_dict)
+        return inspect_monotonic_alignment_capability(
+            self.architecture_state_dict,
+            expected_architecture_version=expected_architecture_version,
+        )
 
     def infer_language_conditioning(self, fallback: bool = False) -> bool:
         capability = self.language_capability()
@@ -1710,6 +1864,17 @@ class FlowCheckpoint:
 
     def load_into(self, model: torch.nn.Module) -> None:
         """Strictly load a base checkpoint, then overlay partial EMA weights if used."""
+        contract_model = unwrap_generation_contract_model(model)
+        if (
+            getattr(contract_model, "architecture_version", None)
+            == LEGACY_ECHODIT_ARCHITECTURE_VERSION
+        ):
+            _reject_v4_state_in_legacy_v3(self.architecture_state_dict)
+            # An EMA file is independently attacker-controlled even when its base
+            # passed topology inspection. Reject additive v4 parameters before any
+            # model tensor can be mutated or compatibility filtering can discard them.
+            if self.base_state_dict is not None:
+                _reject_v4_state_in_legacy_v3(self.state_dict)
         _validate_generation_contract_before_load(model, self.architecture_state_dict)
         model_keys = set(model.state_dict())
 

@@ -38,7 +38,7 @@ def _mark_compiled_cuda_graph_step() -> None:
     marker = getattr(compiler, "cudagraph_mark_step_begin", None)
     if not callable(marker):
         raise RuntimeError(
-            "Compiled CUDA inference requires torch>=2.9 with "
+            "Compiled CUDA inference requires a PyTorch build exposing callable "
             "torch.compiler.cudagraph_mark_step_begin()."
         )
     marker()

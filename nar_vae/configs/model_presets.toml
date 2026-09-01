@@ -1,5 +1,5 @@
 [presets.nano]
-description = "Lowest-cost scratch-training preset for rapid experiments; evaluate quality."
+description = "Lowest-cost acoustic-pretraining preset for rapid experiments; evaluate quality."
 model_size = 128
 num_layers = 6
 num_heads = 4

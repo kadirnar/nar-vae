@@ -10,21 +10,29 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from nar_vae.checkpoint import (
     CheckpointProvenance,
     DurationCheckpointInfo,
     LanguageCheckpointInfo,
+    LegacyArchitectureCheckpointError,
     MonotonicAlignmentCheckpointInfo,
     ReferenceLanguageCheckpointInfo,
 )
 from nar_vae.dacvae_encoding import DACVAE_POSTERIOR_SAMPLING_POLICY
-from nar_vae.dataset.representation import TEXT_FRONTEND_NAME
+from nar_vae.dataset.representation import (
+    LEGACY_CL100K_TEXT_FRONTEND_NAME,
+    LEGACY_CL100K_TEXT_FRONTEND_VERSION,
+    TEXT_FRONTEND_NAME,
+)
 from nar_vae.frozen_text_provider import FROZEN_TEXT_REPRESENTATION_NAME
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.model_manifest import (
     LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
     MODEL_MANIFEST_FILENAME,
     MODEL_MANIFEST_SCHEMA_VERSION,
+    ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION,
     PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION,
     ModelManifestError,
     load_model_manifest,
@@ -34,6 +42,7 @@ from nar_vae.model_manifest import (
     validate_sft_parent_manifest,
     write_model_manifest,
 )
+from nar_vae.models.flow_matching import FlowMatchingEchoDiT
 from nar_vae.post_training.nar_vae_stage import model_export_config_from_manifest
 
 
@@ -56,7 +65,26 @@ def model_config(codec_source: str) -> dict:
         "dacvae_hop_length": 512,
         "dacvae_latent_dim": 128,
         "dacvae_sha256": "c" * 64,
-        "text_vocab_size": 530,
+        "generative_objective": "vp_diffusion_v",
+        "text_conditioning_mode": "frozen_features",
+        "text_num_layers": 0,
+        "text_vocab_size": 23,
+        "pad_token": 1,
+        "conditioning_feature_size": 4,
+        "conditioning_feature_dtype": "float16",
+        "frozen_text_alignment": "hf_non_special_tokens_v1",
+        "frozen_text_cache_version": 1,
+        "frozen_text_config_sha256": "a" * 64,
+        "frozen_text_encoder_id": "example/encoder",
+        "frozen_text_encoder_revision": "a" * 40,
+        "frozen_text_frontend": "phonemes",
+        "frozen_text_hidden_layer": -1,
+        "frozen_text_model_filename": "model.safetensors",
+        "frozen_text_model_sha256": "b" * 64,
+        "frozen_text_tokenizer_filename": "tokenizer.json",
+        "frozen_text_tokenizer_id": "example/tokenizer",
+        "frozen_text_tokenizer_revision": "a" * 40,
+        "frozen_text_tokenizer_sha256": "c" * 64,
         "target_patch_size": 1,
         "speaker_patch_size": 4,
         "norm_eps": 1e-6,
@@ -71,6 +99,107 @@ def model_config(codec_source: str) -> dict:
         "use_mas_duration": True,
         "duration_alignment_hidden_size": 64,
     }
+
+
+def _tiny_legacy_v3_model(*, architecture_version: int = 3) -> FlowMatchingEchoDiT:
+    return FlowMatchingEchoDiT(
+        latent_size=2,
+        model_size=8,
+        num_layers=1,
+        num_heads=2,
+        intermediate_size=16,
+        text_vocab_size=100312,
+        text_model_size=8,
+        text_num_layers=1,
+        text_num_heads=2,
+        text_intermediate_size=16,
+        speaker_patch_size=2,
+        speaker_model_size=8,
+        speaker_num_layers=1,
+        speaker_num_heads=2,
+        speaker_intermediate_size=16,
+        timestep_embed_size=8,
+        adaln_rank=2,
+        use_speaker_conditioning=True,
+        architecture_version=architecture_version,
+    )
+
+
+def _schema2_raw(weight_sha256: str) -> dict:
+    return {
+        "schema_version": ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION,
+        "library": "nar-vae",
+        "stage": "pretrain",
+        "weights": {"pytorch_model.bin": weight_sha256},
+        "architecture": {
+            "latent_size": 2,
+            "model_size": 8,
+            "num_layers": 1,
+            "num_heads": 2,
+            "intermediate_size": 16,
+            "text_model_size": 8,
+            "text_num_layers": 1,
+            "text_num_heads": 2,
+            "text_intermediate_size": 16,
+            "speaker_model_size": 8,
+            "speaker_num_layers": 1,
+            "speaker_num_heads": 2,
+            "speaker_intermediate_size": 16,
+            "timestep_embed_size": 8,
+            "adaln_rank": 2,
+            "text_vocab_size": 100312,
+            "speaker_patch_size": 2,
+            "use_speaker_conditioning": True,
+            "use_mas_duration": False,
+            "norm_eps": 1e-6,
+        },
+        "capabilities": {
+            "speaker_conditioning": True,
+            "language_conditioning": False,
+            "supported_languages": ["en"],
+            "supported_reference_languages": [],
+            "supported_language_pairs": [],
+            "duration_predictor": False,
+            "duration_predictor_hidden_size": 0,
+            "duration_predictor_num_layers": 0,
+            "duration_predictor_use_speaker": False,
+            "monotonic_alignment": False,
+            "duration_alignment_hidden_size": 0,
+        },
+        "representation": {
+            "contract_version": 2,
+            "text_frontend_name": LEGACY_CL100K_TEXT_FRONTEND_NAME,
+            "text_frontend_version": LEGACY_CL100K_TEXT_FRONTEND_VERSION,
+            "codec_source": "codec.pth",
+            "codec_backend": "bundled",
+            "codec_revision": None,
+            "codec_filename": None,
+            "codec_sha256": "c" * 64,
+            "sample_rate": 16,
+            "hop_length": 4,
+            "latent_width": 2,
+        },
+        "parent": None,
+    }
+
+
+class _TinyCodec(torch.nn.Module):
+    sample_rate = 16
+    hop_length = 4
+
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.ones(()), requires_grad=False)
+        self.quantizer = SimpleNamespace(out_proj=SimpleNamespace(in_channels=2))
+        self.nar_vae_codec_identifier = "codec.pth"
+        self.nar_vae_backend = "bundled"
+        self.nar_vae_codec_revision = None
+        self.nar_vae_codec_filename = None
+        self.nar_vae_codec_sha256 = "c" * 64
+
+    @staticmethod
+    def decode(latents):
+        return latents[:, :1]
 
 
 class ModelManifestTest(unittest.TestCase):
@@ -96,7 +225,10 @@ class ModelManifestTest(unittest.TestCase):
             self.assertEqual(loaded.architecture["latent_size"], 128)
             self.assertEqual(loaded.architecture["speaker_num_summary_tokens"], 0)
             self.assertTrue(loaded.capabilities["monotonic_alignment"])
-            self.assertEqual(loaded.representation["text_frontend_name"], TEXT_FRONTEND_NAME)
+            self.assertEqual(
+                loaded.representation["text_frontend_name"],
+                FROZEN_TEXT_REPRESENTATION_NAME,
+            )
             self.assertEqual(loaded.representation["codec_source"], "./codec/weights.pth")
             self.assertIsNone(loaded.representation["codec_revision"])
             self.assertEqual(
@@ -108,6 +240,43 @@ class ModelManifestTest(unittest.TestCase):
             weights.write_bytes(b"different model weights")
             with self.assertRaisesRegex(ModelManifestError, "manifest SHA-256"):
                 validate_manifest_weight(loaded, weights)
+
+    def test_pretraining_writer_rejects_scratch_token_exports_defense_in_depth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            weights = root / "pytorch_model.bin"
+            weights.write_bytes(b"scratch weights")
+            scratch = model_config("./codec/weights.pth")
+            scratch["text_conditioning_mode"] = "scratch_tokens"
+            with self.assertRaisesRegex(ModelManifestError, "require frozen_features"):
+                write_model_manifest(
+                    root,
+                    scratch,
+                    stage="pretrain",
+                    checkpoint_files=(weights.name,),
+                )
+            self.assertFalse((root / MODEL_MANIFEST_FILENAME).exists())
+
+            for name, objective in (("omitted", None), ("rectified_flow", "rectified_flow")):
+                invalid = model_config("./codec/weights.pth")
+                if objective is None:
+                    invalid.pop("generative_objective")
+                else:
+                    invalid["generative_objective"] = objective
+                with (
+                    self.subTest(objective=name),
+                    self.assertRaisesRegex(
+                        ModelManifestError,
+                        "generative_objective: vp_diffusion_v",
+                    ),
+                ):
+                    write_model_manifest(
+                        root,
+                        invalid,
+                        stage="pretrain",
+                        checkpoint_files=(weights.name,),
+                    )
+                self.assertFalse((root / MODEL_MANIFEST_FILENAME).exists())
 
     def test_frozen_export_binds_provider_axis_and_frontend_for_inference(self):
         config = model_config("./codec/weights.pth")
@@ -368,6 +537,10 @@ class ModelManifestTest(unittest.TestCase):
                 legacy_raw["representation"].pop("codec_encoding_policy")
                 if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
                     legacy_raw["architecture"].pop("speaker_num_summary_tokens")
+                    legacy_raw["architecture"]["text_num_layers"] = 1
+                    legacy_raw["architecture"]["text_vocab_size"] = 530
+                    legacy_raw["representation"]["text_frontend_name"] = TEXT_FRONTEND_NAME
+                    legacy_raw["representation"]["text_frontend_version"] = 2
                     legacy_raw.pop("generation")
                     legacy_raw.pop("text_conditioning")
                 (pretrain_dir / MODEL_MANIFEST_FILENAME).write_text(
@@ -380,7 +553,7 @@ class ModelManifestTest(unittest.TestCase):
                     self.subTest(schema_version=schema_version),
                     self.assertRaisesRegex(
                         ModelManifestError,
-                        "codec/frontend representation",
+                        "architecture|codec/frontend representation",
                     ),
                 ):
                     write_model_manifest(
@@ -501,7 +674,11 @@ class ModelManifestTest(unittest.TestCase):
             raw["schema_version"] = LEGACY_MODEL_MANIFEST_SCHEMA_VERSION
             raw["representation"]["contract_version"] = 2
             raw["representation"].pop("codec_encoding_policy")
+            raw["representation"]["text_frontend_name"] = TEXT_FRONTEND_NAME
+            raw["representation"]["text_frontend_version"] = 2
             raw["architecture"].pop("speaker_num_summary_tokens")
+            raw["architecture"]["text_num_layers"] = 1
+            raw["architecture"]["text_vocab_size"] = 530
             raw.pop("generation")
             raw.pop("text_conditioning")
             expected_sha256 = canonical_sha256(raw)
@@ -515,6 +692,194 @@ class ModelManifestTest(unittest.TestCase):
             self.assertEqual(loaded.sha256, expected_sha256)
             self.assertNotIn("speaker_num_summary_tokens", loaded.raw["architecture"])
             self.assertNotIn("codec_encoding_policy", loaded.representation)
+
+    def test_origin_schema2_manifest_preserves_raw_hash_and_authenticates_v3_cl100k(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root)
+            raw = json.loads(json.dumps(manifest.raw))
+            raw["schema_version"] = ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION
+            raw["representation"]["contract_version"] = 2
+            raw["representation"].pop("codec_encoding_policy")
+            raw["representation"]["text_frontend_name"] = LEGACY_CL100K_TEXT_FRONTEND_NAME
+            raw["representation"]["text_frontend_version"] = LEGACY_CL100K_TEXT_FRONTEND_VERSION
+            raw["architecture"].pop("architecture_version")
+            raw["architecture"].pop("speaker_num_summary_tokens")
+            raw["architecture"].pop("target_patch_size")
+            raw["architecture"]["text_num_layers"] = 1
+            raw["architecture"]["text_vocab_size"] = 100312
+            raw.pop("generation")
+            raw.pop("text_conditioning")
+            expected_sha256 = canonical_sha256(raw)
+            manifest_path = root / MODEL_MANIFEST_FILENAME
+            manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            loaded = load_model_manifest(manifest_path)
+
+            self.assertEqual(loaded.raw, raw)
+            self.assertEqual(loaded.sha256, expected_sha256)
+            self.assertEqual(loaded.architecture["architecture_version"], 3)
+            self.assertEqual(loaded.architecture["target_patch_size"], 1)
+            self.assertEqual(loaded.architecture["speaker_num_summary_tokens"], 0)
+            self.assertEqual(loaded.generation["objective"], "rectified_flow")
+            self.assertEqual(loaded.text_conditioning["mode"], "scratch_tokens")
+            self.assertNotIn("architecture_version", loaded.raw["architecture"])
+
+            tampered = json.loads(json.dumps(raw))
+            tampered["representation"]["text_frontend_name"] = TEXT_FRONTEND_NAME
+            manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ModelManifestError,
+                "representation frontend contradicts",
+            ):
+                load_model_manifest(manifest_path)
+
+            invalid = json.loads(json.dumps(raw))
+            invalid["architecture"]["text_num_layers"] = 0
+            manifest_path.write_text(json.dumps(invalid), encoding="utf-8")
+            with self.assertRaisesRegex(ModelManifestError, "trained text encoder"):
+                load_model_manifest(manifest_path)
+
+            invalid = json.loads(json.dumps(raw))
+            invalid["architecture"]["text_vocab_size"] = 100286
+            manifest_path.write_text(json.dumps(invalid), encoding="utf-8")
+            with self.assertRaisesRegex(ModelManifestError, "include the legacy pad token"):
+                load_model_manifest(manifest_path)
+
+    def test_schema2_real_v3_constructor_frontend_and_synthesis_are_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            weights = root / "pytorch_model.bin"
+            torch.save(_tiny_legacy_v3_model().state_dict(), weights)
+            raw = _schema2_raw(hashlib.sha256(weights.read_bytes()).hexdigest())
+            (root / MODEL_MANIFEST_FILENAME).write_text(json.dumps(raw), encoding="utf-8")
+            codec = _TinyCodec()
+
+            with patch("nar_vae.inference.load_dacvae", return_value=codec):
+                runtime = FlowMatchingTTSInference(
+                    weights,
+                    dacvae_model="codec.pth",
+                    device="cpu",
+                    latent_size=2,
+                    model_size=8,
+                    num_layers=1,
+                    num_heads=2,
+                    intermediate_size=16,
+                    text_num_layers=1,
+                    text_model_size=8,
+                    text_num_heads=2,
+                    text_intermediate_size=16,
+                    speaker_model_size=8,
+                    speaker_num_layers=1,
+                    speaker_num_heads=2,
+                    speaker_intermediate_size=16,
+                    timestep_embed_size=8,
+                    adaln_rank=2,
+                )
+
+            prepared = runtime._prepare_conditioning("Hello, world!", "en")
+            self.assertEqual(
+                prepared.conditioning_ids.tolist(),
+                [[100282, 9906, 11, 1917, 0, 100283, 100284, 100280]],
+            )
+            with (
+                patch(
+                    "nar_vae.inference.ODESolver.sample",
+                    side_effect=lambda **kwargs: torch.zeros(kwargs["latent_shape"]),
+                ) as sample,
+                patch(
+                    "nar_vae.inference.encode_dacvae_posterior_legacy_global_rng",
+                    return_value=torch.ones(1, 2, 2),
+                ) as legacy_encode,
+            ):
+                audio = runtime.synthesize(
+                    "Hello",
+                    duration=1.5,
+                    num_steps=1,
+                    show_progress=False,
+                    reference_audio=torch.zeros(8),
+                    reference_sample_rate=16,
+                )
+            self.assertEqual(tuple(audio.shape), (6,))
+            self.assertEqual(sample.call_args.kwargs["conditioning_ids"][0, 0].item(), 100282)
+            self.assertIsNotNone(sample.call_args.kwargs["speaker_latent"])
+            self.assertEqual(tuple(sample.call_args.kwargs["speaker_latent"].shape), (1, 2, 2))
+            legacy_encode.assert_called_once()
+            self.assertEqual(runtime.flow_model.architecture_version, 3)
+            self.assertEqual(
+                {
+                    name: (
+                        runtime.generation_profile(name).num_steps,
+                        runtime.generation_profile(name).solver,
+                        runtime.generation_profile(name).cache_mode,
+                    )
+                    for name in ("quality", "balanced", "fast", "turbo")
+                },
+                {
+                    "quality": (50, "heun", "none"),
+                    "balanced": (32, "euler", "none"),
+                    "fast": (16, "euler", "none"),
+                    "turbo": (16, "euler", "cache_dit"),
+                },
+            )
+
+    def test_manifest_and_state_architecture_versions_cross_reject_before_codec_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            weights = root / "pytorch_model.bin"
+            torch.save(_tiny_legacy_v3_model(architecture_version=4).state_dict(), weights)
+            raw = _schema2_raw(hashlib.sha256(weights.read_bytes()).hexdigest())
+            (root / MODEL_MANIFEST_FILENAME).write_text(json.dumps(raw), encoding="utf-8")
+            constructor = dict(
+                flow_model_path=weights,
+                dacvae_model="codec.pth",
+                device="cpu",
+                latent_size=2,
+                model_size=8,
+                num_layers=1,
+                num_heads=2,
+                intermediate_size=16,
+                text_num_layers=1,
+                text_model_size=8,
+                text_num_heads=2,
+                text_intermediate_size=16,
+                speaker_model_size=8,
+                speaker_num_layers=1,
+                speaker_num_heads=2,
+                speaker_intermediate_size=16,
+                timestep_embed_size=8,
+                adaln_rank=2,
+            )
+            with (
+                patch("nar_vae.inference.load_dacvae") as load_codec,
+                self.assertRaisesRegex(LegacyArchitectureCheckpointError, "does not match"),
+            ):
+                FlowMatchingTTSInference(**constructor)
+            load_codec.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            weights = root / "pytorch_model.bin"
+            # Use a valid current frozen manifest shell while binding the v3 bytes.
+            _, current = self._write(root, model_config("codec.pth"))
+            torch.save(_tiny_legacy_v3_model().state_dict(), weights)
+            current_raw = json.loads(json.dumps(current.raw))
+            current_raw["weights"] = {
+                weights.name: hashlib.sha256(weights.read_bytes()).hexdigest()
+            }
+            (root / MODEL_MANIFEST_FILENAME).write_text(
+                json.dumps(current_raw),
+                encoding="utf-8",
+            )
+            with (
+                patch("nar_vae.inference.load_dacvae") as load_codec,
+                self.assertRaisesRegex(
+                    LegacyArchitectureCheckpointError,
+                    "do not contain versioned",
+                ),
+            ):
+                FlowMatchingTTSInference(weights, dacvae_model="codec.pth", device="cpu")
+            load_codec.assert_not_called()
 
     def test_current_manifest_requires_the_exact_seeded_codec_policy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -538,6 +903,52 @@ class ModelManifestTest(unittest.TestCase):
                 mutate(raw["representation"])
                 manifest_path.write_text(json.dumps(raw), encoding="utf-8")
                 with self.subTest(name=name), self.assertRaises(ModelManifestError):
+                    load_model_manifest(manifest_path)
+
+    def test_manifest_version_axes_reject_float_and_boolean_json_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = self._write(root)
+            manifest_path = root / MODEL_MANIFEST_FILENAME
+            mutations = {
+                "schema-float": ("schema_version", 5.0, "schema_version must be an integer"),
+                "schema-bool": ("schema_version", True, "schema_version must be an integer"),
+                "contract-float": (
+                    "representation.contract_version",
+                    3.0,
+                    "representation contract version",
+                ),
+                "contract-bool": (
+                    "representation.contract_version",
+                    True,
+                    "representation contract version",
+                ),
+                "frontend-float": (
+                    "representation.text_frontend_version",
+                    1.0,
+                    "text_frontend_version must be a positive integer",
+                ),
+                "frontend-bool": (
+                    "representation.text_frontend_version",
+                    True,
+                    "text_frontend_version must be a positive integer",
+                ),
+            }
+            for name, (path, value, message) in mutations.items():
+                raw = json.loads(json.dumps(manifest.raw))
+                if path == "schema_version":
+                    raw[path] = value
+                else:
+                    _, field = path.split(".")
+                    raw["representation"][field] = value
+                manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(
+                        ModelManifestError,
+                        message,
+                    ),
+                ):
                     load_model_manifest(manifest_path)
 
     def test_sft_rejects_language_and_cross_lingual_capability_downgrades(self):

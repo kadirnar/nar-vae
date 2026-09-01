@@ -14,6 +14,8 @@ from nar_vae.dataset.utterance_store import (
     CONDITIONING_NUM_TOKENS_COLUMN,
     SPEAKER_NUM_FRAMES_COLUMN,
     DynamicReferenceDataset,
+    canonical_audio_sha256,
+    namespace_speaker_id,
     validate_utterance_store,
 )
 from nar_vae.languages import LanguagePair, language_id
@@ -60,6 +62,31 @@ def row(index, language, *, speaker="corpus:speaker-a", frames=30):
 
 
 class DynamicReferenceDatasetTest(unittest.TestCase):
+    def test_speaker_identity_rejects_missing_or_ambiguous_scalars(self):
+        for invalid in (None, True, np.bool_(False), np.nan, np.inf, -np.inf, [], {}):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "speaker_id"):
+                    namespace_speaker_id("corpus", invalid)
+
+        self.assertEqual(namespace_speaker_id("corpus", "speaker-a"), "corpus:speaker-a")
+        self.assertEqual(namespace_speaker_id("corpus", np.int64(7)), "corpus:7")
+        self.assertEqual(namespace_speaker_id("corpus", 1.5), "corpus:1.5")
+
+    def test_audio_identity_is_finite_pure_and_normalizes_signed_zero(self):
+        negative_zero = np.array([-0.0, 0.25], dtype=np.float32)
+        positive_zero = np.array([0.0, 0.25], dtype=np.float32)
+        original_bits = negative_zero.view(np.uint32).copy()
+
+        self.assertEqual(
+            canonical_audio_sha256(negative_zero, 44_100),
+            canonical_audio_sha256(positive_zero, 44_100),
+        )
+        np.testing.assert_array_equal(negative_zero.view(np.uint32), original_bits)
+        for invalid in ([np.nan], [np.inf], [-np.inf]):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    canonical_audio_sha256(invalid, 44_100)
+
     def test_cross_language_pair_selection_is_same_speaker_and_not_target(self):
         dataset = Rows([row(0, "en"), row(1, "en"), row(2, "tr"), row(3, "tr")])
         dynamic = DynamicReferenceDataset(

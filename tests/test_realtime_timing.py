@@ -15,7 +15,7 @@ from nar_vae.caching import (
 from nar_vae.configuration import load_inference_settings
 from nar_vae.inference import FlowMatchingTTSInference
 from nar_vae.inference_realtime import RealtimeTTSInference, _mark_compiled_cuda_graph_step
-from nar_vae.objectives import VP_DIFFUSION_OBJECTIVE
+from nar_vae.objectives import RECTIFIED_FLOW_OBJECTIVE, VP_DIFFUSION_OBJECTIVE
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
 
 
@@ -51,7 +51,7 @@ class RealtimeTimingTest(unittest.TestCase):
     def test_compiled_cuda_marker_fails_clearly_on_an_unsupported_torch_build(self):
         with (
             patch("nar_vae.inference_realtime.torch.compiler", object()),
-            self.assertRaisesRegex(RuntimeError, "torch>=2.9"),
+            self.assertRaisesRegex(RuntimeError, "cudagraph_mark_step_begin"),
         ):
             _mark_compiled_cuda_graph_step()
 
@@ -145,6 +145,43 @@ class RealtimeTimingTest(unittest.TestCase):
             + timings["decoding"]
             + timings["output_transfer"],
             timings["ttfa"],
+        )
+
+    def test_rectified_flow_fast_profile_preserves_origin_solver_and_step_budget(self):
+        tts = self.create_runtime()
+        tts.model_manifest = SimpleNamespace(raw={"schema_version": 5})
+        tts.generative_objective = RECTIFIED_FLOW_OBJECTIVE
+        captured = {}
+
+        def fake_sample(**kwargs):
+            captured["num_steps"] = kwargs["num_steps"]
+            captured["solver"] = kwargs["solver"]
+            return torch.zeros(kwargs["latent_shape"])
+
+        with patch("nar_vae.inference_realtime.ODESolver.sample", side_effect=fake_sample):
+            tts.synthesize_fast("test", duration=1.5, cache_mode="none")
+
+        self.assertEqual(captured, {"num_steps": 16, "solver": "euler"})
+
+    def test_vp_profiles_keep_current_diffusion_solver_and_step_budgets(self):
+        tts = self.create_runtime()
+        tts.generative_objective = VP_DIFFUSION_OBJECTIVE
+
+        self.assertEqual(
+            (tts.generation_profile("quality").num_steps, tts.generation_profile("quality").solver),
+            (32, "ddim"),
+        )
+        self.assertEqual(
+            (tts.generation_profile("fast").num_steps, tts.generation_profile("fast").solver),
+            (8, "ddim"),
+        )
+
+    def test_metadata_absent_protocol_runtime_uses_rectified_flow_profiles(self):
+        tts = self.create_runtime()
+
+        self.assertEqual(
+            (tts.generation_profile("quality").num_steps, tts.generation_profile("quality").solver),
+            (50, "heun"),
         )
 
     def test_poisoned_model_is_rejected_before_uncached_realtime_preprocessing(self):

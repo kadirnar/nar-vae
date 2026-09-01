@@ -43,6 +43,8 @@ from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
 from nar_vae.model_manifest import representation_from_config, write_model_manifest
 from nar_vae.model_presets import resolve_model_architecture
 from nar_vae.models.flow_matching import create_flow_matching_echodit
+from nar_vae.models.text_conditioning import FROZEN_FEATURE_TEXT_CONDITIONING
+from nar_vae.objectives import VP_DIFFUSION_OBJECTIVE
 from nar_vae.training_data import FrameBudgetTrainerMixin
 from nar_vae.training_optimizers import MuonTrainerMixin
 from nar_vae.training_utils import (
@@ -110,10 +112,10 @@ def _materialize_flow_model_weights(
 
 class EchoDiTTrainer(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
     """
-    Trainer for EchoDiT flow matching TTS.
+    Trainer for canonical EchoDiT VP-diffusion pretraining.
 
     Handles:
-    - TTS training with flow matching loss
+    - TTS training with the versioned velocity-prediction loss
     - DDP distributed training through torchrun/Transformers Trainer
     - Gradient checkpointing for memory efficiency
     """
@@ -124,9 +126,38 @@ class EchoDiTTrainer(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
         *args,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
         if training_config is None:
             raise ValueError("training_config is required")
+        if training_config.get("text_conditioning_mode") != FROZEN_FEATURE_TEXT_CONDITIONING:
+            raise ValueError(
+                "EchoDiTTrainer pretraining requires text_conditioning_mode: frozen_features."
+            )
+        if training_config.get("generative_objective") != VP_DIFFUSION_OBJECTIVE:
+            raise ValueError(
+                "EchoDiTTrainer pretraining requires generative_objective: vp_diffusion_v."
+            )
+        configured_model = kwargs.get("model", args[0] if args else None)
+        if not isinstance(configured_model, torch.nn.Module):
+            raise ValueError(
+                "EchoDiTTrainer requires an explicit acoustic model so its pretraining "
+                "contract can be authenticated."
+            )
+        canonical_model = unwrap_training_model(configured_model)
+        if (
+            getattr(canonical_model, "text_conditioning_mode", None)
+            != FROZEN_FEATURE_TEXT_CONDITIONING
+        ):
+            raise ValueError(
+                "EchoDiTTrainer model must use frozen_features text conditioning; "
+                "configuration cannot relabel a scratch-token model."
+            )
+        if getattr(canonical_model, "generative_objective", None) != VP_DIFFUSION_OBJECTIVE:
+            raise ValueError(
+                "EchoDiTTrainer model must use vp_diffusion_v; configuration cannot relabel "
+                "a rectified-flow model."
+            )
+
+        super().__init__(*args, **kwargs)
 
         self.flow_model = self.model  # Get model from parent Trainer
         self.training_config = training_config
@@ -135,10 +166,10 @@ class EchoDiTTrainer(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
         # loss by gradient_accumulation_steps a second time.
         self.model_accepts_loss_kwargs = True
 
-        # Flow matching loss with stratified logit-normal timestep distribution
+        # Versioned velocity loss with stratified logit-normal timestep distribution
         self.flow_loss_fn = FlowMatchingLoss(
             sigma_min=training_config.get("flow_sigma_min", 1e-4),
-            generative_objective=training_config.get("generative_objective", "rectified_flow"),
+            generative_objective=training_config["generative_objective"],
             diffusion_schedule_shift=training_config.get("diffusion_schedule_shift", 1.0),
             velocity_weighted=training_config.get("flow_velocity_weighted", False),
             timestep_distribution=training_config.get(
@@ -156,7 +187,7 @@ class EchoDiTTrainer(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-        Compute flow matching loss for TTS.
+        Compute the canonical VP velocity-prediction loss for TTS.
 
         Args:
             model: Model passed by Trainer, including any distributed wrapper
@@ -164,7 +195,7 @@ class EchoDiTTrainer(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
             return_outputs: Whether to return outputs
             num_items_in_batch: Number of items in batch (for loss scaling)
         """
-        # Flow matching loss
+        # Versioned generative velocity loss
         latents = inputs["latents"]
         conditioning_ids = inputs["conditioning_ids"]
         conditioning_mask = inputs.get("conditioning_mask", None)
@@ -730,7 +761,7 @@ def _pretrain(
         lambda: create_flow_matching_echodit(
             latent_size=config["dacvae_latent_dim"],
             text_vocab_size=config["text_vocab_size"],
-            text_conditioning_mode=config.get("text_conditioning_mode", "scratch_tokens"),
+            text_conditioning_mode=config["text_conditioning_mode"],
             conditioning_feature_size=config.get("conditioning_feature_size"),
             speaker_patch_size=speaker_patch_size,
             speaker_num_summary_tokens=config.get("speaker_num_summary_tokens", 0),
@@ -751,7 +782,7 @@ def _pretrain(
             duration_predictor_use_speaker=duration_options.uses_speaker,
             use_mas_duration=duration_options.uses_mas,
             duration_alignment_hidden_size=duration_options.alignment_hidden_size,
-            generative_objective=config.get("generative_objective", "rectified_flow"),
+            generative_objective=config["generative_objective"],
             diffusion_schedule_shift=config.get("diffusion_schedule_shift", 1.0),
         ),
         description="pretraining model construction",
@@ -806,11 +837,11 @@ def _pretrain(
             supported_language_pairs=supported_language_pairs or None,
             require_language_coverage=True,
             use_mas_duration=duration_options.uses_mas,
-            text_conditioning_mode=config.get("text_conditioning_mode", "scratch_tokens"),
+            text_conditioning_mode=config["text_conditioning_mode"],
             conditioning_feature_size=config.get("conditioning_feature_size"),
             frozen_text_provider_spec=(
                 FrozenTextProviderSpec.from_config(config)
-                if config.get("text_conditioning_mode", "scratch_tokens") == "frozen_features"
+                if config["text_conditioning_mode"] == "frozen_features"
                 else None
             ),
             text_vocab_size=config.get("text_vocab_size"),

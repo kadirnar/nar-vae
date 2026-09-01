@@ -192,7 +192,7 @@ class EMACallback(TrainerCallback):
 
 class EchoDiTFineTuner(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
     """
-    Trainer for fine-tuning EchoDiT flow matching TTS.
+    Trainer for manifest-bound EchoDiT continuation.
 
     Features:
     - Pretrained model loading
@@ -237,7 +237,7 @@ class EchoDiTFineTuner(MuonTrainerMixin, FrameBudgetTrainerMixin, Trainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Compute flow matching loss."""
+        """Compute the checkpoint's versioned generative velocity loss."""
         latents = inputs["latents"]
         conditioning_ids = inputs["conditioning_ids"]
         conditioning_mask = inputs.get("conditioning_mask", None)

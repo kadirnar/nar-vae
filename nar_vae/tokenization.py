@@ -10,6 +10,7 @@ control tokens.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -88,6 +89,36 @@ _EMOTION_TAG_NAMES = (
     "applause",
     "music",
     "noise",
+)
+
+# Authenticated model-manifest schema 2 checkpoints used this exact cl100k
+# envelope. Keep the constants namespaced so current compact IDs can never be
+# confused with the much larger historical embedding table.
+LEGACY_CL100K_TOKENIZER_NAME = "cl100k_base"
+LEGACY_CL100K_TOKENIZER_LENGTH = 100277
+LEGACY_CL100K_START_OF_TEXT = LEGACY_CL100K_TOKENIZER_LENGTH + 1
+LEGACY_CL100K_END_OF_TEXT = LEGACY_CL100K_TOKENIZER_LENGTH + 2
+LEGACY_CL100K_START_OF_SPEECH = LEGACY_CL100K_TOKENIZER_LENGTH + 3
+LEGACY_CL100K_END_OF_SPEECH = LEGACY_CL100K_TOKENIZER_LENGTH + 4
+LEGACY_CL100K_START_OF_HUMAN = LEGACY_CL100K_TOKENIZER_LENGTH + 5
+LEGACY_CL100K_END_OF_HUMAN = LEGACY_CL100K_TOKENIZER_LENGTH + 6
+LEGACY_CL100K_START_OF_AI = LEGACY_CL100K_TOKENIZER_LENGTH + 7
+LEGACY_CL100K_END_OF_AI = LEGACY_CL100K_TOKENIZER_LENGTH + 8
+LEGACY_CL100K_PAD_TOKEN = LEGACY_CL100K_TOKENIZER_LENGTH + 9
+LEGACY_CL100K_EMOTION_TAGS = {
+    f"<{name}>": LEGACY_CL100K_TOKENIZER_LENGTH + 10 + index
+    for index, name in enumerate(_EMOTION_TAG_NAMES)
+}
+LEGACY_CL100K_TOTAL_VOCAB_SIZE = max(LEGACY_CL100K_EMOTION_TAGS.values()) + 1
+LEGACY_CL100K_TABLE_SHA256 = "23941fcfd42f17ea21143063ec8a9473cce2abe0cba34c4c342d821c28581cea"
+_LEGACY_CL100K_EMOTION_PATTERN = re.compile(
+    f"({'|'.join(re.escape(tag) for tag in LEGACY_CL100K_EMOTION_TAGS)})"
+)
+_LEGACY_CL100K_GOLDEN_ENCODINGS = (
+    ("Hello, world!", [9906, 11, 1917, 0]),
+    ("Merhaba dünya!", [27814, 10796, 64, 52119, 23741, 0]),
+    ("こんにちは世界", [90115, 3574, 244, 98220]),
+    ("İstanbul’da yağmur.", [48880, 46216, 529, 3315, 13835, 11257, 66206, 13]),
 )
 
 # Suprasegmentals affect pronunciation without receiving a mandatory MAS frame.
@@ -663,6 +694,110 @@ def encode_tts_text(
     ).conditioning_ids
 
 
+def encode_legacy_cl100k_text(
+    text: str,
+    tokenizer: TokenEncoder,
+    *,
+    parse_emotion_tags: bool = True,
+    vocab_size: int | None = None,
+    language: str | Language | None = None,
+) -> list[int]:
+    """Reproduce the schema-2 EchoDiT cl100k input sequence exactly.
+
+    This function is intentionally separate from :func:`encode_tts_text`: callers
+    must first authenticate the legacy manifest identity before selecting it.
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"text must be a string, received {type(text).__name__}")
+    normalize_language(language)
+
+    if parse_emotion_tags:
+        text_tokens: list[int] = []
+        for part in _LEGACY_CL100K_EMOTION_PATTERN.split(text):
+            if not part:
+                continue
+            emotion_token = LEGACY_CL100K_EMOTION_TAGS.get(part)
+            if emotion_token is not None and (vocab_size is None or emotion_token < vocab_size):
+                text_tokens.append(emotion_token)
+            else:
+                text_tokens.extend(tokenizer.encode(part))
+    else:
+        text_tokens = tokenizer.encode(text)
+
+    encoded = [
+        LEGACY_CL100K_START_OF_HUMAN,
+        *text_tokens,
+        LEGACY_CL100K_END_OF_HUMAN,
+        LEGACY_CL100K_START_OF_AI,
+        LEGACY_CL100K_START_OF_SPEECH,
+    ]
+    if vocab_size is not None:
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 0:
+            raise ValueError("vocab_size must be a positive integer.")
+        invalid_ids = sorted({token_id for token_id in encoded if not 0 <= token_id < vocab_size})
+        if invalid_ids:
+            raise ValueError(
+                f"Token IDs {invalid_ids} exceed the checkpoint vocabulary of {vocab_size} entries."
+            )
+    return encoded
+
+
+def validate_legacy_cl100k_tokenizer(tokenizer: TokenEncoder) -> None:
+    """Fail closed unless ``tokenizer`` is the exact cl100k table used by schema 2."""
+    observed_shape = (
+        getattr(tokenizer, "name", None),
+        getattr(tokenizer, "n_vocab", None),
+        getattr(tokenizer, "max_token_value", None),
+    )
+    expected_shape = (
+        LEGACY_CL100K_TOKENIZER_NAME,
+        LEGACY_CL100K_TOKENIZER_LENGTH,
+        LEGACY_CL100K_TOKENIZER_LENGTH - 1,
+    )
+    if observed_shape != expected_shape:
+        raise RuntimeError(
+            "Legacy tokenizer identity does not match authenticated cl100k_base: "
+            f"{observed_shape!r} != {expected_shape!r}."
+        )
+    decode_token = getattr(tokenizer, "decode_single_token_bytes", None)
+    if not callable(decode_token):
+        raise RuntimeError(
+            "Installed tiktoken does not expose the public token decoder required to authenticate "
+            "the schema-2 cl100k runtime."
+        )
+    try:
+        digest = hashlib.sha256()
+        for token_id in range(LEGACY_CL100K_TOKENIZER_LENGTH):
+            try:
+                token = decode_token(token_id)
+            except (KeyError, ValueError):
+                continue
+            if not isinstance(token, bytes):
+                raise TypeError
+            digest.update(token_id.to_bytes(4, "big"))
+            digest.update(len(token).to_bytes(4, "big"))
+            digest.update(token)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise RuntimeError("Installed cl100k tokenizer tables are malformed.") from exc
+    observed_sha256 = digest.hexdigest()
+    if observed_sha256 != LEGACY_CL100K_TABLE_SHA256:
+        raise RuntimeError(
+            "Installed cl100k tokenizer tables do not match the schema-2 contract: "
+            f"{observed_sha256} != {LEGACY_CL100K_TABLE_SHA256}."
+        )
+    try:
+        observed_goldens = tuple(
+            (text, tokenizer.encode(text)) for text, _ in _LEGACY_CL100K_GOLDEN_ENCODINGS
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError("Installed cl100k tokenizer could not encode golden probes.") from exc
+    expected_goldens = tuple(_LEGACY_CL100K_GOLDEN_ENCODINGS)
+    if observed_goldens != expected_goldens:
+        raise RuntimeError(
+            "Installed cl100k tokenizer segmentation does not match the schema-2 contract."
+        )
+
+
 __all__ = [
     "BYTE_END",
     "BYTE_START",
@@ -676,6 +811,12 @@ __all__ = [
     "EXPLICIT_PAUSE",
     "GRAPHEME_TOKENS",
     "IPA_TOKENS",
+    "LEGACY_CL100K_EMOTION_TAGS",
+    "LEGACY_CL100K_PAD_TOKEN",
+    "LEGACY_CL100K_TABLE_SHA256",
+    "LEGACY_CL100K_TOKENIZER_LENGTH",
+    "LEGACY_CL100K_TOKENIZER_NAME",
+    "LEGACY_CL100K_TOTAL_VOCAB_SIZE",
     "PAD_TOKEN",
     "PUNCTUATION_TOKENS",
     "START_OF_AI",
@@ -693,7 +834,9 @@ __all__ = [
     "TokenEncoder",
     "WORD_BOUNDARY",
     "decode_utf8_fallback",
+    "encode_legacy_cl100k_text",
     "encode_tts_conditioning",
     "encode_tts_text",
     "token_receives_alignment",
+    "validate_legacy_cl100k_tokenizer",
 ]

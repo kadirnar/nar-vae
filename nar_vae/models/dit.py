@@ -9,6 +9,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from nar_vae.kernels import flash_attention as _flash_attention
 from nar_vae.tokenization import TOTAL_VOCAB_SIZE
 
+from .duration import ECHODIT_ARCHITECTURE_VERSION, LEGACY_ECHODIT_ARCHITECTURE_VERSION
 from .reference_resampler import ReferenceResampler
 from .text_conditioning import (
     FROZEN_FEATURE_TEXT_CONDITIONING,
@@ -710,14 +711,22 @@ class SpeakerEncoder(nn.Module):
         num_heads: int,
         intermediate_size: int,
         norm_eps: float,
+        architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
     ):
         super().__init__()
+        if architecture_version not in {
+            LEGACY_ECHODIT_ARCHITECTURE_VERSION,
+            ECHODIT_ARCHITECTURE_VERSION,
+        }:
+            raise ValueError(f"Unsupported EchoDiT architecture version: {architecture_version}.")
+        self.architecture_version = architecture_version
         self.patch_size = patch_size
 
         self.in_proj = nn.Linear(latent_size * patch_size, model_size, bias=True)
-        # A learned summary query preserves a stable, explicitly global timbre
-        # channel while all temporal reference patches remain available to DiT.
-        self.global_timbre_token = nn.Parameter(torch.zeros(1, 1, model_size))
+        if architecture_version >= ECHODIT_ARCHITECTURE_VERSION:
+            # A learned summary query preserves a stable, explicitly global timbre
+            # channel while all temporal reference patches remain available to DiT.
+            self.global_timbre_token = nn.Parameter(torch.zeros(1, 1, model_size))
 
         self.blocks = nn.ModuleList()
         for i in range(num_layers):
@@ -725,10 +734,9 @@ class SpeakerEncoder(nn.Module):
                 model_size=model_size,
                 num_heads=num_heads,
                 intermediate_size=intermediate_size,
-                # Reference audio is fully available before diffusion starts. A
-                # bidirectional encoder lets the summary and every patch use the
-                # complete recording instead of inheriting Echo's continuation mask.
-                is_causal=False,
+                # Architecture v3 used causal reference attention. Version 4 is
+                # deliberately bidirectional and carries a leading global token.
+                is_causal=architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION,
                 norm_eps=norm_eps,
             )
             self.blocks.append(block)
@@ -769,13 +777,21 @@ class SpeakerEncoder(nn.Module):
         x = self.in_proj(x)
         x = x / 6.0  # Activation scaling (from paper)
         patch_count = x.shape[1]
-        global_token = self.global_timbre_token.to(dtype=x.dtype).expand(x.shape[0], -1, -1)
-        x = torch.cat((global_token, x), dim=1)
+        if self.architecture_version >= ECHODIT_ARCHITECTURE_VERSION:
+            global_token = self.global_timbre_token.to(dtype=x.dtype).expand(x.shape[0], -1, -1)
+            x = torch.cat((global_token, x), dim=1)
 
         if mask is not None:
             patch_shape = (latent.shape[0], patch_count)
-            state_shape = (latent.shape[0], patch_count + 1)
-            if tuple(mask.shape) == patch_shape:
+            state_shape = (
+                (latent.shape[0], patch_count + 1)
+                if self.architecture_version >= ECHODIT_ARCHITECTURE_VERSION
+                else patch_shape
+            )
+            if (
+                self.architecture_version >= ECHODIT_ARCHITECTURE_VERSION
+                and tuple(mask.shape) == patch_shape
+            ):
                 mask = torch.cat(
                     (
                         torch.ones((latent.shape[0], 1), dtype=torch.bool, device=x.device),
@@ -810,7 +826,7 @@ class SpeakerEncoder(nn.Module):
 
 class EchoDiT(nn.Module):
     """
-    EchoDiT: Efficient DiT with Joint Attention for Flow Matching TTS.
+    EchoDiT: efficient joint-attention backbone for continuous-latent TTS.
 
     This is adapted from the EchoDiT paper for DACVAE-based flow matching.
     """
@@ -846,8 +862,23 @@ class EchoDiT(nn.Module):
         use_duration_alignment: bool = False,
         target_patch_size: int = 1,
         speaker_num_summary_tokens: int = 0,
+        architecture_version: int = ECHODIT_ARCHITECTURE_VERSION,
     ):
         super().__init__()
+        if architecture_version not in {
+            LEGACY_ECHODIT_ARCHITECTURE_VERSION,
+            ECHODIT_ARCHITECTURE_VERSION,
+        }:
+            raise ValueError(f"Unsupported EchoDiT architecture version: {architecture_version}.")
+        if architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION and (
+            target_patch_size != 1
+            or speaker_num_summary_tokens != 0
+            or text_conditioning_mode != SCRATCH_TOKEN_TEXT_CONDITIONING
+        ):
+            raise ValueError(
+                "EchoDiT architecture v3 requires target_patch_size=1, "
+                "speaker_num_summary_tokens=0, and scratch-token conditioning."
+            )
         if isinstance(target_patch_size, bool) or not isinstance(target_patch_size, Integral):
             raise ValueError("target_patch_size must be a positive integer.")
         if target_patch_size <= 0:
@@ -861,6 +892,7 @@ class EchoDiT(nn.Module):
         if speaker_num_summary_tokens > 0 and not use_speaker_conditioning:
             raise ValueError("speaker_num_summary_tokens requires use_speaker_conditioning=True.")
         self.speaker_patch_size = speaker_patch_size
+        self.architecture_version = architecture_version
         self.speaker_num_summary_tokens = int(speaker_num_summary_tokens)
         self.target_patch_size = int(target_patch_size)
         self.speaker_model_size = speaker_model_size
@@ -898,7 +930,7 @@ class EchoDiT(nn.Module):
             )
         self.global_language_embedding = (
             nn.Embedding(num_languages + 1, timestep_embed_size, padding_idx=0)
-            if num_languages > 0
+            if num_languages > 0 and architecture_version >= ECHODIT_ARCHITECTURE_VERSION
             else None
         )
 
@@ -913,6 +945,7 @@ class EchoDiT(nn.Module):
                 num_heads=speaker_num_heads,
                 intermediate_size=speaker_intermediate_size,
                 norm_eps=norm_eps,
+                architecture_version=architecture_version,
             )
             if use_speaker_conditioning
             else None
@@ -1248,6 +1281,8 @@ class EchoDiT(nn.Module):
     ) -> torch.Tensor | None:
         """Encode the utterance-level target language used by every DiT block."""
         if self.global_language_embedding is None:
+            if self.architecture_version == LEGACY_ECHODIT_ARCHITECTURE_VERSION:
+                return None
             if language_ids is not None:
                 raise ValueError("language_ids require a language-conditioned NAR-VAE checkpoint.")
             return None

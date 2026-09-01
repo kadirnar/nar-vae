@@ -552,7 +552,7 @@ def grpo_reference_identity(
     if model_manifest.stage != "sft" or model_manifest.parent is None:
         raise GRPOStageError("The GRPO reference must be a validated SFT model manifest.")
     if model_manifest.parent.get("stage") != "pretrain":
-        raise GRPOStageError("The GRPO SFT reference lacks its scratch-pretraining parent.")
+        raise GRPOStageError("The GRPO SFT reference lacks its NAR-VAE pretraining parent.")
     is_ema = checkpoint.name in {"ema_model.bin", "pytorch_model_ema.bin"} or (
         "_ema" in checkpoint.stem
     )
@@ -570,7 +570,7 @@ def grpo_reference_identity(
         raise GRPOStageError("The GRPO reference training lineage must be an SFT export.")
     parent = lineage.get("parent")
     if not isinstance(parent, Mapping) or parent.get("stage") != "pretrain":
-        raise GRPOStageError("The GRPO reference lineage must retain scratch pretraining.")
+        raise GRPOStageError("The GRPO reference lineage must retain NAR-VAE pretraining.")
     if lineage.get("checkpoint_file") != lineage_checkpoint.name:
         raise GRPOStageError("The SFT training lineage does not select the GRPO parent weight.")
     lineage_checkpoint_hash = _file_sha256(lineage_checkpoint)

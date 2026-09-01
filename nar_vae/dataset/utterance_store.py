@@ -8,7 +8,7 @@ import math
 import multiprocessing
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any
 
 import numpy as np
@@ -56,7 +56,18 @@ def _nonempty_string(value: Any, *, name: str) -> str:
 def namespace_speaker_id(namespace: str, speaker_id: Any) -> str:
     """Namespace a source-local grouping key before corpora are combined."""
     namespace = _nonempty_string(namespace, name="dataset namespace")
-    raw = _nonempty_string(str(speaker_id), name="speaker_id")
+    if isinstance(speaker_id, (bool, np.bool_)) or speaker_id is None:
+        raise ValueError("speaker_id must be a finite string or numeric scalar.")
+    if isinstance(speaker_id, str):
+        raw = _nonempty_string(speaker_id, name="speaker_id")
+    elif isinstance(speaker_id, Integral):
+        raw = str(speaker_id)
+    elif isinstance(speaker_id, Real):
+        if not math.isfinite(speaker_id):
+            raise ValueError("speaker_id must be a finite string or numeric scalar.")
+        raw = str(speaker_id)
+    else:
+        raise ValueError("speaker_id must be a finite string or numeric scalar.")
     return f"{namespace}:{raw}"
 
 
@@ -64,15 +75,23 @@ def canonical_audio_sha256(audio: Any, sample_rate: int) -> str:
     """Hash decoded PCM plus its rate for exact duplicate/leak detection."""
     if isinstance(sample_rate, bool) or not isinstance(sample_rate, Integral) or sample_rate <= 0:
         raise ValueError("audio sample_rate must be a positive integer.")
-    samples = np.asarray(audio)
+    try:
+        samples = np.asarray(audio, dtype=np.float32)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("audio must be convertible to a finite float32 waveform.") from exc
     if samples.ndim == 2:
         # Hugging Face audio is normally [samples]. Accept either common channel
         # orientation deterministically for external manifests.
         channel_axis = 0 if samples.shape[0] <= samples.shape[1] else 1
-        samples = samples.astype(np.float32, copy=False).mean(axis=channel_axis)
+        samples = samples.mean(axis=channel_axis, dtype=np.float32)
     if samples.ndim != 1 or samples.size == 0:
         raise ValueError("audio must contain a non-empty mono or multichannel waveform.")
-    samples = np.ascontiguousarray(samples, dtype="<f4")
+    if not np.isfinite(samples).all():
+        raise ValueError("audio must contain only finite samples.")
+    # Copy before normalizing signed zero so hashing never mutates a caller's
+    # array (or a Tensor-backed view) and numerically equal PCM has one ID.
+    samples = np.array(samples, dtype="<f4", order="C", copy=True)
+    samples[samples == 0] = 0.0
     digest = hashlib.sha256()
     digest.update(b"nar-vae-audio-v1\0")
     digest.update(int(sample_rate).to_bytes(8, "big", signed=False))

@@ -10,6 +10,7 @@ import torch
 
 from nar_vae.dacvae_encoding import derive_dacvae_posterior_seed
 from nar_vae.inference import FlowMatchingTTSInference, VoiceCloningUnsupportedError
+from nar_vae.models.duration import ECHODIT_ARCHITECTURE_VERSION
 from nar_vae.models.flow_matching import FlowMatchingEchoDiT, PreparedCFGConditioning
 from nar_vae.solvers.ode_solver import ODESolver
 from nar_vae.voice import DEFAULT_MAX_REFERENCE_SECONDS
@@ -394,6 +395,7 @@ class VoiceCloningTest(unittest.TestCase):
 
         model = FlowMatchingEchoDiT.__new__(FlowMatchingEchoDiT)
         torch.nn.Module.__init__(model)
+        model.architecture_version = ECHODIT_ARCHITECTURE_VERSION
         model.latent_size = 2
         model.speaker_patch_size = 4
         model.use_speaker_conditioning = True
@@ -482,6 +484,7 @@ class VoiceCloningTest(unittest.TestCase):
 
         model = FlowMatchingEchoDiT.__new__(FlowMatchingEchoDiT)
         torch.nn.Module.__init__(model)
+        model.architecture_version = ECHODIT_ARCHITECTURE_VERSION
         model.latent_size = 2
         model.speaker_patch_size = 4
         model.use_speaker_conditioning = True
@@ -544,6 +547,7 @@ class VoiceCloningTest(unittest.TestCase):
 
         model = FlowMatchingEchoDiT.__new__(FlowMatchingEchoDiT)
         torch.nn.Module.__init__(model)
+        model.architecture_version = ECHODIT_ARCHITECTURE_VERSION
         model.latent_size = 2
         model.speaker_patch_size = 4
         model.use_speaker_conditioning = False

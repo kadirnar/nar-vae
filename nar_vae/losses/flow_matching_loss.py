@@ -423,7 +423,7 @@ class FlowMatchingLoss(nn.Module):
         conditioning_features: torch.Tensor | None = None,  # [B, L, F]
     ) -> torch.Tensor:
         """
-        Compute flow matching loss.
+        Compute the checkpoint's versioned generative velocity loss.
 
         Args:
             model: Flow matching model

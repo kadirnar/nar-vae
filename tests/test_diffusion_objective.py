@@ -1,6 +1,7 @@
 import copy
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -81,10 +82,30 @@ class _ConstantPrediction(nn.Module):
         self.generative_objective = objective
         self.diffusion_schedule_shift = 1.0
         self.value = value
+        self.calls = 0
 
     def forward(self, latents, conditioning_ids, timesteps, attention_mask):
         del conditioning_ids, timesteps, attention_mask
+        self.calls += 1
         return torch.full_like(latents, self.value)
+
+
+class _ModuleWrapper(nn.Module):
+    def __init__(self, module: nn.Module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+class _OrigModuleWrapper(nn.Module):
+    def __init__(self, module: nn.Module):
+        super().__init__()
+        self._orig_mod = module
+
+    def forward(self, *args, **kwargs):
+        return self._orig_mod(*args, **kwargs)
 
 
 class _CleanOracle(nn.Module):
@@ -320,6 +341,65 @@ class DiffusionObjectiveTests(unittest.TestCase):
                 generative_objective=RECTIFIED_FLOW_OBJECTIVE,
                 device=torch.device("cpu"),
             )
+
+    def test_solver_authenticates_canonical_wrapped_schedule_before_sampling(self):
+        inner = _ConstantPrediction(VP_DIFFUSION_OBJECTIVE).eval()
+        inner.diffusion_schedule_shift = 0.2
+        wrapped = _ModuleWrapper(_OrigModuleWrapper(inner)).eval()
+
+        with (
+            patch("nar_vae.solvers.ode_solver.torch.randn") as random_draw,
+            self.assertRaisesRegex(ValueError, "schedule shift does not match"),
+        ):
+            ODESolver.sample(
+                model=wrapped,
+                conditioning_ids=torch.tensor([[1]]),
+                num_steps=1,
+                latent_shape=(1, 1, 1),
+                solver="euler",
+                generative_objective=VP_DIFFUSION_OBJECTIVE,
+                diffusion_schedule_shift=1.0,
+                device=torch.device("cpu"),
+            )
+
+        random_draw.assert_not_called()
+        self.assertEqual(inner.calls, 0)
+
+    def test_solver_resolves_wrapped_vp_contract_without_explicit_overrides(self):
+        inner = _ConstantPrediction(VP_DIFFUSION_OBJECTIVE, value=0.0).eval()
+        wrapped = _OrigModuleWrapper(_ModuleWrapper(inner)).eval()
+
+        sampled = ODESolver.sample(
+            model=wrapped,
+            conditioning_ids=torch.tensor([[1]]),
+            num_steps=1,
+            latent_shape=(1, 1, 1),
+            solver="ddim",
+            device=torch.device("cpu"),
+        )
+
+        self.assertTrue(bool(torch.isfinite(sampled).all()))
+        self.assertEqual(inner.calls, 1)
+
+    def test_solver_rejects_wrapper_cycles_before_sampling(self):
+        first = _ModuleWrapper(_ConstantPrediction(VP_DIFFUSION_OBJECTIVE))
+        second = _OrigModuleWrapper(first)
+        object.__setattr__(first, "module", second)
+
+        with (
+            patch("nar_vae.solvers.ode_solver.torch.randn") as random_draw,
+            self.assertRaisesRegex(ValueError, "wrapper cycle"),
+        ):
+            ODESolver.sample(
+                model=first,
+                conditioning_ids=torch.tensor([[1]]),
+                num_steps=1,
+                latent_shape=(1, 1, 1),
+                solver="euler",
+                device=torch.device("cpu"),
+            )
+
+        random_draw.assert_not_called()
 
 
 if __name__ == "__main__":

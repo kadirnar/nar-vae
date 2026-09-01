@@ -15,6 +15,7 @@ from nar_vae.objectives import (
     diffusion_probability_flow_scale,
     normalize_generative_objective,
     shifted_cosine_vp_coefficients,
+    unwrap_generation_contract_model,
     validate_diffusion_schedule_shift,
 )
 
@@ -129,12 +130,42 @@ class ODESolver:
             raise ValueError("Temporal rescale k and sigma must be positive.")
         if target_latent_std is not None and target_latent_std <= 0:
             raise ValueError("target_latent_std must be positive when provided.")
-        model_objective_value = getattr(model, "generative_objective", None)
+        contract_model = unwrap_generation_contract_model(model)
+        missing_contract_value = object()
+        model_objective_value = getattr(
+            contract_model,
+            "generative_objective",
+            missing_contract_value,
+        )
+        model_schedule_shift_value = getattr(
+            contract_model,
+            "diffusion_schedule_shift",
+            missing_contract_value,
+        )
+        if (model_objective_value is missing_contract_value) != (
+            model_schedule_shift_value is missing_contract_value
+        ):
+            raise ValueError(
+                "The diffusion model exposes an incomplete generative objective/schedule contract."
+            )
+        model_contract_present = model_objective_value is not missing_contract_value
         model_objective = (
             normalize_generative_objective(model_objective_value)
-            if model_objective_value is not None
+            if model_contract_present
             else None
         )
+        model_schedule_shift = (
+            validate_diffusion_schedule_shift(model_schedule_shift_value)
+            if model_contract_present
+            else None
+        )
+        if (
+            model_objective == RECTIFIED_FLOW_OBJECTIVE
+            and model_schedule_shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT
+        ):
+            raise ValueError(
+                "A rectified-flow diffusion model cannot declare a shifted diffusion schedule."
+            )
         objective = normalize_generative_objective(
             generative_objective
             if generative_objective is not None
@@ -145,7 +176,6 @@ class ODESolver:
                 "The requested generative objective does not match the loaded model: "
                 f"requested={objective!r}, model={model_objective!r}."
             )
-        model_schedule_shift = getattr(model, "diffusion_schedule_shift", None)
         schedule_shift = validate_diffusion_schedule_shift(
             diffusion_schedule_shift
             if diffusion_schedule_shift is not None
@@ -158,11 +188,16 @@ class ODESolver:
         if (
             model_schedule_shift is not None
             and diffusion_schedule_shift is not None
-            and schedule_shift != validate_diffusion_schedule_shift(model_schedule_shift)
+            and schedule_shift != model_schedule_shift
         ):
             raise ValueError(
                 "The requested diffusion schedule shift does not match the loaded model."
             )
+        if (
+            objective == RECTIFIED_FLOW_OBJECTIVE
+            and schedule_shift != DEFAULT_DIFFUSION_SCHEDULE_SHIFT
+        ):
+            raise ValueError("Rectified-flow sampling cannot use a shifted diffusion schedule.")
         if solver == "ddim" and objective != VP_DIFFUSION_OBJECTIVE:
             raise ValueError("solver='ddim' requires a vp_diffusion_v checkpoint.")
         if solver == "ddim" and temporal_rescale_k != 1.0:

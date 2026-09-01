@@ -1,7 +1,8 @@
 # NAR-VAE flow-native GRPO post-training configuration.
 #
-# This stage accepts only a legacy rectified-flow NAR-VAE SFT checkpoint whose
-# model and training manifests retain the original scratch-pretraining parent.
+# This stage accepts only a current schema-5 rectified-flow NAR-VAE SFT checkpoint whose
+# model and training manifests retain its NAR-VAE pretraining parent. Schemas 2–4 are
+# inference-only compatibility inputs and are rejected here.
 # Canonical vp_diffusion_v checkpoints are rejected until a diffusion-native
 # policy objective is implemented. It never imports a third-party pretrained TTS
 # model. Reward evaluators are injected through the Python API and their exact

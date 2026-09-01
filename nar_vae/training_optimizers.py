@@ -162,8 +162,8 @@ class HybridMuonAdamW(torch.optim.Optimizer):
         muon_class = getattr(torch.optim, "Muon", None)
         if muon_class is None:
             raise RuntimeError(
-                "optimizer: muon requires PyTorch 2.9 or newer. Reinstall the current nar-vae "
-                "package so its PyTorch requirement is satisfied."
+                "optimizer: muon requires PyTorch 2.9 or newer; install torch>=2.9 to use "
+                "optimizer: muon."
             )
 
         all_parameters = list(muon_parameters)

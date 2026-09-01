@@ -19,6 +19,8 @@ from nar_vae.dacvae.loader import (
 )
 from nar_vae.dacvae_encoding import DACVAE_POSTERIOR_SAMPLING_POLICY
 from nar_vae.dataset.representation import (
+    LEGACY_CL100K_TEXT_FRONTEND_NAME,
+    LEGACY_CL100K_TEXT_FRONTEND_VERSION,
     REPRESENTATION_CONTRACT_VERSION,
     TEXT_FRONTEND_NAME,
     TEXT_FRONTEND_VERSION,
@@ -33,16 +35,22 @@ from nar_vae.languages import (
     resolve_language_pair_support,
 )
 from nar_vae.model_presets import ARCHITECTURE_FIELDS, resolve_model_architecture
-from nar_vae.models.duration import ECHODIT_ARCHITECTURE_VERSION
+from nar_vae.models.duration import (
+    ECHODIT_ARCHITECTURE_VERSION,
+    LEGACY_ECHODIT_ARCHITECTURE_VERSION,
+)
 from nar_vae.objectives import (
     DEFAULT_DIFFUSION_SCHEDULE_SHIFT,
     RECTIFIED_FLOW_OBJECTIVE,
+    VP_DIFFUSION_OBJECTIVE,
     normalize_generative_objective,
     validate_diffusion_schedule_shift,
 )
+from nar_vae.tokenization import LEGACY_CL100K_PAD_TOKEN
 
 MODEL_MANIFEST_FILENAME = "nar_vae_manifest.json"
 MODEL_MANIFEST_SCHEMA_VERSION = 5
+ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION = 2
 LEGACY_MODEL_MANIFEST_SCHEMA_VERSION = 3
 PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION = 4
 MODEL_MANIFEST_LIBRARY = "nar-vae"
@@ -64,6 +72,11 @@ _ARCHITECTURE_FIELDS = (
 )
 _LEGACY_ARCHITECTURE_FIELDS = tuple(
     name for name in _ARCHITECTURE_FIELDS if name != "speaker_num_summary_tokens"
+)
+_ORIGIN_ARCHITECTURE_FIELDS = tuple(
+    name
+    for name in _ARCHITECTURE_FIELDS
+    if name not in {"architecture_version", "speaker_num_summary_tokens", "target_patch_size"}
 )
 _CAPABILITY_FIELDS = (
     "speaker_conditioning",
@@ -476,7 +489,10 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         raise ModelManifestError("NAR-VAE model manifest must be a JSON object.")
     raw = dict(value)
     schema_version = raw.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise ModelManifestError("NAR-VAE model-manifest schema_version must be an integer.")
     if schema_version not in {
+        ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION,
         LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
         PREVIOUS_MODEL_MANIFEST_SCHEMA_VERSION,
         MODEL_MANIFEST_SCHEMA_VERSION,
@@ -492,7 +508,10 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         "representation",
         "parent",
     }
-    if schema_version != LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+    if schema_version not in {
+        ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION,
+        LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
+    }:
         expected_root.update({"generation", "text_conditioning"})
     if set(raw) != expected_root:
         raise ModelManifestError("NAR-VAE model manifest has incomplete or unknown root fields.")
@@ -512,11 +531,12 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             raise ModelManifestError(f"Weight {resolved_name!r} has an invalid SHA-256.")
         weights[resolved_name] = checksum
 
-    architecture_fields = (
-        _LEGACY_ARCHITECTURE_FIELDS
-        if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION
-        else _ARCHITECTURE_FIELDS
-    )
+    if schema_version == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION:
+        architecture_fields = _ORIGIN_ARCHITECTURE_FIELDS
+    elif schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+        architecture_fields = _LEGACY_ARCHITECTURE_FIELDS
+    else:
+        architecture_fields = _ARCHITECTURE_FIELDS
     architecture = _mapping_with_exact_fields(
         raw["architecture"], architecture_fields, name="architecture"
     )
@@ -534,11 +554,38 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
                 raise ModelManifestError(f"Manifest architecture {name} must be non-negative.")
         else:
             architecture[name] = _positive_integer(architecture[name], name=name)
-    if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+    if schema_version == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION:
+        architecture["architecture_version"] = LEGACY_ECHODIT_ARCHITECTURE_VERSION
         architecture["speaker_num_summary_tokens"] = 0
-    if architecture["architecture_version"] != ECHODIT_ARCHITECTURE_VERSION:
+        architecture["target_patch_size"] = 1
+    elif schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+        architecture["speaker_num_summary_tokens"] = 0
+    expected_architecture_version = (
+        LEGACY_ECHODIT_ARCHITECTURE_VERSION
+        if schema_version == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION
+        else ECHODIT_ARCHITECTURE_VERSION
+    )
+    if architecture["architecture_version"] != expected_architecture_version:
         raise ModelManifestError(
             "The model manifest uses an unsupported NAR-VAE architecture version."
+        )
+    if (
+        schema_version
+        in {
+            ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION,
+            LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
+        }
+        and architecture["text_num_layers"] <= 0
+    ):
+        raise ModelManifestError(
+            "Schema-2/3 scratch-token manifests require a trained text encoder."
+        )
+    if (
+        schema_version == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION
+        and architecture["text_vocab_size"] <= LEGACY_CL100K_PAD_TOKEN
+    ):
+        raise ModelManifestError(
+            "Schema-2 cl100k architecture.text_vocab_size must include the legacy pad token."
         )
 
     capabilities = _mapping_with_exact_fields(
@@ -640,7 +687,10 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             "MAS topology and monotonic-alignment capability metadata disagree."
         )
 
-    if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+    if schema_version in {
+        ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION,
+        LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
+    }:
         generation = generation_from_config({})
         text_conditioning = text_conditioning_from_config({})
     else:
@@ -741,13 +791,19 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
     expected_representation_version = (
         REPRESENTATION_CONTRACT_VERSION if schema_version == MODEL_MANIFEST_SCHEMA_VERSION else 2
     )
-    if representation["contract_version"] != expected_representation_version:
+    if (
+        isinstance(representation["contract_version"], bool)
+        or not isinstance(representation["contract_version"], int)
+        or representation["contract_version"] != expected_representation_version
+    ):
         raise ModelManifestError("Unsupported prepared-data representation contract version.")
     for name in ("text_frontend_name", "codec_source", "codec_backend"):
         if not isinstance(representation[name], str) or not representation[name].strip():
             raise ModelManifestError(f"Manifest representation {name} must be non-empty.")
-    if representation["text_frontend_version"] < 1:
-        raise ModelManifestError("Manifest text_frontend_version must be positive.")
+    representation["text_frontend_version"] = _positive_integer(
+        representation["text_frontend_version"],
+        name="text_frontend_version",
+    )
     for name in ("sample_rate", "hop_length", "latent_width"):
         representation[name] = _positive_integer(representation[name], name=name)
     revision = representation["codec_revision"]
@@ -766,11 +822,18 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         and representation["codec_encoding_policy"] != DACVAE_POSTERIOR_SAMPLING_POLICY
     ):
         raise ModelManifestError("Manifest codec_encoding_policy is unsupported.")
-    expected_frontend = (
-        (FROZEN_TEXT_REPRESENTATION_NAME, FROZEN_TEXT_REPRESENTATION_VERSION)
-        if text_conditioning["mode"] == "frozen_features"
-        else (TEXT_FRONTEND_NAME, TEXT_FRONTEND_VERSION)
-    )
+    if schema_version == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION:
+        expected_frontend = (
+            LEGACY_CL100K_TEXT_FRONTEND_NAME,
+            LEGACY_CL100K_TEXT_FRONTEND_VERSION,
+        )
+    elif text_conditioning["mode"] == "frozen_features":
+        expected_frontend = (
+            FROZEN_TEXT_REPRESENTATION_NAME,
+            FROZEN_TEXT_REPRESENTATION_VERSION,
+        )
+    else:
+        expected_frontend = (TEXT_FRONTEND_NAME, TEXT_FRONTEND_VERSION)
     observed_frontend = (
         representation["text_frontend_name"],
         representation["text_frontend_version"],
@@ -842,7 +905,11 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
             parent["base_weight_filename"] = base_name
 
     raw_architecture = dict(architecture)
-    if schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+    if schema_version == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION:
+        raw_architecture.pop("architecture_version")
+        raw_architecture.pop("speaker_num_summary_tokens")
+        raw_architecture.pop("target_patch_size")
+    elif schema_version == LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
         raw_architecture.pop("speaker_num_summary_tokens")
     normalized_raw = {
         **raw,
@@ -852,7 +919,10 @@ def _validate_manifest(value: Any, *, path: Path) -> ModelManifest:
         "representation": representation,
         "parent": parent,
     }
-    if schema_version != LEGACY_MODEL_MANIFEST_SCHEMA_VERSION:
+    if schema_version not in {
+        ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION,
+        LEGACY_MODEL_MANIFEST_SCHEMA_VERSION,
+    }:
         normalized_raw["generation"] = generation
         normalized_raw["text_conditioning"] = text_conditioning
     return ModelManifest(
@@ -978,6 +1048,21 @@ def write_model_manifest(
     """Atomically write a hash-bound manifest beside a training export."""
     if stage not in MODEL_MANIFEST_STAGES:
         raise ModelManifestError(f"Unknown training stage {stage!r}.")
+    if (
+        stage == "pretrain"
+        and config.get("text_conditioning_mode", "scratch_tokens") != "frozen_features"
+    ):
+        raise ModelManifestError(
+            "Pretraining exports require frozen_features text conditioning; scratch-token "
+            "topologies are reserved for authenticated legacy inference."
+        )
+    if stage == "pretrain" and generation_from_config(config)["objective"] != (
+        VP_DIFFUSION_OBJECTIVE
+    ):
+        raise ModelManifestError(
+            "Pretraining exports require generative_objective: vp_diffusion_v; rectified-flow "
+            "exports are reserved for authenticated legacy continuation."
+        )
     if stage == "pretrain" and parent_manifest is not None:
         raise ModelManifestError("Pretraining exports cannot declare a parent manifest.")
     if stage == "sft":
@@ -1213,7 +1298,7 @@ def validate_sft_resume_manifest(
 def validate_grpo_parent_manifest(
     checkpoint_path: str | os.PathLike[str],
 ) -> ModelManifest:
-    """Require a hash-bound NAR-VAE SFT checkpoint descended from scratch pretraining.
+    """Require a hash-bound NAR-VAE SFT checkpoint descended from NAR-VAE pretraining.
 
     The returned SFT manifest is also the immutable reference-policy identity for a
     fresh GRPO run.  GRPO is not an alternate model-import path: legacy, external,
@@ -1229,7 +1314,7 @@ def validate_grpo_parent_manifest(
         )
     if manifest.parent is None or manifest.parent.get("stage") != "pretrain":
         raise ModelManifestError(
-            "The GRPO SFT reference must retain its NAR-VAE scratch-pretraining parent."
+            "The GRPO SFT reference must retain its NAR-VAE pretraining parent."
         )
     if manifest.representation.get("codec_encoding_policy") != DACVAE_POSTERIOR_SAMPLING_POLICY:
         raise ModelManifestError(
@@ -1301,11 +1386,18 @@ def validate_inference_manifest(
             "Checkpoint frozen text-conditioning topology does not match the manifest."
         )
     representation = manifest.representation
-    expected_frontend = (
-        (FROZEN_TEXT_REPRESENTATION_NAME, FROZEN_TEXT_REPRESENTATION_VERSION)
-        if manifest.text_conditioning["mode"] == "frozen_features"
-        else (TEXT_FRONTEND_NAME, TEXT_FRONTEND_VERSION)
-    )
+    if manifest.raw["schema_version"] == ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION:
+        expected_frontend = (
+            LEGACY_CL100K_TEXT_FRONTEND_NAME,
+            LEGACY_CL100K_TEXT_FRONTEND_VERSION,
+        )
+    elif manifest.text_conditioning["mode"] == "frozen_features":
+        expected_frontend = (
+            FROZEN_TEXT_REPRESENTATION_NAME,
+            FROZEN_TEXT_REPRESENTATION_VERSION,
+        )
+    else:
+        expected_frontend = (TEXT_FRONTEND_NAME, TEXT_FRONTEND_VERSION)
     if (
         representation["text_frontend_name"] != expected_frontend[0]
         or representation["text_frontend_version"] != expected_frontend[1]
@@ -1357,6 +1449,7 @@ __all__ = [
     "MODEL_MANIFEST_FILENAME",
     "MODEL_MANIFEST_LIBRARY",
     "MODEL_MANIFEST_SCHEMA_VERSION",
+    "ORIGIN_MODEL_MANIFEST_SCHEMA_VERSION",
     "ModelManifest",
     "ModelManifestError",
     "architecture_from_config",

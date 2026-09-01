@@ -41,6 +41,11 @@ This is diffusion, not the straight rectified-flow interpolation used by Echo-TT
 Legacy flow checkpoints remain loadable and are identified separately; objective and schedule
 metadata cannot be mixed.
 
+The diagram describes current schema-5 checkpoints. Authenticated schema-2 checkpoints use their
+original EchoDiT-v3 topology, exact `cl100k_base` frontend, and historical global-RNG reference
+posterior path. That isolated inference lane does not alter the current content-seeded policy and
+cannot be used to start or export new training.
+
 The design review, source links, accepted ideas, rejected alternatives, and required ablations are
 in [docs/research_2025_2026.md](docs/research_2025_2026.md).
 
@@ -84,7 +89,11 @@ wandb login
 ```
 
 `pyproject.toml` is the dependency manifest. W&B is required by the current training entry points;
-use `WANDB_MODE=offline` on an isolated server.
+use `WANDB_MODE=offline` on an isolated server. The pinned `tiktoken` dependency exists only to
+reproduce the exact authenticated schema-2 `cl100k_base` frontend; current frozen-feature
+checkpoints do not import it. The default AdamW path supports the package's PyTorch 2.7.1 floor;
+the optional experimental Muon optimizer requires PyTorch 2.9 or newer and fails clearly when the
+native optimizer is unavailable.
 
 ## Prepare multilingual cloning data
 

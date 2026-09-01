@@ -88,7 +88,7 @@ duration_predictor_num_layers: 2
 duration_predictor_use_speaker: true
 duration_loss_weight: 0.1
 duration_huber_delta: 1.0
-# These architecture fields match the canonical scratch pretraining export. Change them only when
+# These architecture fields match the canonical pretraining export. Change them only when
 # the selected parent lineage was produced by a deliberately different pretraining configuration.
 use_mas_duration: true
 duration_alignment_hidden_size: 64

@@ -30,7 +30,8 @@ references and for legacy rectified-flow checkpoints. Objective, schedule, and s
 checkpoint metadata; the runtime rejects attempts to decode a flow checkpoint as VP diffusion or
 to use DDIM with a flow checkpoint.
 
-The shipped profile names describe fixed compute budgets only:
+For current schema-5 VP checkpoints, the shipped profile names describe fixed compute budgets
+only:
 
 | Profile | Sampler | Neural evaluations | Intended use |
 | --- | --- | ---: | --- |
@@ -38,8 +39,21 @@ The shipped profile names describe fixed compute budgets only:
 | `balanced` | deterministic DDIM | 16 | Candidate after quality gating |
 | `fast` | deterministic DDIM | 8 | Aggressive candidate after quality gating |
 
+Rectified-flow checkpoints—including authenticated schema-2/EchoDiT-v3 compatibility weights and
+current schema-5 flow exports—use objective-compatible ODE profiles instead of borrowing VP/DDIM
+settings. The budgets below reproduce the historical schema-2 profiles; for later flow schemas
+they are a conservative library policy, not an authenticated training-time calibration:
+
+| Profile | Sampler | Neural evaluations | Cache mode |
+| --- | --- | ---: | --- |
+| `quality` | Heun | 50 | none |
+| `balanced` | Euler | 32 | none |
+| `fast` | Euler | 16 | none |
+| `turbo` | Euler | 16 | Cache-DiT |
+
 These labels do not establish perceptual quality, real-time factor, or hardware latency. A trained
-checkpoint must be evaluated at all three budgets.
+checkpoint must be evaluated at every advertised budget. For schema-2 weights these profiles are
+compatibility behavior, not recommendations for a newly trained VP model.
 
 ## Work removed from the diffusion loop
 
