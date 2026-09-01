@@ -27,12 +27,10 @@ from .data_collator import (
 _LAZY_EXPORTS = {
     "DatasetPreparer": ("nar_vae.dataset.prepare", "DatasetPreparer"),
     "prepare_dataset": ("nar_vae.dataset.prepare", "prepare_dataset"),
-    "EmiliaPreparer": ("nar_vae.dataset.emilia_prepare", "EmiliaPreparer"),
-    "prepare_emilia_dataset": (
-        "nar_vae.dataset.emilia_prepare",
-        "prepare_emilia_dataset",
+    "prepare_from_hf_dataset": (
+        "nar_vae.dataset.prepare_dataset",
+        "prepare_from_hf_dataset",
     ),
-    "merge_parts": ("nar_vae.dataset.emilia_prepare", "merge_parts"),
     "prepare_finetune_dataset": (
         "nar_vae.dataset.finetune_prepare",
         "prepare_finetune_dataset",
@@ -98,9 +96,7 @@ _LAZY_EXPORTS = {
 __all__ = [
     "DatasetPreparer",
     "prepare_dataset",
-    "EmiliaPreparer",
-    "prepare_emilia_dataset",
-    "merge_parts",
+    "prepare_from_hf_dataset",
     "prepare_finetune_dataset",
     "validate_zero_shot_splits",
     "FrameBudgetBatchSampler",

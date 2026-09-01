@@ -186,6 +186,7 @@ inference returns a complete waveform after ODE integration and codec decoding; 
 
 ## More documentation
 
+- [Simple training guide](docs/train.md)
 - [Architecture and training](docs/architecture.md)
 - [SFT, GRPO, and evaluation](docs/post_pretraining.md)
 - [Inference optimization](docs/inference_optimization.md)

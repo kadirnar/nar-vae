@@ -11,13 +11,12 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from nar_vae.dacvae import HubDACVAESource
-from nar_vae.dataset.emilia_prepare import EmiliaPreparer, prepare_emilia_dataset
+from nar_vae.dataset import prepare_from_hf_dataset
 from nar_vae.dataset.finetune_prepare import DataPreparer, prepare_finetune_dataset
 from nar_vae.dataset.prepare import DatasetPreparer, prepare_dataset
 from nar_vae.dataset.prepare_dataset import (
     DatasetPreparer as FileDatasetPreparer,
 )
-from nar_vae.dataset.prepare_dataset import prepare_from_hf_dataset
 from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_COLUMN,
     REPRESENTATION_CONTRACT_VERSION,
@@ -31,7 +30,6 @@ from nar_vae.dataset.sources import resolve_dataset_source
 
 DATASET_REVISION_A = "a" * 40
 DATASET_REVISION_B = "b" * 40
-DATASET_REVISION_C = "c" * 40
 
 
 def fake_codec(
@@ -215,17 +213,6 @@ class RepresentationContractTest(unittest.TestCase):
                 {"audio": {"array": [0.0], "sampling_rate": 48000}, "text": "hello"}
             )
 
-        emilia = EmiliaPreparer.__new__(EmiliaPreparer)
-        emilia.language = "en"
-        emilia.sample_rate = 48000
-        emilia.representation_contract = self.contract
-        emilia.extract_latents = lambda audio, sr: np.zeros((4, 3), dtype=np.float32)
-        emilia.tokenize_text = lambda text, language=None: [1, 2]
-        batch = emilia.process_batch(
-            [{"mp3": {"array": [0.0], "sampling_rate": 48000}, "json": {"text": "hi"}}]
-        )
-        self.assertEqual(batch[REPRESENTATION_CONTRACT_COLUMN], [self.contract.to_dict()])
-
         finetune = DataPreparer.__new__(DataPreparer)
         finetune.language = "en"
         finetune.sample_rate = 48000
@@ -254,7 +241,6 @@ class RepresentationContractTest(unittest.TestCase):
             ("nar_vae.dataset.prepare.load_dacvae", DatasetPreparer),
             ("nar_vae.dataset.prepare_dataset.load_dacvae", FileDatasetPreparer),
             ("nar_vae.dataset.finetune_prepare.load_dacvae", DataPreparer),
-            ("nar_vae.dataset.emilia_prepare.load_dacvae", EmiliaPreparer),
         )
 
         for load_target, preparer_class in cases:
@@ -341,7 +327,7 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
         load_dataset.assert_called_once_with(directory, split="train", num_proc=3)
         write_manifest.assert_called_once_with(prepared, str(Path(directory) / "prepared"))
 
-    def test_all_other_hub_preparation_paths_thread_revision_and_workers(self):
+    def test_generic_hub_preparation_paths_thread_revision_and_workers(self):
         raw = empty_dataset()
         with tempfile.TemporaryDirectory() as directory:
             with (
@@ -398,40 +384,6 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
             write_finetune_manifest.assert_called_once_with(
                 prepared_finetune,
                 str(Path(directory) / "finetune"),
-            )
-
-            with (
-                patch(
-                    "nar_vae.dataset.emilia_prepare.setup_distributed",
-                    return_value=(0, 1, False),
-                ),
-                patch(
-                    "nar_vae.dataset.emilia_prepare.load_dataset", return_value=[]
-                ) as load_emilia,
-                patch(
-                    "nar_vae.dataset.emilia_prepare.EmiliaPreparer",
-                    return_value=SimpleNamespace(sample_rate=48000),
-                ),
-                patch("nar_vae.dataset.emilia_prepare.merge_parts", return_value=None),
-                patch("nar_vae.dataset.emilia_prepare.cleanup_distributed"),
-            ):
-                prepare_emilia_dataset(
-                    str(Path(directory) / "emilia"),
-                    "en",
-                    "Emilia",
-                    "codec/source-v1",
-                    8,
-                    0,
-                    dataset_revision=DATASET_REVISION_C,
-                    dataset_download_workers=9,
-                )
-            load_emilia.assert_called_once_with(
-                "amphion/Emilia-Dataset",
-                data_files={"train": "Emilia/en/**/*.tar"},
-                split="train",
-                streaming=True,
-                revision=DATASET_REVISION_C,
-                num_proc=9,
             )
 
 
