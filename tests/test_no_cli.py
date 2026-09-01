@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-PACKAGE = ROOT / "vyvotts"
+PACKAGE = ROOT / "nar_vae"
 
 
 class LibraryOnlySurfaceTest(unittest.TestCase):

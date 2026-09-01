@@ -4,12 +4,12 @@ import unittest
 
 import torch
 
-from vyvotts.dataset.data_collator import (
+from nar_vae.dataset.data_collator import (
     FlowMatchingDataCollator,
     SimpleTTSCollator,
     create_data_collator,
 )
-from vyvotts.tokenization import PAD_TOKEN
+from nar_vae.tokenization import PAD_TOKEN
 
 
 class DataCollatorDefaultsTest(unittest.TestCase):

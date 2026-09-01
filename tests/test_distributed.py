@@ -5,7 +5,7 @@ from unittest.mock import Mock, call, patch
 
 import torch
 
-from vyvotts.distributed import (
+from nar_vae.distributed import (
     DistributedContext,
     distributed_cleanup_guard,
     initialize_distributed,
@@ -54,19 +54,19 @@ class DistributedContextTest(unittest.TestCase):
         events = Mock()
 
         with (
-            patch("vyvotts.distributed.torch.cuda.is_available", return_value=True),
-            patch("vyvotts.distributed.torch.cuda.device_count", return_value=2),
+            patch("nar_vae.distributed.torch.cuda.is_available", return_value=True),
+            patch("nar_vae.distributed.torch.cuda.device_count", return_value=2),
             patch(
-                "vyvotts.distributed.torch.cuda.set_device",
+                "nar_vae.distributed.torch.cuda.set_device",
                 side_effect=lambda rank: events("set_device", rank),
             ),
-            patch("vyvotts.distributed.dist.is_initialized", return_value=False),
+            patch("nar_vae.distributed.dist.is_initialized", return_value=False),
             patch(
-                "vyvotts.distributed.dist.init_process_group",
+                "nar_vae.distributed.dist.init_process_group",
                 side_effect=lambda **kwargs: events("init", kwargs["backend"]),
             ),
-            patch("vyvotts.distributed.dist.get_rank", return_value=1),
-            patch("vyvotts.distributed.dist.get_world_size", return_value=2),
+            patch("nar_vae.distributed.dist.get_rank", return_value=1),
+            patch("nar_vae.distributed.dist.get_world_size", return_value=2),
         ):
             result = initialize_distributed(context)
 
@@ -79,9 +79,9 @@ class DistributedContextTest(unittest.TestCase):
     def test_rank_outside_visible_cuda_devices_fails_before_initialization(self):
         context = DistributedContext(local_rank=2, rank=2, world_size=4, local_world_size=4)
         with (
-            patch("vyvotts.distributed.torch.cuda.is_available", return_value=True),
-            patch("vyvotts.distributed.torch.cuda.device_count", return_value=2),
-            patch("vyvotts.distributed.dist.init_process_group") as initialize,
+            patch("nar_vae.distributed.torch.cuda.is_available", return_value=True),
+            patch("nar_vae.distributed.torch.cuda.device_count", return_value=2),
+            patch("nar_vae.distributed.dist.init_process_group") as initialize,
             self.assertRaisesRegex(RuntimeError, "cannot select"),
         ):
             initialize_distributed(context)
@@ -103,10 +103,10 @@ class DistributedContextTest(unittest.TestCase):
     def test_new_process_group_cleanup_avoids_barrier_after_failure(self):
         with (
             patch(
-                "vyvotts.distributed.dist.is_initialized",
+                "nar_vae.distributed.dist.is_initialized",
                 side_effect=[False, True],
             ),
-            patch("vyvotts.distributed.cleanup_distributed") as cleanup,
+            patch("nar_vae.distributed.cleanup_distributed") as cleanup,
             self.assertRaisesRegex(RuntimeError, "rank-local failure"),
         ):
             with distributed_cleanup_guard():
@@ -117,10 +117,10 @@ class DistributedContextTest(unittest.TestCase):
     def test_new_process_group_cleanup_synchronizes_after_success(self):
         with (
             patch(
-                "vyvotts.distributed.dist.is_initialized",
+                "nar_vae.distributed.dist.is_initialized",
                 side_effect=[False, True],
             ),
-            patch("vyvotts.distributed.cleanup_distributed") as cleanup,
+            patch("nar_vae.distributed.cleanup_distributed") as cleanup,
             distributed_cleanup_guard(),
         ):
             pass
@@ -129,8 +129,8 @@ class DistributedContextTest(unittest.TestCase):
 
     def test_preexisting_process_group_is_not_owned_by_guard(self):
         with (
-            patch("vyvotts.distributed.dist.is_initialized", return_value=True),
-            patch("vyvotts.distributed.cleanup_distributed") as cleanup,
+            patch("nar_vae.distributed.dist.is_initialized", return_value=True),
+            patch("nar_vae.distributed.cleanup_distributed") as cleanup,
             distributed_cleanup_guard(),
         ):
             pass
@@ -148,7 +148,7 @@ class DistributedContextTest(unittest.TestCase):
                 {"rank": 3, "is_node_leader": False, "value": None, "error": None},
             ]
 
-        with patch("vyvotts.distributed.dist.all_gather_object", side_effect=identical):
+        with patch("nar_vae.distributed.dist.all_gather_object", side_effect=identical):
             value = resolve_node_consistent_value(
                 context,
                 lambda: {"hash": "same"},
@@ -165,7 +165,7 @@ class DistributedContextTest(unittest.TestCase):
             ]
 
         with (
-            patch("vyvotts.distributed.dist.all_gather_object", side_effect=mismatched),
+            patch("nar_vae.distributed.dist.all_gather_object", side_effect=mismatched),
             self.assertRaisesRegex(ValueError, "differs between node-local"),
         ):
             resolve_node_consistent_value(
@@ -182,7 +182,7 @@ class DistributedContextTest(unittest.TestCase):
             outputs[:] = ["OSError: disk full", None]
 
         with (
-            patch("vyvotts.distributed.dist.all_gather_object", side_effect=remote_failure),
+            patch("nar_vae.distributed.dist.all_gather_object", side_effect=remote_failure),
             self.assertRaisesRegex(RuntimeError, "Rank 0 failed during final export"),
         ):
             propagate_distributed_error(context, None, description="final export")
@@ -193,10 +193,10 @@ class DistributedContextTest(unittest.TestCase):
             outputs[:] = [None, "OSError: disk full"]
 
         with (
-            patch("vyvotts.distributed.dist.is_available", return_value=True),
-            patch("vyvotts.distributed.dist.is_initialized", return_value=True),
-            patch("vyvotts.distributed.dist.get_world_size", return_value=2),
-            patch("vyvotts.distributed.dist.all_gather_object", side_effect=remote_failure),
+            patch("nar_vae.distributed.dist.is_available", return_value=True),
+            patch("nar_vae.distributed.dist.is_initialized", return_value=True),
+            patch("nar_vae.distributed.dist.get_world_size", return_value=2),
+            patch("nar_vae.distributed.dist.all_gather_object", side_effect=remote_failure),
             self.assertRaisesRegex(
                 RuntimeError,
                 "Rank 1 failed during Trainer checkpoint save",
@@ -212,10 +212,10 @@ class DistributedContextTest(unittest.TestCase):
             outputs[:] = [local_message, None]
 
         with (
-            patch("vyvotts.distributed.dist.is_available", return_value=True),
-            patch("vyvotts.distributed.dist.is_initialized", return_value=True),
-            patch("vyvotts.distributed.dist.get_world_size", return_value=2),
-            patch("vyvotts.distributed.dist.all_gather_object", side_effect=local_failure),
+            patch("nar_vae.distributed.dist.is_available", return_value=True),
+            patch("nar_vae.distributed.dist.is_initialized", return_value=True),
+            patch("nar_vae.distributed.dist.get_world_size", return_value=2),
+            patch("nar_vae.distributed.dist.all_gather_object", side_effect=local_failure),
             self.assertRaises(OSError) as raised,
         ):
             propagate_process_group_error(failure, description="Trainer checkpoint save")
@@ -241,10 +241,10 @@ class DistributedContextTest(unittest.TestCase):
             outputs[:] = [local_value, {"sha256": "different"}]
 
         with (
-            patch("vyvotts.distributed.dist.is_available", return_value=True),
-            patch("vyvotts.distributed.dist.is_initialized", return_value=True),
-            patch("vyvotts.distributed.dist.get_world_size", return_value=2),
-            patch("vyvotts.distributed.dist.all_gather_object", side_effect=mismatched),
+            patch("nar_vae.distributed.dist.is_available", return_value=True),
+            patch("nar_vae.distributed.dist.is_initialized", return_value=True),
+            patch("nar_vae.distributed.dist.get_world_size", return_value=2),
+            patch("nar_vae.distributed.dist.all_gather_object", side_effect=mismatched),
             self.assertRaisesRegex(ValueError, "differs between distributed ranks"),
         ):
             require_process_group_consistent_value(

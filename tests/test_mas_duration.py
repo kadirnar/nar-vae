@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from vyvotts.checkpoint import (
+from nar_vae.checkpoint import (
     CheckpointProvenance,
     DurationCheckpointInfo,
     FlowCheckpoint,
@@ -21,17 +21,17 @@ from vyvotts.checkpoint import (
     inspect_monotonic_alignment_capability,
     load_pretrained_checkpoint,
 )
-from vyvotts.inference import FlowMatchingTTSInference
-from vyvotts.losses.flow_matching_loss import FlowMatchingLoss, _global_valid_mean
-from vyvotts.models.dit import LowRankAdaLN
-from vyvotts.models.duration import (
+from nar_vae.inference import FlowMatchingTTSInference
+from nar_vae.losses.flow_matching_loss import FlowMatchingLoss, _global_valid_mean
+from nar_vae.models.dit import LowRankAdaLN
+from nar_vae.models.duration import (
     DurationAlignmentOutput,
     EchoDurationAlignment,
     allocate_positive_token_durations,
     expand_text_by_durations,
 )
-from vyvotts.models.flow_matching import FlowMatchingEchoDiT
-from vyvotts.solvers.ode_solver import ODESolver
+from nar_vae.models.flow_matching import FlowMatchingEchoDiT
+from nar_vae.solvers.ode_solver import ODESolver
 
 
 def tiny_model(*, mas: bool) -> FlowMatchingEchoDiT:
@@ -314,11 +314,11 @@ class MASFlowTrainingTest(unittest.TestCase):
                 statistics.add_(torch.tensor([4.0, 8.0]))
 
         with (
-            patch("vyvotts.losses.flow_matching_loss.dist.is_available", return_value=True),
-            patch("vyvotts.losses.flow_matching_loss.dist.is_initialized", return_value=True),
-            patch("vyvotts.losses.flow_matching_loss.dist.get_world_size", return_value=2),
+            patch("nar_vae.losses.flow_matching_loss.dist.is_available", return_value=True),
+            patch("nar_vae.losses.flow_matching_loss.dist.is_initialized", return_value=True),
+            patch("nar_vae.losses.flow_matching_loss.dist.get_world_size", return_value=2),
             patch(
-                "vyvotts.losses.flow_matching_loss.dist.all_reduce",
+                "nar_vae.losses.flow_matching_loss.dist.all_reduce",
                 side_effect=add_remote_rank,
             ),
         ):
@@ -379,18 +379,18 @@ class MASCheckpointTest(unittest.TestCase):
         )
 
         with (
-            patch("vyvotts.inference.FlowCheckpoint.load", return_value=checkpoint),
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=checkpoint),
             patch(
-                "vyvotts.inference.create_flow_matching_echodit",
+                "nar_vae.inference.create_flow_matching_echodit",
                 return_value=model,
             ) as factory,
             patch(
-                "vyvotts.inference.load_model_manifest",
+                "nar_vae.inference.load_model_manifest",
                 return_value=SimpleNamespace(representation={"codec_sha256": "a" * 64}),
             ),
-            patch("vyvotts.inference.validate_inference_manifest"),
-            patch("vyvotts.inference.load_dacvae", return_value=codec),
-            patch("vyvotts.inference.validate_loaded_codec"),
+            patch("nar_vae.inference.validate_inference_manifest"),
+            patch("nar_vae.inference.load_dacvae", return_value=codec),
+            patch("nar_vae.inference.validate_loaded_codec"),
         ):
             runtime = FlowMatchingTTSInference(
                 checkpoint_path,

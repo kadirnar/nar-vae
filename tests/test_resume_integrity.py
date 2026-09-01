@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from vyvotts.configuration import (
+from nar_vae.configuration import (
     RESOLVED_TRAINING_DATASET_IDENTITY_KEY,
     TRAINING_CHECKPOINT_MANIFEST_FILENAME,
     bind_training_dataset_identity,
@@ -318,10 +318,10 @@ class ResumeIntegrityTest(unittest.TestCase):
             checkpoint = self._checkpoint(config, 9, parent_lineage=parent)
             resumed = dict(config, resume_from_checkpoint=True)
 
-            import vyvotts.finetune as finetune_module
+            import nar_vae.finetune as finetune_module
 
             if not hasattr(finetune_module.Trainer, "_load_from_checkpoint"):
-                self.skipTest("Transformers training extra is unavailable")
+                self.skipTest("Transformers dependency is unavailable")
             fine_tuner = object.__new__(finetune_module.EchoDiTFineTuner)
             fine_tuner.config = resumed
             fine_tuner.ema_model = None
@@ -387,8 +387,8 @@ class ResumeIntegrityTest(unittest.TestCase):
                 )
 
     def test_trainer_checkpoint_write_failure_is_synchronized_before_seal_barrier(self):
-        import vyvotts.finetune as finetune_module
-        import vyvotts.train as train_module
+        import nar_vae.finetune as finetune_module
+        import nar_vae.train as train_module
 
         cases = (
             (train_module, train_module.EchoDiTTrainer, "training_config"),
@@ -397,7 +397,7 @@ class ResumeIntegrityTest(unittest.TestCase):
         for module, trainer_type, config_attribute in cases:
             with self.subTest(trainer=trainer_type.__name__), tempfile.TemporaryDirectory() as root:
                 if not hasattr(module.Trainer, "_save_checkpoint"):
-                    self.skipTest("Transformers training extra is unavailable")
+                    self.skipTest("Transformers dependency is unavailable")
                 trainer = object.__new__(trainer_type)
                 trainer.state = SimpleNamespace(global_step=4)
                 setattr(trainer, config_attribute, {})

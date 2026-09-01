@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.inference import FlowMatchingTTSInference, VoiceCloningUnsupportedError
-from vyvotts.models.flow_matching import FlowMatchingEchoDiT, PreparedCFGConditioning
-from vyvotts.solvers.ode_solver import ODESolver
+from nar_vae.inference import FlowMatchingTTSInference, VoiceCloningUnsupportedError
+from nar_vae.models.flow_matching import FlowMatchingEchoDiT, PreparedCFGConditioning
+from nar_vae.solvers.ode_solver import ODESolver
 
 
 class FakeCodec:

@@ -6,8 +6,8 @@ from pathlib import Path
 
 
 def load_tokenization_module():
-    module_path = Path(__file__).parents[1] / "vyvotts" / "tokenization.py"
-    spec = importlib.util.spec_from_file_location("vyvotts_tokenization_test", module_path)
+    module_path = Path(__file__).parents[1] / "nar_vae" / "tokenization.py"
+    spec = importlib.util.spec_from_file_location("nar_vae_tokenization_test", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)

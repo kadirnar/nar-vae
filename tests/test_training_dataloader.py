@@ -8,24 +8,24 @@ from types import SimpleNamespace
 
 import torch
 
-from vyvotts.configuration import resolve_frame_budget_batching
-from vyvotts.dataset.sampling import FrameBudgetBatchSampler
-from vyvotts.training_data import (
+from nar_vae.configuration import resolve_frame_budget_batching
+from nar_vae.dataset.sampling import FrameBudgetBatchSampler
+from nar_vae.training_data import (
     FrameBudgetTrainerMixin,
     build_accumulation_loss_normalization,
     build_frame_budget_train_dataloader,
 )
 
-_TRAINING_EXTRAS_AVAILABLE = True
+_TRAINING_DEPENDENCIES_AVAILABLE = True
 try:
     from accelerate.data_loader import BatchSamplerShard, DataLoaderShard
     from torch import nn
     from transformers import TrainingArguments
 
-    from vyvotts.finetune import EchoDiTFineTuner
-    from vyvotts.train import EchoDiTTrainer
+    from nar_vae.finetune import EchoDiTFineTuner
+    from nar_vae.train import EchoDiTTrainer
 except (ImportError, RuntimeError):
-    _TRAINING_EXTRAS_AVAILABLE = False
+    _TRAINING_DEPENDENCIES_AVAILABLE = False
     BatchSamplerShard = None
     DataLoaderShard = None
     EchoDiTFineTuner = None
@@ -72,7 +72,7 @@ def collate_ids(rows):
     return [row["sample_id"] for row in rows]
 
 
-@unittest.skipUnless(_TRAINING_EXTRAS_AVAILABLE, "training extras are not installed")
+@unittest.skipUnless(_TRAINING_DEPENDENCIES_AVAILABLE, "training dependencies are not installed")
 class TrainingDataLoaderTest(unittest.TestCase):
     def _trainer(self, lengths):
         dataset = MetadataDataset(lengths)

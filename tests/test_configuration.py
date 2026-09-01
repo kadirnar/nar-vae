@@ -2,7 +2,7 @@
 
 import unittest
 
-from vyvotts.configuration import load_inference_settings
+from nar_vae.configuration import load_inference_settings
 
 
 class InferenceConfigurationTest(unittest.TestCase):

@@ -9,16 +9,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from vyvotts.checkpoint import (
+from nar_vae.checkpoint import (
     CheckpointProvenance,
     DurationCheckpointInfo,
     LanguageCheckpointInfo,
     MonotonicAlignmentCheckpointInfo,
     ReferenceLanguageCheckpointInfo,
 )
-from vyvotts.dataset.representation import TEXT_FRONTEND_NAME
-from vyvotts.inference import FlowMatchingTTSInference
-from vyvotts.model_manifest import (
+from nar_vae.dataset.representation import TEXT_FRONTEND_NAME
+from nar_vae.inference import FlowMatchingTTSInference
+from nar_vae.model_manifest import (
     MODEL_MANIFEST_FILENAME,
     ModelManifestError,
     load_model_manifest,
@@ -292,20 +292,20 @@ class ModelManifestTest(unittest.TestCase):
             False
         )
         with (
-            patch("vyvotts.inference.FlowCheckpoint.load", return_value=checkpoint),
-            patch("vyvotts.inference.load_dacvae") as implicit_codec,
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=checkpoint),
+            patch("nar_vae.inference.load_dacvae") as implicit_codec,
             self.assertRaisesRegex(ValueError, "dacvae_model is required"),
         ):
             FlowMatchingTTSInference("checkpoint.bin", device="cpu")
         implicit_codec.assert_not_called()
 
         with (
-            patch("vyvotts.inference.FlowCheckpoint.load", return_value=checkpoint),
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=checkpoint),
             patch(
-                "vyvotts.inference.load_model_manifest",
+                "nar_vae.inference.load_model_manifest",
                 side_effect=ModelManifestError("missing manifest"),
             ),
-            patch("vyvotts.inference.load_dacvae") as load_codec,
+            patch("nar_vae.inference.load_dacvae") as load_codec,
             self.assertRaisesRegex(ModelManifestError, "missing manifest"),
         ):
             FlowMatchingTTSInference(
@@ -320,7 +320,7 @@ class ModelManifestTest(unittest.TestCase):
             checkpoint = Path(directory) / "pytorch_model.bin"
             checkpoint.write_bytes(b"not a serialized checkpoint")
             with (
-                patch("vyvotts.checkpoint.torch.load") as deserialize,
+                patch("nar_vae.checkpoint.torch.load") as deserialize,
                 self.assertRaisesRegex(ModelManifestError, "missing"),
             ):
                 FlowMatchingTTSInference(

@@ -6,11 +6,11 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from vyvotts.benchmark import _run_once
-from vyvotts.checkpoint import LanguageCheckpointInfo, ReferenceLanguageCheckpointInfo
-from vyvotts.dataset.data_collator import FlowMatchingDataCollator
-from vyvotts.inference import FlowMatchingTTSInference
-from vyvotts.languages import (
+from nar_vae.benchmark import _run_once
+from nar_vae.checkpoint import LanguageCheckpointInfo, ReferenceLanguageCheckpointInfo
+from nar_vae.dataset.data_collator import FlowMatchingDataCollator
+from nar_vae.inference import FlowMatchingTTSInference
+from nar_vae.languages import (
     CrossLingualUnsupportedError,
     LanguagePair,
     MultilingualUnsupportedError,
@@ -144,7 +144,7 @@ class LanguageRegistryTest(unittest.TestCase):
     def test_inference_cannot_disable_checkpoint_language_conditioning(self):
         checkpoint = self._checkpoint(LanguageCheckpointInfo(True, ("en", "es")))
         with (
-            patch("vyvotts.inference.FlowCheckpoint.load", return_value=checkpoint),
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=checkpoint),
             self.assertRaisesRegex(MultilingualUnsupportedError, "cannot be disabled"),
         ):
             FlowMatchingTTSInference(
@@ -156,7 +156,7 @@ class LanguageRegistryTest(unittest.TestCase):
     def test_legacy_checkpoint_rejects_claimed_non_english_support(self):
         checkpoint = self._checkpoint(LanguageCheckpointInfo(False))
         with (
-            patch("vyvotts.inference.FlowCheckpoint.load", return_value=checkpoint),
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=checkpoint),
             self.assertRaisesRegex(MultilingualUnsupportedError, "only English"),
         ):
             FlowMatchingTTSInference(

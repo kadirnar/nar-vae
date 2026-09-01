@@ -2,8 +2,8 @@
 
 import unittest
 
-from vyvotts.inference import FlowMatchingTTSInference
-from vyvotts.model_presets import (
+from nar_vae.inference import FlowMatchingTTSInference
+from nar_vae.model_presets import (
     ARCHITECTURE_FIELDS,
     ModelPreset,
     get_model_preset,

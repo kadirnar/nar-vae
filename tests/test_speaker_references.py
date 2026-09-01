@@ -6,9 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from vyvotts.dataset.prepare_dataset import save_dataset
-from vyvotts.dataset.representation import REPRESENTATION_CONTRACT_COLUMN
-from vyvotts.dataset.speaker_references import (
+from nar_vae.dataset.prepare_dataset import save_dataset
+from nar_vae.dataset.representation import REPRESENTATION_CONTRACT_COLUMN
+from nar_vae.dataset.speaker_references import (
     build_speaker_index,
     select_reference_indices,
     validate_zero_shot_splits,
@@ -167,11 +167,11 @@ class SpeakerReferenceTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             with (
                 patch(
-                    "vyvotts.dataset.prepare_dataset.Dataset.from_dict",
+                    "nar_vae.dataset.prepare_dataset.Dataset.from_dict",
                     return_value=dataset,
                 ) as from_dict,
                 patch(
-                    "vyvotts.dataset.prepare_dataset.write_prepared_dataset_manifest"
+                    "nar_vae.dataset.prepare_dataset.write_prepared_dataset_manifest"
                 ) as write_manifest,
             ):
                 save_dataset([sample], directory)
@@ -214,11 +214,11 @@ class SpeakerReferenceTest(unittest.TestCase):
 
             with (
                 patch(
-                    "vyvotts.dataset.prepare_dataset.Dataset.from_dict",
+                    "nar_vae.dataset.prepare_dataset.Dataset.from_dict",
                     return_value=dataset,
                 ),
                 patch(
-                    "vyvotts.dataset.prepare_dataset.write_prepared_dataset_manifest"
+                    "nar_vae.dataset.prepare_dataset.write_prepared_dataset_manifest"
                 ) as write_manifest,
             ):
                 save_dataset(

@@ -6,7 +6,7 @@ import sys
 import unittest
 from dataclasses import replace
 
-from vyvotts.serving import (
+from nar_vae.serving import (
     RequestMetadata,
     ShapeBucketKey,
     StageTiming,
@@ -78,7 +78,7 @@ class ServingMetadataTest(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
-                "import sys, vyvotts.serving; assert 'torch' not in sys.modules",
+                "import sys, nar_vae.serving; assert 'torch' not in sys.modules",
             ],
             check=False,
             capture_output=True,

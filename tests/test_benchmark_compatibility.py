@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.benchmark import run_benchmark
-from vyvotts.checkpoint import CheckpointProvenance
+from nar_vae.benchmark import run_benchmark
+from nar_vae.checkpoint import CheckpointProvenance
 
 
 class DummyFlowModel(torch.nn.Module):
@@ -88,9 +88,9 @@ class BenchmarkCompatibilityTest(unittest.TestCase):
             output = root / "result.json"
             runtime = DummyRealtimeTTS(checkpoint)
             with (
-                patch("vyvotts.benchmark.RealtimeTTSInference", return_value=runtime),
-                patch("vyvotts.benchmark.package_source_hashes", return_value={}),
-                patch("vyvotts.benchmark.environment", return_value={"cuda_available": False}),
+                patch("nar_vae.benchmark.RealtimeTTSInference", return_value=runtime),
+                patch("nar_vae.benchmark.package_source_hashes", return_value={}),
+                patch("nar_vae.benchmark.environment", return_value={"cuda_available": False}),
             ):
                 result = run_benchmark(
                     checkpoint=checkpoint,

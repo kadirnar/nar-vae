@@ -1,92 +1,86 @@
-"""Canonical NAR-VAE public API.
-
-The implementation currently remains in :mod:`vyvotts` so existing checkpoints and imports keep
-working during the package transition. New code should import :mod:`nar_vae`.
-"""
+"""Lightweight public API for NAR-VAE."""
 
 from __future__ import annotations
 
-import sys
-from importlib import import_module, util
-from importlib.abc import Loader, MetaPathFinder
-from importlib.machinery import ModuleSpec
+from importlib import import_module
+from typing import Any
 
-import vyvotts as _implementation
+from ._version import __version__
 
 __author__ = "NAR-VAE Team"
-__version__ = _implementation.__version__
-__all__ = _implementation.__all__
+
+_LAZY_EXPORTS = {
+    "AdaLN": ("nar_vae.modules", "AdaLN"),
+    "AdaLNZero": ("nar_vae.modules", "AdaLNZero"),
+    "DACVAE": ("nar_vae.dacvae", "DACVAE"),
+    "DACVAE_BACKENDS": ("nar_vae.dacvae", "DACVAE_BACKENDS"),
+    "HubDACVAESource": ("nar_vae.dacvae", "HubDACVAESource"),
+    "EchoDiT": ("nar_vae.models", "EchoDiT"),
+    "EchoDurationPredictor": ("nar_vae.models", "EchoDurationPredictor"),
+    "FlowMatchingDataCollator": ("nar_vae.dataset.data_collator", "FlowMatchingDataCollator"),
+    "FlowMatchingEchoDiT": ("nar_vae.models", "FlowMatchingEchoDiT"),
+    "FlowMatchingLoss": ("nar_vae.losses", "FlowMatchingLoss"),
+    "FlowMatchingTTSInference": ("nar_vae.inference", "FlowMatchingTTSInference"),
+    "FlowGRPOConfig": ("nar_vae.post_training", "FlowGRPOConfig"),
+    "FlowGRPOTrainer": ("nar_vae.post_training", "FlowGRPOTrainer"),
+    "GRPOStageConfig": ("nar_vae.post_training", "GRPOStageConfig"),
+    "DEFAULT_GRPO_CONFIG_PATH": ("nar_vae.post_training", "DEFAULT_GRPO_CONFIG_PATH"),
+    "GenerationConfig": ("nar_vae.configuration", "GenerationConfig"),
+    "CheckpointProvenance": ("nar_vae.checkpoint", "CheckpointProvenance"),
+    "CrossLingualUnsupportedError": (
+        "nar_vae.languages",
+        "CrossLingualUnsupportedError",
+    ),
+    "Language": ("nar_vae.languages", "Language"),
+    "LanguagePair": ("nar_vae.languages", "LanguagePair"),
+    "HubCheckpointSource": ("nar_vae.checkpoint", "HubCheckpointSource"),
+    "LearnedDurationUnsupportedError": (
+        "nar_vae.inference",
+        "LearnedDurationUnsupportedError",
+    ),
+    "MultilingualUnsupportedError": (
+        "nar_vae.languages",
+        "MultilingualUnsupportedError",
+    ),
+    "ModelPreset": ("nar_vae.model_presets", "ModelPreset"),
+    "ODESolver": ("nar_vae.solvers", "ODESolver"),
+    "RealtimeTTSInference": ("nar_vae.inference_realtime", "RealtimeTTSInference"),
+    "RotaryPositionalEncoding": ("nar_vae.modules", "RotaryPositionalEncoding"),
+    "SimpleTTSCollator": ("nar_vae.dataset.data_collator", "SimpleTTSCollator"),
+    "TimestepEmbedding": ("nar_vae.modules", "TimestepEmbedding"),
+    "VoiceCloningUnsupportedError": (
+        "nar_vae.inference",
+        "VoiceCloningUnsupportedError",
+    ),
+    "create_data_collator": ("nar_vae.dataset.data_collator", "create_data_collator"),
+    "create_flow_matching_echodit": ("nar_vae.models", "create_flow_matching_echodit"),
+    "bind_reward_evaluator_manifest": (
+        "nar_vae.post_training",
+        "bind_reward_evaluator_manifest",
+    ),
+    "get_model_preset": ("nar_vae.model_presets", "get_model_preset"),
+    "grpo_post_train": ("nar_vae.post_training", "grpo_post_train"),
+    "list_model_presets": ("nar_vae.model_presets", "list_model_presets"),
+    "normalize_language": ("nar_vae.languages", "normalize_language"),
+    "load_dacvae": ("nar_vae.dacvae", "load_dacvae"),
+}
+
+__all__ = [
+    "__author__",
+    "__version__",
+    *_LAZY_EXPORTS,
+]
 
 
-class _ImplementationAliasLoader(Loader):
-    """Return one existing implementation module for its canonical public name."""
-
-    def __init__(self, public_name: str, implementation_name: str) -> None:
-        self.public_name = public_name
-        self.implementation_name = implementation_name
-        self._implementation_metadata: dict[str, object] = {}
-
-    def create_module(self, spec: ModuleSpec):
-        del spec
-        module = import_module(self.implementation_name)
-        for name in (
-            "__name__",
-            "__spec__",
-            "__loader__",
-            "__package__",
-            "__file__",
-            "__cached__",
-            "__path__",
-        ):
-            if hasattr(module, name):
-                self._implementation_metadata[name] = getattr(module, name)
-        return module
-
-    def exec_module(self, module) -> None:
-        # Import machinery initializes the returned object with the alias spec.
-        # Restore the implementation metadata so reload, resources, pickling,
-        # and introspection continue to see one internally consistent module.
-        for name, value in self._implementation_metadata.items():
-            setattr(module, name, value)
-        sys.modules[self.public_name] = module
-
-
-class _ImplementationAliasFinder(MetaPathFinder):
-    """Lazily map ``nar_vae.*`` imports to the single ``vyvotts.*`` module graph."""
-
-    nar_vae_alias_finder = True
-
-    def find_spec(self, fullname: str, path=None, target=None):
-        del path, target
-        prefix = f"{__name__}."
-        if not fullname.startswith(prefix):
-            return None
-        implementation_name = f"vyvotts.{fullname.removeprefix(prefix)}"
-        try:
-            implementation_spec = util.find_spec(implementation_name)
-        except (ImportError, ModuleNotFoundError, ValueError):
-            return None
-        if implementation_spec is None:
-            return None
-        loader = _ImplementationAliasLoader(fullname, implementation_name)
-        return util.spec_from_loader(
-            fullname,
-            loader,
-            origin=implementation_spec.origin,
-            is_package=implementation_spec.submodule_search_locations is not None,
-        )
-
-
-# A copied ``__path__`` makes Python execute each implementation file a second
-# time as ``nar_vae.<module>``. The finder instead aliases submodules lazily,
-# preserving optional dependencies while sharing classes, locks, and caches.
-if not any(getattr(finder, "nar_vae_alias_finder", False) for finder in sys.meta_path):
-    sys.meta_path.insert(0, _ImplementationAliasFinder())
-
-
-def __getattr__(name: str):
-    """Resolve public objects lazily through the compatibility implementation."""
-    return getattr(_implementation, name)
+def __getattr__(name: str) -> Any:
+    """Import optional/heavy public objects only when first requested."""
+    try:
+        module_name, attribute_name = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
 
 
 def __dir__() -> list[str]:

@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from vyvotts.models import (
+from nar_vae.models import (
     allocate_integer_durations,
     durations_from_alignment,
     monotonic_alignment_search,

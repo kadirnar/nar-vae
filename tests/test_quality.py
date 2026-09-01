@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.quality import (
+from nar_vae.quality import (
     audio_metrics,
     cross_lingual_quality_report,
     evaluate_audio_file,
@@ -122,13 +122,13 @@ class QualityTest(unittest.TestCase):
             "revision_kind": "checkpoint_sha256",
         }
         with (
-            patch("vyvotts.quality.torchaudio.load", return_value=(waveform, 16000)),
+            patch("nar_vae.quality.torchaudio.load", return_value=(waveform, 16000)),
             patch(
-                "vyvotts.quality.file_metadata",
+                "nar_vae.quality.file_metadata",
                 return_value={"path": "generated.wav", "size_bytes": 1, "sha256": "b" * 64},
             ),
             patch(
-                "vyvotts.quality._greedy_wav2vec_transcript",
+                "nar_vae.quality._greedy_wav2vec_transcript",
                 return_value=("hello world", "test-asr", evaluator),
             ),
         ):
@@ -149,7 +149,7 @@ class QualityTest(unittest.TestCase):
 
     def test_audio_evaluation_rejects_invalid_wer_gate_before_loading_audio(self):
         with (
-            patch("vyvotts.quality.torchaudio.load") as load,
+            patch("nar_vae.quality.torchaudio.load") as load,
             self.assertRaisesRegex(ValueError, "maximum_wer"),
         ):
             evaluate_audio_file("generated.wav", "hello", maximum_wer=1.1)

@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.configuration import load_inference_settings
-from vyvotts.inference import FlowMatchingTTSInference
+from nar_vae.configuration import load_inference_settings
+from nar_vae.inference import FlowMatchingTTSInference
 
 
 class FakeTokenizer:
@@ -93,7 +93,7 @@ class InferenceBatchingTest(unittest.TestCase):
             values = torch.arange(batch, dtype=torch.float32)[:, None, None]
             return values.expand(batch, channels, frames).clone()
 
-        with patch("vyvotts.inference.ODESolver.sample", side_effect=fake_sample):
+        with patch("nar_vae.inference.ODESolver.sample", side_effect=fake_sample):
             audios = runtime.synthesize_batch(["a", "longer"], num_steps=4)
 
         self.assertEqual(len(calls), 1)
@@ -120,7 +120,7 @@ class InferenceBatchingTest(unittest.TestCase):
             calls.append(kwargs)
             return torch.zeros(kwargs["latent_shape"])
 
-        with patch("vyvotts.inference.ODESolver.sample", side_effect=fake_sample):
+        with patch("nar_vae.inference.ODESolver.sample", side_effect=fake_sample):
             runtime.synthesize_batch(["a", "longer"], num_steps=1)
 
         self.assertEqual(len(runtime.flow_model.calls), 1)
@@ -147,7 +147,7 @@ class InferenceBatchingTest(unittest.TestCase):
             calls.append(kwargs)
             return torch.zeros(kwargs["latent_shape"])
 
-        with patch("vyvotts.inference.ODESolver.sample", side_effect=fake_sample):
+        with patch("nar_vae.inference.ODESolver.sample", side_effect=fake_sample):
             runtime.synthesize("a", duration=1.5, num_steps=1, show_progress=False)
 
         self.assertEqual(runtime.flow_model.calls[0]["total_frames"], 6)
@@ -162,7 +162,7 @@ class InferenceBatchingTest(unittest.TestCase):
             batch, channels, frames = kwargs["latent_shape"]
             return torch.full((batch, channels, frames), float(frames))
 
-        with patch("vyvotts.inference.ODESolver.sample", side_effect=fake_sample):
+        with patch("nar_vae.inference.ODESolver.sample", side_effect=fake_sample):
             audios = runtime.synthesize_batch(
                 ["a", "x" * 30, "b"],
                 num_steps=2,
@@ -178,7 +178,7 @@ class InferenceBatchingTest(unittest.TestCase):
 
         with (
             patch(
-                "vyvotts.inference.ODESolver.sample",
+                "nar_vae.inference.ODESolver.sample",
                 return_value=torch.zeros(2, 2, 6),
             ),
             self.assertRaisesRegex(RuntimeError, "preserve the generated batch dimension"),
@@ -189,7 +189,7 @@ class InferenceBatchingTest(unittest.TestCase):
         runtime = make_runtime()
 
         with (
-            patch("vyvotts.inference.ODESolver.sample") as sample,
+            patch("nar_vae.inference.ODESolver.sample") as sample,
             self.assertRaisesRegex(ValueError, "batch maximum"),
         ):
             runtime.synthesize_batch(["x" * 30], max_duration=2.0)
@@ -202,7 +202,7 @@ class InferenceBatchingTest(unittest.TestCase):
         def fake_sample(**kwargs):
             return torch.zeros(kwargs["latent_shape"])
 
-        with patch("vyvotts.inference.ODESolver.sample", side_effect=fake_sample):
+        with patch("nar_vae.inference.ODESolver.sample", side_effect=fake_sample):
             audio = runtime.synthesize_batch(["x" * 30])
 
         self.assertEqual(audio[0].shape[0], 9)

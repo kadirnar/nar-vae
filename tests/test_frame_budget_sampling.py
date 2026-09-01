@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from vyvotts.dataset import (
+from nar_vae.dataset import (
     LATENT_NUM_FRAMES_COLUMN,
     FrameBudgetBatchSampler,
     read_dataset_frame_lengths,

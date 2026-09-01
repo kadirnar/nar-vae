@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import torch
 
-import vyvotts.models.dit as dit_module
-from vyvotts.models.flow_matching import FlowMatchingEchoDiT
+import nar_vae.models.dit as dit_module
+from nar_vae.models.flow_matching import FlowMatchingEchoDiT
 
 
 def tiny_model(
@@ -165,7 +165,7 @@ class SharedConditioningEncodingTest(unittest.TestCase):
 
         with (
             patch(
-                "vyvotts.models.flow_matching.torch.rand",
+                "nar_vae.models.flow_matching.torch.rand",
                 side_effect=(text_draws, speaker_draws),
             ),
             patch.object(model.dit, "encode_text", wraps=model.dit.encode_text) as encode_text,

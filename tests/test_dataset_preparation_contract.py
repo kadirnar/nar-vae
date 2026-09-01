@@ -10,15 +10,15 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from vyvotts.dacvae import HubDACVAESource
-from vyvotts.dataset.emilia_prepare import EmiliaPreparer, prepare_emilia_dataset
-from vyvotts.dataset.finetune_prepare import DataPreparer, prepare_finetune_dataset
-from vyvotts.dataset.prepare import DatasetPreparer, prepare_dataset
-from vyvotts.dataset.prepare_dataset import (
+from nar_vae.dacvae import HubDACVAESource
+from nar_vae.dataset.emilia_prepare import EmiliaPreparer, prepare_emilia_dataset
+from nar_vae.dataset.finetune_prepare import DataPreparer, prepare_finetune_dataset
+from nar_vae.dataset.prepare import DatasetPreparer, prepare_dataset
+from nar_vae.dataset.prepare_dataset import (
     DatasetPreparer as FileDatasetPreparer,
 )
-from vyvotts.dataset.prepare_dataset import prepare_from_hf_dataset
-from vyvotts.dataset.representation import (
+from nar_vae.dataset.prepare_dataset import prepare_from_hf_dataset
+from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_COLUMN,
     REPRESENTATION_CONTRACT_VERSION,
     TEXT_FRONTEND_NAME,
@@ -27,7 +27,7 @@ from vyvotts.dataset.representation import (
     attach_representation_contract,
     build_representation_contract,
 )
-from vyvotts.dataset.sources import resolve_dataset_source
+from nar_vae.dataset.sources import resolve_dataset_source
 
 DATASET_REVISION_A = "a" * 40
 DATASET_REVISION_B = "b" * 40
@@ -255,16 +255,16 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
         prepared = saved_dataset()
         with tempfile.TemporaryDirectory() as directory:
             with (
-                patch("vyvotts.dataset.prepare.setup_distributed", return_value=(0, 1, False)),
-                patch("vyvotts.dataset.prepare.snapshot_download") as snapshot_download,
-                patch("vyvotts.dataset.prepare.load_dataset", return_value=raw) as load_dataset,
+                patch("nar_vae.dataset.prepare.setup_distributed", return_value=(0, 1, False)),
+                patch("nar_vae.dataset.prepare.snapshot_download") as snapshot_download,
+                patch("nar_vae.dataset.prepare.load_dataset", return_value=raw) as load_dataset,
                 patch(
-                    "vyvotts.dataset.prepare.DatasetPreparer",
+                    "nar_vae.dataset.prepare.DatasetPreparer",
                     return_value=SimpleNamespace(sample_rate=48000),
                 ),
-                patch("vyvotts.dataset.prepare.Dataset.from_list", return_value=prepared),
-                patch("vyvotts.dataset.prepare.write_prepared_dataset_manifest") as write_manifest,
-                patch("vyvotts.dataset.prepare.cleanup_distributed"),
+                patch("nar_vae.dataset.prepare.Dataset.from_list", return_value=prepared),
+                patch("nar_vae.dataset.prepare.write_prepared_dataset_manifest") as write_manifest,
+                patch("nar_vae.dataset.prepare.cleanup_distributed"),
             ):
                 prepare_dataset(
                     "speech/example",
@@ -296,16 +296,16 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
         prepared = saved_dataset()
         with tempfile.TemporaryDirectory() as directory:
             with (
-                patch("vyvotts.dataset.prepare.setup_distributed", return_value=(0, 1, False)),
-                patch("vyvotts.dataset.prepare.snapshot_download") as snapshot_download,
-                patch("vyvotts.dataset.prepare.load_dataset", return_value=raw) as load_dataset,
+                patch("nar_vae.dataset.prepare.setup_distributed", return_value=(0, 1, False)),
+                patch("nar_vae.dataset.prepare.snapshot_download") as snapshot_download,
+                patch("nar_vae.dataset.prepare.load_dataset", return_value=raw) as load_dataset,
                 patch(
-                    "vyvotts.dataset.prepare.DatasetPreparer",
+                    "nar_vae.dataset.prepare.DatasetPreparer",
                     return_value=SimpleNamespace(sample_rate=48000),
                 ),
-                patch("vyvotts.dataset.prepare.Dataset.from_list", return_value=prepared),
-                patch("vyvotts.dataset.prepare.write_prepared_dataset_manifest") as write_manifest,
-                patch("vyvotts.dataset.prepare.cleanup_distributed"),
+                patch("nar_vae.dataset.prepare.Dataset.from_list", return_value=prepared),
+                patch("nar_vae.dataset.prepare.write_prepared_dataset_manifest") as write_manifest,
+                patch("nar_vae.dataset.prepare.cleanup_distributed"),
             ):
                 prepare_dataset(
                     directory,
@@ -326,9 +326,9 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
         raw = empty_dataset()
         with tempfile.TemporaryDirectory() as directory:
             with (
-                patch("vyvotts.dataset.prepare_dataset.load_dataset", return_value=raw) as load_hf,
-                patch("vyvotts.dataset.prepare_dataset.DatasetPreparer"),
-                patch("vyvotts.dataset.prepare_dataset.save_dataset"),
+                patch("nar_vae.dataset.prepare_dataset.load_dataset", return_value=raw) as load_hf,
+                patch("nar_vae.dataset.prepare_dataset.DatasetPreparer"),
+                patch("nar_vae.dataset.prepare_dataset.save_dataset"),
             ):
                 prepare_from_hf_dataset(
                     "speech/example",
@@ -345,24 +345,24 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
 
             with (
                 patch(
-                    "vyvotts.dataset.finetune_prepare.setup_distributed",
+                    "nar_vae.dataset.finetune_prepare.setup_distributed",
                     return_value=(0, 1, False),
                 ),
                 patch(
-                    "vyvotts.dataset.finetune_prepare.load_dataset", return_value=raw
+                    "nar_vae.dataset.finetune_prepare.load_dataset", return_value=raw
                 ) as load_finetune,
                 patch(
-                    "vyvotts.dataset.finetune_prepare.DataPreparer",
+                    "nar_vae.dataset.finetune_prepare.DataPreparer",
                     return_value=SimpleNamespace(),
                 ),
                 patch(
-                    "vyvotts.dataset.finetune_prepare.Dataset.from_list",
+                    "nar_vae.dataset.finetune_prepare.Dataset.from_list",
                     return_value=(prepared_finetune := saved_dataset()),
                 ),
                 patch(
-                    "vyvotts.dataset.finetune_prepare.write_prepared_dataset_manifest"
+                    "nar_vae.dataset.finetune_prepare.write_prepared_dataset_manifest"
                 ) as write_finetune_manifest,
-                patch("vyvotts.dataset.finetune_prepare.cleanup_distributed"),
+                patch("nar_vae.dataset.finetune_prepare.cleanup_distributed"),
             ):
                 prepare_finetune_dataset(
                     "speech/example",
@@ -383,18 +383,18 @@ class DatasetLoadingThreadingTest(unittest.TestCase):
 
             with (
                 patch(
-                    "vyvotts.dataset.emilia_prepare.setup_distributed",
+                    "nar_vae.dataset.emilia_prepare.setup_distributed",
                     return_value=(0, 1, False),
                 ),
                 patch(
-                    "vyvotts.dataset.emilia_prepare.load_dataset", return_value=[]
+                    "nar_vae.dataset.emilia_prepare.load_dataset", return_value=[]
                 ) as load_emilia,
                 patch(
-                    "vyvotts.dataset.emilia_prepare.EmiliaPreparer",
+                    "nar_vae.dataset.emilia_prepare.EmiliaPreparer",
                     return_value=SimpleNamespace(sample_rate=48000),
                 ),
-                patch("vyvotts.dataset.emilia_prepare.merge_parts", return_value=None),
-                patch("vyvotts.dataset.emilia_prepare.cleanup_distributed"),
+                patch("nar_vae.dataset.emilia_prepare.merge_parts", return_value=None),
+                patch("nar_vae.dataset.emilia_prepare.cleanup_distributed"),
             ):
                 prepare_emilia_dataset(
                     str(Path(directory) / "emilia"),

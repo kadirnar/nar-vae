@@ -13,21 +13,21 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 
-from vyvotts.configuration import write_training_lineage
-from vyvotts.dataset.finetune_prepare import (
+from nar_vae.configuration import write_training_lineage
+from nar_vae.dataset.finetune_prepare import (
     _content_bound_utterance_id,
     _validate_unique_prompt_ids,
 )
-from vyvotts.distributed import DistributedContext
-from vyvotts.losses.flow_matching_loss import FlowMatchingLoss
-from vyvotts.model_manifest import (
+from nar_vae.distributed import DistributedContext
+from nar_vae.losses.flow_matching_loss import FlowMatchingLoss
+from nar_vae.model_manifest import (
     MODEL_MANIFEST_FILENAME,
     ModelManifestError,
     load_model_manifest,
     validate_grpo_parent_manifest,
     write_model_manifest,
 )
-from vyvotts.post_training import (
+from nar_vae.post_training import (
     DEFAULT_GRPO_CONFIG_PATH,
     FlowGRPOConfig,
     FlowGRPOTrainer,
@@ -39,10 +39,10 @@ from vyvotts.post_training import (
     grpo_reference_identity,
     run_grpo_stage,
 )
-from vyvotts.post_training import grpo as grpo_module
-from vyvotts.post_training import nar_vae_stage as nar_stage_module
-from vyvotts.post_training import stage as stage_module
-from vyvotts.post_training.nar_vae_stage import (
+from nar_vae.post_training import grpo as grpo_module
+from nar_vae.post_training import nar_vae_stage as nar_stage_module
+from nar_vae.post_training import stage as stage_module
+from nar_vae.post_training.nar_vae_stage import (
     NARVAEGRPOCollator,
     _decode_exact_latent_lengths,
     _evaluate_exact_audio_lengths,
@@ -50,7 +50,7 @@ from vyvotts.post_training.nar_vae_stage import (
     _preserve_flow_only_trainability,
     _velocity_adapter,
 )
-from vyvotts.post_training.stage import GRPOPreparedBatch
+from nar_vae.post_training.stage import GRPOPreparedBatch
 
 
 def model_config(codec_source: str = "./codec/weights.pth") -> dict:
@@ -218,7 +218,7 @@ def stage_config(
         dataloader_pin_memory=False,
         dataloader_drop_last=True,
         mixed_precision="fp32",
-        report_to="none",
+        report_to="wandb",
         num_steps=4,
         group_size=2,
         sde_window_start=1,
@@ -269,6 +269,23 @@ def write_sft_parent(root: Path):
 
 
 class GRPOStageTest(unittest.TestCase):
+    def setUp(self):
+        class NoOpWandbLogger:
+            def log(self, metrics, *, step):
+                del metrics, step
+
+            def finish(self):
+                return None
+
+        # Exercise the training loop without importing W&B or making network calls.
+        self._wandb_logger_patch = patch.object(
+            stage_module,
+            "_WandbLogger",
+            return_value=NoOpWandbLogger(),
+        )
+        self._wandb_logger_patch.start()
+        self.addCleanup(self._wandb_logger_patch.stop)
+
     def test_runtime_revalidates_sft_bytes_immediately_before_deserialization(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -304,7 +321,7 @@ class GRPOStageTest(unittest.TestCase):
                 ),
                 patch.object(nar_stage_module, "validate_manifest_weight", side_effect=validate),
                 patch.object(nar_stage_module, "validate_loaded_codec"),
-                patch("vyvotts.checkpoint.torch.load", side_effect=deserialize),
+                patch("nar_vae.checkpoint.torch.load", side_effect=deserialize),
             ):
                 runtime = nar_stage_module.build_nar_vae_grpo_runtime(
                     config,
@@ -355,7 +372,7 @@ class GRPOStageTest(unittest.TestCase):
                         "_new_model_from_manifest",
                         side_effect=(ToyVelocity(), ToyVelocity()),
                     ),
-                    patch("vyvotts.checkpoint.torch.load") as deserialize,
+                    patch("nar_vae.checkpoint.torch.load") as deserialize,
                     self.assertRaisesRegex(ModelManifestError, "does not match"),
                 ):
                     nar_stage_module.build_nar_vae_grpo_runtime(
@@ -444,6 +461,7 @@ class GRPOStageTest(unittest.TestCase):
             "final/flow_model/pytorch_model.bin",
             config_path.read_text(encoding="utf-8"),
         )
+        self.assertIn('report_to: "wandb"', config_path.read_text(encoding="utf-8"))
 
         def reward(audio, batch):
             del audio, batch
@@ -496,7 +514,7 @@ class GRPOStageTest(unittest.TestCase):
             ),
             distributed_error_synchronizer=synchronize,
         )
-        with patch("vyvotts.post_training.grpo.combine_reward_components", side_effect=combine):
+        with patch("nar_vae.post_training.grpo.combine_reward_components", side_effect=combine):
             trainer.step(
                 initial_state=torch.randn(1, 2, 4),
                 conditioning=None,
@@ -731,6 +749,22 @@ class GRPOStageTest(unittest.TestCase):
                     save_folder=(root / "run").resolve(),
                     reward_weights={"quality": 1.0},
                     reward_evaluators={},
+                )
+
+            with self.assertRaisesRegex(ValueError, "W&B logging is mandatory"):
+                GRPOStageConfig(
+                    parent_checkpoint=parent.resolve(),
+                    prompt_dataset_local=(root / "data").resolve(),
+                    save_folder=(root / "run").resolve(),
+                    reward_weights={"quality": 1.0},
+                    reward_evaluators={
+                        "quality": {
+                            "implementation": "toy",
+                            "revision": "v1",
+                            "sha256": "a" * 64,
+                        }
+                    },
+                    report_to="none",
                 )
 
     def test_full_cpu_stage_saves_atomic_resume_state_and_loadable_export(self):

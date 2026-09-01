@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vyvotts.dataset.identity import (
+from nar_vae.dataset.identity import (
     PREPARED_DATASET_MANIFEST_FILENAME,
     DatasetIdentityError,
     resolve_hub_dataset_identity,
@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - lightweight inference environment
     load_from_disk = None
 
 
-@unittest.skipIf(Dataset is None, "datasets training extra is unavailable")
+@unittest.skipIf(Dataset is None, "datasets dependency is unavailable")
 class LocalPreparedDatasetIdentityTest(unittest.TestCase):
     def _save(self, directory: Path, values: list[int]):
         dataset = Dataset.from_dict(

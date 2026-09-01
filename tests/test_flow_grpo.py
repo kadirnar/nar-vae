@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
-from vyvotts.post_training import (
+from nar_vae.post_training import (
     FlowGRPOConfig,
     FlowGRPOTrainer,
     clipped_grpo_loss,

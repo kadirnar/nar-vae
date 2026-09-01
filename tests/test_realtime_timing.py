@@ -6,14 +6,14 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.caching import (
+from nar_vae.caching import (
     CacheDiTPoisonedError,
     CacheDiTRequestActiveError,
     CacheDiTStats,
 )
-from vyvotts.configuration import load_inference_settings
-from vyvotts.inference import FlowMatchingTTSInference
-from vyvotts.inference_realtime import RealtimeTTSInference, _mark_compiled_cuda_graph_step
+from nar_vae.configuration import load_inference_settings
+from nar_vae.inference import FlowMatchingTTSInference
+from nar_vae.inference_realtime import RealtimeTTSInference, _mark_compiled_cuda_graph_step
 
 
 class FakeTokenizer:
@@ -34,8 +34,8 @@ class ConstantVelocityModel(torch.nn.Module):
 class RealtimeTimingTest(unittest.TestCase):
     def test_compiled_cuda_marker_fails_clearly_on_an_unsupported_torch_build(self):
         with (
-            patch("vyvotts.inference_realtime.torch.compiler", object()),
-            self.assertRaisesRegex(RuntimeError, "torch>=2.2"),
+            patch("nar_vae.inference_realtime.torch.compiler", object()),
+            self.assertRaisesRegex(RuntimeError, "torch>=2.7.1"),
         ):
             _mark_compiled_cuda_graph_step()
 
@@ -84,7 +84,7 @@ class RealtimeTimingTest(unittest.TestCase):
 
         try:
             with patch(
-                "vyvotts.inference_realtime.FlowMatchingTTSInference.__init__",
+                "nar_vae.inference_realtime.FlowMatchingTTSInference.__init__",
                 new=fake_base_init,
             ):
                 RealtimeTTSInference("checkpoint.bin", device="cuda")
@@ -180,7 +180,7 @@ class RealtimeTimingTest(unittest.TestCase):
         expected = [torch.ones(2)]
 
         with (
-            patch("vyvotts.inference_realtime._mark_compiled_cuda_graph_step") as marker,
+            patch("nar_vae.inference_realtime._mark_compiled_cuda_graph_step") as marker,
             patch.object(
                 FlowMatchingTTSInference,
                 "synthesize_batch",
@@ -237,9 +237,9 @@ class RealtimeTimingTest(unittest.TestCase):
             return compiled_backbone if model is hooked_backbone else compiled_decode
 
         with (
-            patch("vyvotts.inference_realtime.CacheDiTSession", FakeCacheDiTSession),
-            patch("vyvotts.inference_realtime.torch.compile", side_effect=fake_compile),
-            patch("vyvotts.inference_realtime.weakref.finalize", return_value=FakeFinalizer()),
+            patch("nar_vae.inference_realtime.CacheDiTSession", FakeCacheDiTSession),
+            patch("nar_vae.inference_realtime.torch.compile", side_effect=fake_compile),
+            patch("nar_vae.inference_realtime.weakref.finalize", return_value=FakeFinalizer()),
         ):
             tts._enable_compilation("reduce-overhead")
 
@@ -306,9 +306,9 @@ class RealtimeTimingTest(unittest.TestCase):
                 raise RuntimeError("cleanup exploded")
 
         with (
-            patch("vyvotts.inference_realtime.CacheDiTSession", FailingCleanupSession),
+            patch("nar_vae.inference_realtime.CacheDiTSession", FailingCleanupSession),
             patch(
-                "vyvotts.inference_realtime.torch.compile",
+                "nar_vae.inference_realtime.torch.compile",
                 side_effect=ValueError("compile exploded"),
             ),
             self.assertRaisesRegex(RuntimeError, "could not prepare") as raised,
@@ -412,9 +412,9 @@ class RealtimeTimingTest(unittest.TestCase):
             return torch.zeros(kwargs["latent_shape"])
 
         with (
-            patch("vyvotts.inference_realtime.CacheDiTSession", FakeCacheDiTSession),
-            patch("vyvotts.inference_realtime.ODESolver.sample", side_effect=fake_sample),
-            patch("vyvotts.inference_realtime.create_scm_context") as legacy_cache,
+            patch("nar_vae.inference_realtime.CacheDiTSession", FakeCacheDiTSession),
+            patch("nar_vae.inference_realtime.ODESolver.sample", side_effect=fake_sample),
+            patch("nar_vae.inference_realtime.create_scm_context") as legacy_cache,
         ):
             _, timings = tts.synthesize_fast(
                 "test",
@@ -461,8 +461,8 @@ class RealtimeTimingTest(unittest.TestCase):
                 raise AssertionError("Cache-DiT session should not be created")
 
         with (
-            patch("vyvotts.inference_realtime.ODESolver.sample", side_effect=fake_sample),
-            patch("vyvotts.inference_realtime.CacheDiTSession", UnexpectedCacheSession),
+            patch("nar_vae.inference_realtime.ODESolver.sample", side_effect=fake_sample),
+            patch("nar_vae.inference_realtime.CacheDiTSession", UnexpectedCacheSession),
         ):
             tts.synthesize_fast(
                 "test",
@@ -484,7 +484,7 @@ class RealtimeTimingTest(unittest.TestCase):
             captured["fuse_cfg_branches"] = kwargs["fuse_cfg_branches"]
             return torch.zeros(kwargs["latent_shape"])
 
-        with patch("vyvotts.inference_realtime.ODESolver.sample", side_effect=fake_sample):
+        with patch("nar_vae.inference_realtime.ODESolver.sample", side_effect=fake_sample):
             tts.synthesize_fast(
                 "test",
                 config=tts.generation_profile("turbo").with_overrides(cache_mode="none"),
@@ -499,7 +499,7 @@ class RealtimeTimingTest(unittest.TestCase):
 
         with (
             patch(
-                "vyvotts.inference_realtime.ODESolver.sample",
+                "nar_vae.inference_realtime.ODESolver.sample",
                 side_effect=RuntimeError("sampling failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "sampling failed"),
@@ -556,7 +556,7 @@ class RealtimeTimingTest(unittest.TestCase):
 
         with (
             patch(
-                "vyvotts.inference_realtime.ODESolver.sample",
+                "nar_vae.inference_realtime.ODESolver.sample",
                 side_effect=RuntimeError("sampling failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "sampling failed"),

@@ -3,7 +3,7 @@
 import unittest
 from dataclasses import replace
 
-from vyvotts.serving import (
+from nar_vae.serving import (
     DeadlineBatchScheduler,
     ManualClock,
     RequestMetadata,

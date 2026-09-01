@@ -6,16 +6,16 @@ from pathlib import Path
 
 import torch
 
-from vyvotts.checkpoint import (
+from nar_vae.checkpoint import (
     FlowCheckpoint,
     LegacyCrossLingualCheckpointError,
     LegacyLanguageCheckpointError,
     load_pretrained_checkpoint,
 )
-from vyvotts.languages import LANGUAGE_COUNT, language_id
-from vyvotts.models.dit import TextEncoder
-from vyvotts.models.flow_matching import FlowMatchingEchoDiT
-from vyvotts.solvers.ode_solver import ODESolver
+from nar_vae.languages import LANGUAGE_COUNT, language_id
+from nar_vae.models.dit import TextEncoder
+from nar_vae.models.flow_matching import FlowMatchingEchoDiT
+from nar_vae.solvers.ode_solver import ODESolver
 
 
 class RecordingLanguageModel(torch.nn.Module):

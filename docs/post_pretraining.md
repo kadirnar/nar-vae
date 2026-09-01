@@ -194,8 +194,8 @@ Bind the callback with `bind_reward_evaluator_manifest`. Its component names mus
 `reward_weights`, while every configured evaluator records an implementation name, immutable
 revision, and artifact SHA-256. Use language-appropriate WER/CER, speaker-verification, perceptual,
 silence, clipping, truncation, repetition, and duration signals. The library does not download
-these expensive evaluators. Set `report_to: wandb` for rank-zero logging of globally reduced
-metrics, or keep the default `none`.
+these expensive evaluators. W&B logging is mandatory and rank zero reports globally reduced
+metrics; isolated servers may use W&B offline mode.
 
 Each row is a uniquely identified prompt group and stays on one rank. The stage creates an
 independent frozen SFT reference, disables CFG for RL rollouts, reuses one detached rollout for at

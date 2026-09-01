@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from vyvotts.checkpoint import (
+from nar_vae.checkpoint import (
     DurationCheckpointInfo,
     FlowCheckpoint,
     LanguageCheckpointInfo,
@@ -17,13 +17,13 @@ from vyvotts.checkpoint import (
     inspect_duration_capability,
     load_pretrained_checkpoint,
 )
-from vyvotts.configuration import DurationConfig
-from vyvotts.inference import (
+from nar_vae.configuration import DurationConfig
+from nar_vae.inference import (
     FlowMatchingTTSInference,
     LearnedDurationUnsupportedError,
 )
-from vyvotts.languages import language_id
-from vyvotts.models.flow_matching import create_flow_matching_echodit
+from nar_vae.languages import language_id
+from nar_vae.models.flow_matching import create_flow_matching_echodit
 
 
 def tiny_model(
@@ -228,7 +228,7 @@ class EchoDiTDurationTest(unittest.TestCase):
     def test_inference_cannot_claim_or_disable_learned_duration(self):
         legacy = self.checkpoint_mock(DurationCheckpointInfo(False))
         with (
-            patch("vyvotts.inference.FlowCheckpoint.load", return_value=legacy),
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=legacy),
             self.assertRaises(LearnedDurationUnsupportedError),
         ):
             FlowMatchingTTSInference(
@@ -239,7 +239,7 @@ class EchoDiTDurationTest(unittest.TestCase):
 
         versioned = self.checkpoint_mock(DurationCheckpointInfo(True, 6, 2, False))
         with (
-            patch("vyvotts.inference.FlowCheckpoint.load", return_value=versioned),
+            patch("nar_vae.inference.FlowCheckpoint.load", return_value=versioned),
             self.assertRaises(LearnedDurationUnsupportedError),
         ):
             FlowMatchingTTSInference(

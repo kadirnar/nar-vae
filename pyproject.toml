@@ -24,18 +24,29 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
-    "torch>=2.2",
+    "accelerate>=1.3,<2",
+    "build",
+    "cache-dit>=1.5,<2",
+    "datasets==3.4.1",
+    "descript-audiotools>=0.7.2",
     "tiktoken",
     "einops",
-    "numpy",
     "huggingface-hub",
-    "tqdm",
-    "soundfile",
-    "torchaudio>=2.2",
-    "descript-audiotools>=0.7.2",
+    "kernels>=0.16,<0.17",
+    "librosa",
+    "numpy",
     # Prevent legacy numba releases, which cannot install on supported Python versions.
     "numba>=0.60",
+    "PyYAML",
+    "ruff",
+    "soundfile",
+    "torch>=2.7.1",
+    "torchaudio>=2.7.1",
+    "torchcodec",
+    "tqdm",
     "tomli>=2.0; python_version < '3.11'",
+    "transformers>=4.49,<5",
+    "wandb",
 ]
 
 [project.urls]
@@ -43,40 +54,17 @@ Homepage = "https://github.com/kadirnar/nar-vae"
 Repository = "https://github.com/kadirnar/nar-vae"
 Issues = "https://github.com/kadirnar/nar-vae/issues"
 
-[project.optional-dependencies]
-train = [
-    "accelerate>=1.3,<2",
-    "datasets==3.4.1",
-    "librosa",
-    "PyYAML",
-    "torchcodec",
-    "transformers>=4.49,<5",
-]
-wandb = [
-    "wandb",
-]
-turbo = [
-    "cache-dit>=1.5,<2",
-]
-flash-attention = [
-    "kernels>=0.16,<0.17",
-]
-dev = [
-    "build",
-    "ruff",
-]
-
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.dynamic]
-version = { attr = "vyvotts._version.__version__" }
+version = { attr = "nar_vae._version.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["nar_vae*", "vyvotts*"]
+include = ["nar_vae*"]
 
 [tool.setuptools.package-data]
-vyvotts = ["configs/*.yaml", "configs/*.toml"]
+nar_vae = ["configs/*.yaml", "configs/*.toml"]
 
 [tool.ruff]
 line-length = 100

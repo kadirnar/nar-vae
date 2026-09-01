@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import torch
 
-import vyvotts.models.dit as dit_module
-from vyvotts.models.dit import SpeakerEncoder
+import nar_vae.models.dit as dit_module
+from nar_vae.models.dit import SpeakerEncoder
 
 
 class SpeakerEncoderTest(unittest.TestCase):

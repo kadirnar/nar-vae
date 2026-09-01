@@ -4,13 +4,13 @@ import unittest
 
 import torch
 
-from vyvotts.dataset.representation import (
+from nar_vae.dataset.representation import (
     REPRESENTATION_CONTRACT_COLUMN,
     REPRESENTATION_CONTRACT_VERSION,
     TEXT_FRONTEND_NAME,
     TEXT_FRONTEND_VERSION,
 )
-from vyvotts.training_utils import (
+from nar_vae.training_utils import (
     freeze_layers,
     resolve_duration_training_options,
     resolve_language_training_options,

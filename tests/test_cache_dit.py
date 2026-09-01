@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.caching import (
+from nar_vae.caching import (
     CacheDiTPoisonedError,
     CacheDiTRequestActiveError,
     CacheDiTSession,
@@ -20,10 +20,10 @@ from vyvotts.caching import (
     CacheDiTUnavailableError,
     assert_cache_dit_healthy,
 )
-from vyvotts.caching.cache_dit import _SESSION_LOCK, _PersistentCacheDiTRequest
-from vyvotts.models.dit import DiTBlock
-from vyvotts.models.flow_matching import FlowMatchingEchoDiT
-from vyvotts.solvers.ode_solver import ODESolver
+from nar_vae.caching.cache_dit import _SESSION_LOCK, _PersistentCacheDiTRequest
+from nar_vae.models.dit import DiTBlock
+from nar_vae.models.flow_matching import FlowMatchingEchoDiT
+from nar_vae.solvers.ode_solver import ODESolver
 
 
 class IdentityAdaLN(torch.nn.Module):
@@ -94,13 +94,16 @@ class CacheDiTTest(unittest.TestCase):
     def test_missing_dependency_has_an_actionable_error(self):
         model = SimpleNamespace(dit=SimpleNamespace(blocks=torch.nn.ModuleList()))
         with patch(
-            "vyvotts.caching.cache_dit.import_module",
+            "nar_vae.caching.cache_dit.import_module",
             side_effect=ModuleNotFoundError(
                 "No module named 'cache_dit'",
                 name="cache_dit",
             ),
         ):
-            with self.assertRaisesRegex(CacheDiTUnavailableError, r"\[turbo\]"):
+            with self.assertRaisesRegex(
+                CacheDiTUnavailableError,
+                r"python -m pip install -e \.",
+            ):
                 CacheDiTSession(model, num_steps=16).__enter__()
 
     def test_transitive_missing_dependency_is_not_masked(self):
@@ -110,7 +113,7 @@ class CacheDiTTest(unittest.TestCase):
             name="diffusers",
         )
         with patch(
-            "vyvotts.caching.cache_dit.import_module",
+            "nar_vae.caching.cache_dit.import_module",
             side_effect=missing_dependency,
         ):
             with self.assertRaises(ModuleNotFoundError) as caught:
@@ -120,7 +123,7 @@ class CacheDiTTest(unittest.TestCase):
 
     def test_base_exception_during_setup_releases_the_session_lock(self):
         with patch(
-            "vyvotts.caching.cache_dit._load_cache_dit",
+            "nar_vae.caching.cache_dit._load_cache_dit",
             side_effect=KeyboardInterrupt,
         ):
             with self.assertRaises(KeyboardInterrupt):
@@ -490,7 +493,7 @@ class CacheDiTTest(unittest.TestCase):
         session._request_lock.release()
 
 
-@unittest.skipUnless(importlib.util.find_spec("cache_dit"), "Cache-DiT turbo extra not installed")
+@unittest.skipUnless(importlib.util.find_spec("cache_dit"), "Cache-DiT dependency not installed")
 class CacheDiTInstalledIntegrationTest(unittest.TestCase):
     def test_real_cache_dit_reduces_block_work_at_fixed_step_count(self):
         class CountingBlock(torch.nn.Module):

@@ -8,7 +8,7 @@ from unittest.mock import patch
 @unittest.skipUnless(find_spec("audiotools") is not None, "bundled codec dependency not installed")
 class BundledDACVAEPublicAPITest(unittest.TestCase):
     def test_raw_class_does_not_download_hub_shaped_paths(self):
-        from vyvotts.dacvae import DACVAE
+        from nar_vae.dacvae import DACVAE
 
         with (
             patch("huggingface_hub.hf_hub_download") as download,

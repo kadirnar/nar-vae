@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 
 def load_backend_module():
-    module_path = Path(__file__).parents[1] / "vyvotts" / "dacvae" / "loader.py"
-    spec = importlib.util.spec_from_file_location("vyvotts_dacvae_loader_test", module_path)
+    module_path = Path(__file__).parents[1] / "nar_vae" / "dacvae" / "loader.py"
+    spec = importlib.util.spec_from_file_location("nar_vae_dacvae_loader_test", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module

@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from vyvotts.configuration import (
+from nar_vae.configuration import (
     build_training_argument_overrides,
     load_training_lineage,
     resolve_frame_budget_batching,
@@ -20,11 +20,13 @@ from vyvotts.configuration import (
     validate_sft_config,
     write_training_lineage,
 )
-from vyvotts.train import (
+from nar_vae.finetune import _require_wandb as _require_sft_wandb
+from nar_vae.train import (
     _load_pretraining_dataset,
     _load_pretraining_yaml,
     _resolve_pretraining_dataset_source,
 )
+from nar_vae.train import _require_wandb as _require_pretraining_wandb
 
 try:
     import yaml
@@ -50,7 +52,7 @@ class TrainingConfigurationTest(unittest.TestCase):
             "adam_beta2": 0.95,
             "adam_epsilon": 1e-7,
             "mixed_precision": "fp16",
-            "report_to": "none",
+            "report_to": "wandb",
             "gradient_checkpointing": True,
             "seed": 17,
         }
@@ -152,7 +154,7 @@ class TrainingConfigurationTest(unittest.TestCase):
                         validator(rejected)
 
     def test_pretrain_is_the_canonical_api_and_train_remains_compatible(self):
-        source = (ROOT / "vyvotts" / "train.py").read_text(encoding="utf-8")
+        source = (ROOT / "nar_vae" / "train.py").read_text(encoding="utf-8")
         module = ast.parse(source)
         functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
 
@@ -166,7 +168,7 @@ class TrainingConfigurationTest(unittest.TestCase):
         self.assertEqual([call.func.id for call in train_calls], ["pretrain"])
         self.assertIn('"configs/pretrain_config.yaml"', source)
 
-        canonical_config = ROOT / "vyvotts" / "configs" / "pretrain_config.yaml"
+        canonical_config = ROOT / "nar_vae" / "configs" / "pretrain_config.yaml"
         self.assertTrue(canonical_config.is_file())
         self.assertIn('extends: "echodit_config.yaml"', canonical_config.read_text())
 
@@ -208,7 +210,7 @@ class TrainingConfigurationTest(unittest.TestCase):
 
         self.assertTrue(options["fp16"])
         self.assertFalse(options["bf16"])
-        self.assertEqual(options["report_to"], [])
+        self.assertEqual(options["report_to"], ["wandb"])
         self.assertEqual(options["optim"], "adamw_torch")
         self.assertEqual(options["adam_beta1"], 0.8)
         self.assertEqual(options["adam_beta2"], 0.95)
@@ -257,21 +259,22 @@ class TrainingConfigurationTest(unittest.TestCase):
 
     def test_packaged_training_configs_enable_persisted_frame_budgets(self):
         if yaml is None:
-            self.skipTest("PyYAML training extra is not installed")
+            self.skipTest("PyYAML dependency is not installed")
 
         for filename in ("echodit_config.yaml", "finetune_config.yaml"):
             with self.subTest(filename=filename):
-                with (ROOT / "vyvotts" / "configs" / filename).open(encoding="utf-8") as file:
+                with (ROOT / "nar_vae" / "configs" / filename).open(encoding="utf-8") as file:
                     config = yaml.safe_load(file)
                 settings = resolve_frame_budget_batching(config)
                 self.assertTrue(settings.enabled)
                 self.assertEqual(settings.max_examples_per_batch, config["batch_size"])
                 self.assertFalse(settings.allow_legacy_frame_length_inference)
                 self.assertFalse(config["allow_legacy_representation"])
+                self.assertEqual(config["report_to"], "wandb")
 
-        pretraining = _load_pretraining_yaml(ROOT / "vyvotts" / "configs" / "pretrain_config.yaml")
+        pretraining = _load_pretraining_yaml(ROOT / "nar_vae" / "configs" / "pretrain_config.yaml")
         validate_pretraining_config(pretraining)
-        with (ROOT / "vyvotts" / "configs" / "finetune_config.yaml").open(encoding="utf-8") as file:
+        with (ROOT / "nar_vae" / "configs" / "finetune_config.yaml").open(encoding="utf-8") as file:
             sft = yaml.safe_load(file)
         for name in (
             "use_mas_duration",
@@ -342,9 +345,9 @@ class TrainingConfigurationTest(unittest.TestCase):
             (snapshot / "nar_vae_dataset_manifest.json").write_text("{}", encoding="utf-8")
             with (
                 patch(
-                    "vyvotts.train.snapshot_download", return_value=str(snapshot)
+                    "nar_vae.train.snapshot_download", return_value=str(snapshot)
                 ) as snapshot_download,
-                patch("vyvotts.train.load_from_disk", return_value=expected_dataset) as load_disk,
+                patch("nar_vae.train.load_from_disk", return_value=expected_dataset) as load_disk,
             ):
                 loaded, prepared_path = _load_pretraining_dataset(source, process)
 
@@ -369,7 +372,7 @@ class TrainingConfigurationTest(unittest.TestCase):
         process = SimpleNamespace(is_main_process=True, is_distributed=False)
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch("vyvotts.train.snapshot_download", return_value=directory),
+            patch("nar_vae.train.snapshot_download", return_value=directory),
             self.assertRaisesRegex(ValueError, "mutable external URLs"),
         ):
             _load_pretraining_dataset(source, process)
@@ -405,9 +408,9 @@ class TrainingConfigurationTest(unittest.TestCase):
                     outputs[:] = [None] * 4
 
             with (
-                patch("vyvotts.train.snapshot_download", return_value=str(snapshot)) as download,
-                patch("vyvotts.train.dist.all_gather_object", side_effect=gather_paths),
-                patch("vyvotts.train.load_from_disk", return_value=expected_dataset),
+                patch("nar_vae.train.snapshot_download", return_value=str(snapshot)) as download,
+                patch("nar_vae.train.dist.all_gather_object", side_effect=gather_paths),
+                patch("nar_vae.train.load_from_disk", return_value=expected_dataset),
             ):
                 loaded, prepared_path = _load_pretraining_dataset(source, process)
 
@@ -415,15 +418,41 @@ class TrainingConfigurationTest(unittest.TestCase):
         self.assertEqual(prepared_path, snapshot.resolve())
         download.assert_called_once()
 
-    def test_wandb_is_an_explicit_optional_reporter(self):
+    def test_wandb_is_the_mandatory_reporter(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self._pretraining_config(Path(directory) / "run")
-            config["report_to"] = "wandb"
             self.assertEqual(build_training_argument_overrides(config)["report_to"], ["wandb"])
+
+            omitted = dict(config)
+            omitted.pop("report_to")
+            self.assertEqual(
+                build_training_argument_overrides(omitted)["report_to"],
+                ["wandb"],
+            )
+
+            for disabled in ("none", "disabled", []):
+                rejected = dict(config, report_to=disabled)
+                with (
+                    self.subTest(disabled=disabled),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "W&B logging is mandatory",
+                    ),
+                ):
+                    build_training_argument_overrides(rejected)
 
             config["report_to"] = "tensorboard"
             with self.assertRaisesRegex(ValueError, "Unsupported training reporter"):
                 build_training_argument_overrides(config)
+
+    def test_training_entrypoints_require_wandb_without_eager_imports(self):
+        for target, require in (
+            ("nar_vae.train.import_module", _require_pretraining_wandb),
+            ("nar_vae.finetune.import_module", _require_sft_wandb),
+        ):
+            with self.subTest(target=target), patch(target, side_effect=ImportError("missing")):
+                with self.assertRaisesRegex(RuntimeError, "W&B is required"):
+                    require()
 
     def test_cfg_dropout_default_and_branch_overrides_are_bounded(self):
         inherited = resolve_training_cfg_dropout({"cfg_dropout": 0.25})
@@ -489,7 +518,7 @@ class TrainingConfigurationTest(unittest.TestCase):
 
     def test_packaged_training_yaml_contains_only_wired_training_controls(self):
         if yaml is None:
-            self.skipTest("PyYAML training extra is not installed")
+            self.skipTest("PyYAML dependency is not installed")
 
         removed = {
             "cfg_max_t",
@@ -519,7 +548,7 @@ class TrainingConfigurationTest(unittest.TestCase):
         }
         for filename in ("echodit_config.yaml", "finetune_config.yaml"):
             with self.subTest(filename=filename):
-                with (ROOT / "vyvotts" / "configs" / filename).open(encoding="utf-8") as file:
+                with (ROOT / "nar_vae" / "configs" / filename).open(encoding="utf-8") as file:
                     config = yaml.safe_load(file)
                 self.assertFalse(removed.intersection(config))
                 self.assertIs(config["do_validation"], False)
@@ -594,7 +623,7 @@ class TrainingConfigurationTest(unittest.TestCase):
 
     def test_packaged_yaml_does_not_advertise_unconsumed_token_controls(self):
         if yaml is None:
-            self.skipTest("PyYAML training extra is not installed")
+            self.skipTest("PyYAML dependency is not installed")
         removed = {
             "tokeniser_length",
             "start_of_text",
@@ -607,7 +636,7 @@ class TrainingConfigurationTest(unittest.TestCase):
             "end_of_ai",
         }
         for filename in ("echodit_config.yaml", "finetune_config.yaml"):
-            with (ROOT / "vyvotts" / "configs" / filename).open(encoding="utf-8") as file:
+            with (ROOT / "nar_vae" / "configs" / filename).open(encoding="utf-8") as file:
                 config = yaml.safe_load(file)
             self.assertFalse(removed.intersection(config))
             self.assertEqual(config["pad_token"], 100286)
@@ -621,7 +650,7 @@ class TrainingConfigurationTest(unittest.TestCase):
                 "save_folder": str(output),
                 "learning_rate": 1e-5,
                 "pretrained_checkpoint": None,
-                "report_to": "none",
+                "report_to": "wandb",
             }
             with self.assertRaisesRegex(ValueError, "requires pretrained_checkpoint"):
                 validate_sft_config(config)
@@ -660,7 +689,7 @@ class TrainingConfigurationTest(unittest.TestCase):
                 "save_folder": str(root / "sft"),
                 "learning_rate": 1e-5,
                 "pretrained_checkpoint": str(checkpoint),
-                "report_to": "none",
+                "report_to": "wandb",
             }
 
             with self.assertRaisesRegex(ValueError, "Legacy/external checkpoints"):

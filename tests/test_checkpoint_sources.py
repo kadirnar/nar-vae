@@ -7,7 +7,7 @@ from unittest.mock import call, patch
 
 import torch
 
-from vyvotts.checkpoint import FlowCheckpoint, HubCheckpointSource
+from nar_vae.checkpoint import FlowCheckpoint, HubCheckpointSource
 
 
 class CheckpointSourceTest(unittest.TestCase):

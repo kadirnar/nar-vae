@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vyvotts.hub import (
+from nar_vae.hub import (
     DEFAULT_IGNORE_PATTERNS,
     download_snapshot,
     resolve_revision,
@@ -26,8 +26,8 @@ class HubDownloadTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit 40-character"):
             resolve_revision("owner/another-model", "main")
 
-    @patch("vyvotts.hub.get_token")
-    @patch("vyvotts.hub.snapshot_download")
+    @patch("nar_vae.hub.get_token")
+    @patch("nar_vae.hub.snapshot_download")
     def test_download_uses_environment_token_and_defaults(self, snapshot_download, get_token):
         snapshot_download.return_value = "/tmp/downloaded"
 
@@ -52,8 +52,8 @@ class HubDownloadTest(unittest.TestCase):
             token="environment-token",
         )
 
-    @patch("vyvotts.hub.get_token", return_value="cached-token")
-    @patch("vyvotts.hub.snapshot_download")
+    @patch("nar_vae.hub.get_token", return_value="cached-token")
+    @patch("nar_vae.hub.snapshot_download")
     def test_explicit_patterns_and_cached_token(self, snapshot_download, get_token):
         snapshot_download.return_value = "/tmp/downloaded"
 
@@ -89,8 +89,8 @@ class HubDownloadTest(unittest.TestCase):
                 max_workers=0,
             )
 
-    @patch("vyvotts.hub.get_token")
-    @patch("vyvotts.hub.snapshot_download")
+    @patch("nar_vae.hub.get_token")
+    @patch("nar_vae.hub.snapshot_download")
     def test_missing_revision_fails_before_network(self, snapshot_download, get_token):
         with self.assertRaisesRegex(ValueError, "explicit 40-character"):
             download_snapshot(

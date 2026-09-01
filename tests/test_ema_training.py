@@ -7,9 +7,9 @@ import unittest
 
 import torch
 
-from vyvotts.configuration import validate_pretraining_config
-from vyvotts.finetune import EMACallback, EMAModel
-from vyvotts.train import DEFAULT_TRAIN_CONFIG_PATH, _load_pretraining_yaml, pretrain, train
+from nar_vae.configuration import validate_pretraining_config
+from nar_vae.finetune import EMACallback, EMAModel
+from nar_vae.train import DEFAULT_TRAIN_CONFIG_PATH, _load_pretraining_yaml, pretrain, train
 
 
 class PretrainingEntryPointTest(unittest.TestCase):

@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.benchmark_solvers import _markdown_table, compare_solvers
-from vyvotts.checkpoint import CheckpointProvenance, HubCheckpointSource
-from vyvotts.configuration import SOLVER_NFE_PER_STEP, SOLVERS
+from nar_vae.benchmark_solvers import _markdown_table, compare_solvers
+from nar_vae.checkpoint import CheckpointProvenance, HubCheckpointSource
+from nar_vae.configuration import SOLVER_NFE_PER_STEP, SOLVERS
 
 
 class DummyFlowModel(torch.nn.Module):
@@ -140,12 +140,12 @@ class SolverBenchmarkTest(unittest.TestCase):
 
             with (
                 patch(
-                    "vyvotts.benchmark_solvers.RealtimeTTSInference",
+                    "nar_vae.benchmark_solvers.RealtimeTTSInference",
                     return_value=runtime,
                 ) as runtime_factory,
-                patch("vyvotts.benchmark_solvers.package_source_hashes", return_value={}),
+                patch("nar_vae.benchmark_solvers.package_source_hashes", return_value={}),
                 patch(
-                    "vyvotts.benchmark_solvers.environment",
+                    "nar_vae.benchmark_solvers.environment",
                     return_value={"cuda_available": False},
                 ),
             ):

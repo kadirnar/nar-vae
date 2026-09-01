@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.solvers.ode_solver import ODESolver
+from nar_vae.solvers.ode_solver import ODESolver
 
 
 class RecordingModel(torch.nn.Module):

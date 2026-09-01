@@ -156,7 +156,7 @@ first implementation priorities are correctness and reproducibility:
   [Hugging Face Flash Attention 3 kernel](https://huggingface.co/kernels-community/flash-attn3)
   only on compatible CUDA servers and only after numerical parity checks;
 - EMA updated after successful optimizer steps, not per microbatch;
-- rank-zero-only, optional/offline W&B logging;
+- mandatory rank-zero-only W&B logging, with offline mode available for isolated servers;
 - FSDP as a later option after DDP parity, with block-level wrapping and distributed checkpoints.
 
 The current Trainer entry points optimize training batches only. They do not construct a held-out

@@ -5,12 +5,12 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.losses.flow_matching_loss import (
+from nar_vae.losses.flow_matching_loss import (
     FlowMatchingLoss,
     sample_logit_normal,
     sample_stratified_logit_normal,
 )
-from vyvotts.models.dit import JointAttention, RMSNorm, precompute_freqs_cis
+from nar_vae.models.dit import JointAttention, RMSNorm, precompute_freqs_cis
 
 
 class RecordingVelocityModel(torch.nn.Module):
@@ -40,11 +40,11 @@ class StratifiedLogitNormalTest(unittest.TestCase):
         identity_permutation = torch.arange(4)
         with (
             patch(
-                "vyvotts.losses.flow_matching_loss.torch.rand",
+                "nar_vae.losses.flow_matching_loss.torch.rand",
                 return_value=draws,
             ),
             patch(
-                "vyvotts.losses.flow_matching_loss.torch.randperm",
+                "nar_vae.losses.flow_matching_loss.torch.randperm",
                 return_value=identity_permutation,
             ),
         ):

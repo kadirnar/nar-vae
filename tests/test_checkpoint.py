@@ -7,13 +7,13 @@ from unittest.mock import patch
 
 import torch
 
-from vyvotts.checkpoint import (
+from nar_vae.checkpoint import (
     FlowCheckpoint,
     LegacySpeakerCheckpointError,
     load_pretrained_checkpoint,
     resolve_flow_checkpoint,
 )
-from vyvotts.voice import SPEAKER_CONDITIONING_VERSION, SPEAKER_PATCH_LAYOUT_VERSION
+from nar_vae.voice import SPEAKER_CONDITIONING_VERSION, SPEAKER_PATCH_LAYOUT_VERSION
 
 
 class FlowCheckpointTest(unittest.TestCase):
@@ -32,7 +32,7 @@ class FlowCheckpointTest(unittest.TestCase):
                 events.append(("deserialize", Path(args[0]).resolve()))
                 return original_load(*args, **kwargs)
 
-            with patch("vyvotts.checkpoint.torch.load", side_effect=deserialize):
+            with patch("nar_vae.checkpoint.torch.load", side_effect=deserialize):
                 load_pretrained_checkpoint(
                     model,
                     checkpoint_path,

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vyvotts.serving import (
+from nar_vae.serving import (
     DEFAULT_CLIENT_COUNTS,
     ArrivalPattern,
     ManualClock,
